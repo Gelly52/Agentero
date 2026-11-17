@@ -87,7 +87,7 @@ export const LAYOUT_MERGE = {
 	/** Minimum geometric score lead before assigning an unreadable caption to a non-figure host. */
 	captionFamilyMinScoreMargin: 0.2,
 	/** Only explicit numbered captions may attach beside a figure across a small gutter. */
-	sideCaptionMaxGap: 0.06,
+	sideCaptionMaxGap: 0.1,
 } as const;
 
 /**
@@ -1102,9 +1102,22 @@ function pairCaptionsOneToOne(
 					c = caption.bbox;
 				const gap = Math.max(c.x - h.x - h.w, h.x - c.x - c.w);
 				const overlap = verticalOverlapRatio(h, c);
+				const gapLeft = Math.min(c.x + c.w, h.x + h.w);
+				const gapRight = Math.max(c.x, h.x);
+				const separated = blockers.some(
+					(block) =>
+						block.pageIndex === host.pageIndex &&
+						block.id !== host.id &&
+						block.id !== caption.id &&
+						block.score >= LAYOUT_SIDEBAR_MIN_SCORE &&
+						block.bbox.x >= gapLeft - 0.005 &&
+						block.bbox.x + block.bbox.w <= gapRight + 0.005 &&
+						verticalOverlapRatio(block.bbox, h) >= 0.5,
+				);
 				if (
 					gap >= -0.01 &&
-					gap <= LAYOUT_MERGE.sideCaptionMaxGap &&
+					gap <= LAYOUT_MERGE.sideCaptionMaxGap + 1e-9 &&
+					!separated &&
 					overlap >= 0.5 &&
 					c.w <= h.w &&
 					c.h <= h.h * 1.25
@@ -1676,8 +1689,41 @@ export function mergeCaptionsIntoHosts(
 	for (const cap of figPairs.values()) usedCaptionIds.add(cap.id);
 
 	const singles: PdfLayoutRegion[] = [];
+	const sidePanelIds = new Set<string>();
+	for (const host of freeFigures) {
+		const cap = figPairs.get(host.id);
+		if (!cap || !figureCaptionKey(cap.title ?? cap.text ?? "")) continue;
+		// Margin captions sit beside the first panel, rather than below the
+		// whole float. Follow aligned neighbours to include the entire figure.
+		if (
+			horizontalOverlapRatio(host.bbox, cap.bbox) >= 0.2 ||
+			verticalOverlapRatio(host.bbox, cap.bbox) < 0.5
+		)
+			continue;
+		const peers = freeFigures.filter(
+			(panel) =>
+				panel.pageIndex === host.pageIndex &&
+				(panel.id === host.id || !figPairs.has(panel.id)) &&
+				verticalOverlapRatio(host.bbox, panel.bbox) >= 0.65 &&
+				Math.abs(host.bbox.y - panel.bbox.y) <= 0.06,
+		);
+		const group = connectedPanelGroups(peers, [
+			...figureBlockers,
+			...mainFigureTitles.filter((c) => c.id !== cap.id),
+		]).find((g) => g.some((p) => p.id === host.id));
+		if (!group || group.length < 2) continue;
+		clustered.push({
+			...mergeCluster(group, cap, [], []),
+			bbox: group.reduce(
+				(bbox, panel) => unionBbox(bbox, panel.bbox),
+				cap.bbox,
+			),
+		});
+		for (const panel of group) sidePanelIds.add(panel.id);
+	}
 	// Missing captions are not evidence that a detected figure is invalid.
 	for (const host of freeFigures) {
+		if (sidePanelIds.has(host.id)) continue;
 		const cap = figPairs.get(host.id);
 		singles.push(cap ? attachCaptionToHost(host, cap) : host);
 	}
