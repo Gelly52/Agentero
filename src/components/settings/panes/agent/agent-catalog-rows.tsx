@@ -1,6 +1,16 @@
-import { ArrowUpCircle, Loader2, Terminal, Trash2 } from "lucide-react";
+import {
+	ArrowUpCircle,
+	CircleAlert,
+	Loader2,
+	Pencil,
+	Terminal,
+	Trash2,
+	X,
+} from "lucide-react";
+import { useState } from "react";
 import { useTranslation } from "react-i18next";
 import { AgentLogo } from "@/components/agent/agent-logo";
+import type { CustomAgentFormDraft } from "@/components/settings/panes/agent/agent-custom-form";
 import type { UninstallTarget } from "@/components/settings/panes/agent/use-agent-uninstall";
 import {
 	catalogProbeKey,
@@ -16,7 +26,14 @@ import {
 	showUpdateAgent,
 } from "@/components/settings/panes/agent-catalog";
 import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
 import { Progress } from "@/components/ui/progress";
+import {
+	Tooltip,
+	TooltipContent,
+	TooltipTrigger,
+} from "@/components/ui/tooltip";
 import type { useAgentToolLifecycle } from "@/hooks/use-agent-tool-lifecycle";
 import {
 	type AgentDescriptor,
@@ -27,6 +44,7 @@ import {
 } from "@/lib/agent";
 import { isTauri } from "@/lib/core/tauri";
 import { cn } from "@/lib/core/utils";
+import { isDesktopBundledCliPath } from "@/lib/system/desktop-apps";
 
 type AgentToolLifecycle = ReturnType<typeof useAgentToolLifecycle>;
 
@@ -36,6 +54,9 @@ export function AgentCatalogRows({
 	probingKeys,
 	lifecycle,
 	openUninstallDialog,
+	onLogin,
+	onOpenCli,
+	onEditCustom,
 }: {
 	catalog: CatalogScanResponse | null;
 	/** Global scan busy — ProbingBadge inference needs it next to probingKeys. */
@@ -43,6 +64,9 @@ export function AgentCatalogRows({
 	probingKeys: ReadonlySet<string>;
 	lifecycle: AgentToolLifecycle;
 	openUninstallDialog: (target: UninstallTarget) => void;
+	onLogin: (templateId: string) => Promise<boolean>;
+	onOpenCli: (templateId: string) => void;
+	onEditCustom: (draft: CustomAgentFormDraft) => Promise<boolean>;
 }) {
 	const { t } = useTranslation(["settings", "agent", "common"]);
 	const entries = catalog?.entries ?? [];
@@ -66,6 +90,8 @@ export function AgentCatalogRows({
 					batchActive={batchActive}
 					lifecycle={lifecycle}
 					openUninstallDialog={openUninstallDialog}
+					onLogin={onLogin}
+					onOpenCli={onOpenCli}
 				/>
 			))}
 			{customAgents.map((agent) => (
@@ -76,6 +102,7 @@ export function AgentCatalogRows({
 					probing={probingKeys.has(customProbeKey(agent.id))}
 					batchActive={batchActive}
 					openUninstallDialog={openUninstallDialog}
+					onSubmit={onEditCustom}
 				/>
 			))}
 		</>
@@ -88,22 +115,38 @@ function AgentCatalogEntryRow({
 	batchActive,
 	lifecycle,
 	openUninstallDialog,
+	onLogin,
+	onOpenCli,
 }: {
 	entry: CatalogEntry;
 	probing: boolean;
 	batchActive: boolean;
 	lifecycle: AgentToolLifecycle;
 	openUninstallDialog: (target: UninstallTarget) => void;
+	onLogin: (templateId: string) => Promise<boolean>;
+	onOpenCli: (templateId: string) => void;
 }) {
 	const { t } = useTranslation(["settings", "agent", "common"]);
-	const { lifecycleBusyIds, lifecycleProgress, runToolLifecycle } = lifecycle;
+	const {
+		lifecycleBusyIds,
+		lifecycleProgress,
+		runToolLifecycle,
+		cancelToolLifecycle,
+	} = lifecycle;
 	const installAgent = showInstallAgent(entry);
 	const installAcp = showInstallAcp(entry);
 	const updateAgent = showUpdateAgent(entry);
 	const uninstallAgent = showUninstallAgent(entry);
-	// Install/ACP-only gaps gate “Use default”; Update/Uninstall can sit beside it.
+	const loginAgent =
+		entry.acpStatus === "failed" &&
+		isAgentAuthFailure(entry.lastProbeError) &&
+		Boolean(entry.loginCommand?.trim());
+	// Installed host CLI with a user-facing entrypoint → offer it in a terminal.
+	const openCli = entry.binaryAvailable && Boolean(entry.cliCommand);
+	// Install/ACP-only gaps gate “Use default”; Update/CLI/Uninstall can sit beside it.
 	const needsInstall = installAgent || installAcp;
-	const hasLifecycleAction = needsInstall || updateAgent || uninstallAgent;
+	const hasLifecycleAction =
+		needsInstall || updateAgent || uninstallAgent || loginAgent || openCli;
 	const notInstalled = !entry.binaryAvailable;
 	const rowInstalling = lifecycleBusyIds.has(entry.templateId);
 	const rowBusyAction = lifecycleBusyIds.get(entry.templateId);
@@ -117,7 +160,7 @@ function AgentCatalogEntryRow({
 						<AgentLogo template={entry.templateId} />
 						<span
 							className={cn(
-								"min-w-0 truncate font-medium text-[13px]",
+								"min-w-0 truncate font-medium text-sm",
 								// Dim label only — never the Install button (looks disabled).
 								notInstalled &&
 									!hasLifecycleAction &&
@@ -127,6 +170,26 @@ function AgentCatalogEntryRow({
 						>
 							{entry.name}
 						</span>
+						{entry.templateId === "zcode" ? (
+							<Tooltip>
+								<TooltipTrigger asChild>
+									<span
+										role="img"
+										aria-label={t("agent.zcodeDesktopPathHint")}
+										className="inline-flex shrink-0 cursor-help text-muted-foreground"
+									>
+										<CircleAlert className="size-3.5" aria-hidden />
+									</span>
+								</TooltipTrigger>
+								<TooltipContent
+									side="bottom"
+									align="start"
+									className="max-w-sm leading-relaxed"
+								>
+									{t("agent.zcodeDesktopPathHint")}
+								</TooltipContent>
+							</Tooltip>
+						) : null}
 					</div>
 					<div className="flex min-w-0 flex-wrap items-center gap-1.5">
 						{entry.isDefault ? (
@@ -145,12 +208,37 @@ function AgentCatalogEntryRow({
 							</StatusBadge>
 						)}
 						{/* Layer 2: ACP entrypoint / probe */}
+						{entry.acpBundled ? (
+							<StatusBadge
+								// Provenance, not status: the bundled tier exists in app
+								// resources and only serves when PATH has no adapter.
+								tone="muted"
+								title={t("agent.badges.acpBundledTitle", {
+									version: entry.acpBundledVersion ?? "—",
+								})}
+							>
+								{t("agent.badges.acpBundled")}
+							</StatusBadge>
+						) : null}
+						{entry.binaryAvailable &&
+						isDesktopBundledCliPath(entry.resolvedPath) ? (
+							<StatusBadge
+								tone="muted"
+								title={t("agent.badges.desktopBundledTitle", {
+									path: entry.resolvedPath,
+								})}
+							>
+								{t("agent.badges.desktopBundled")}
+							</StatusBadge>
+						) : null}
 						{!entry.acpCommandAvailable ? (
 							<StatusBadge
 								tone={entry.binaryAvailable ? "warn" : "muted"}
 								title={entry.lastProbeError ?? entry.installHint ?? undefined}
 							>
-								{t("agent.badges.acpMissing")}
+								{entry.acpBundled && entry.binaryAvailable
+									? t("agent.badges.acpNodeBlocker")
+									: t("agent.badges.acpMissing")}
 							</StatusBadge>
 						) : isProbing ? (
 							<ProbingBadge label={t("agent.probing")} />
@@ -215,6 +303,25 @@ function AgentCatalogEntryRow({
 							{t("agent.installAdapter")}
 						</Button>
 					) : null}
+					{loginAgent ? (
+						<Button
+							type="button"
+							variant="outline"
+							size="sm"
+							className="h-7 gap-1 px-2 text-xs"
+							aria-label={t("agent.loginAgentAria", {
+								name: entry.name,
+							})}
+							title={t("agent.loginAgentTitle", {
+								command: entry.loginCommand,
+							})}
+							disabled={rowInstalling || !isTauri()}
+							onClick={() => void onLogin(entry.templateId)}
+						>
+							<Terminal className="size-3" />
+							{t("agent.loginAgent")}
+						</Button>
+					) : null}
 					{updateAgent ? (
 						<Button
 							type="button"
@@ -234,6 +341,22 @@ function AgentCatalogEntryRow({
 								<ArrowUpCircle className="size-3" />
 							)}
 							{t("agent.updateAgent")}
+						</Button>
+					) : null}
+					{openCli ? (
+						<Button
+							type="button"
+							variant="ghost"
+							size="icon-xs"
+							className="size-7"
+							aria-label={t("agent.openCliAria", { name: entry.name })}
+							title={t("agent.openCliTitle", {
+								command: entry.cliCommand ?? entry.command,
+							})}
+							disabled={rowInstalling || !isTauri()}
+							onClick={() => onOpenCli(entry.templateId)}
+						>
+							<Terminal className="size-3.5" aria-hidden />
 						</Button>
 					) : null}
 					{uninstallAgent ? (
@@ -268,16 +391,27 @@ function AgentCatalogEntryRow({
 				</div>
 			</div>
 			{rowLifecycle ? (
-				<div className="grid grid-cols-[8rem_minmax(0,1fr)_2.5rem] items-center gap-3 pr-2">
-					<span className="truncate text-[11px] text-muted-foreground">
+				<div className="grid grid-cols-[8rem_minmax(0,1fr)_2.5rem_1.5rem] items-center gap-3 pr-2">
+					<span className="truncate text-caption text-muted-foreground">
 						{rowLifecycle.detail}
 					</span>
 					<Progress value={rowLifecycle.progress ?? 0} className="h-1" />
-					<span className="text-right font-mono text-[10px] text-muted-foreground tabular-nums">
+					<span className="text-right font-mono text-caption text-muted-foreground tabular-nums">
 						{rowLifecycle.progress == null
 							? ""
 							: `${Math.round(rowLifecycle.progress)}%`}
 					</span>
+					<Button
+						type="button"
+						variant="ghost"
+						size="icon-xs"
+						className="size-6"
+						aria-label={t("common:cancel")}
+						title={t("common:cancel")}
+						onClick={() => cancelToolLifecycle(entry.templateId)}
+					>
+						<X className="size-3.5" aria-hidden />
+					</Button>
 				</div>
 			) : null}
 		</div>
@@ -290,73 +424,176 @@ function AgentCustomAgentRow({
 	probing,
 	batchActive,
 	openUninstallDialog,
+	onSubmit,
 }: {
 	agent: AgentDescriptor;
 	isDefault: boolean;
 	probing: boolean;
 	batchActive: boolean;
 	openUninstallDialog: (target: UninstallTarget) => void;
+	onSubmit: (draft: CustomAgentFormDraft) => Promise<boolean>;
 }) {
 	const { t } = useTranslation(["settings", "agent", "common"]);
 	const isProbing = isCustomAgentProbing(agent, probing, batchActive);
+	const [editing, setEditing] = useState(false);
+	const [formName, setFormName] = useState(agent.name);
+	const [formCommand, setFormCommand] = useState(agent.command);
+	const [formArgs, setFormArgs] = useState(agent.args.join(" "));
+
+	const resetForm = () => {
+		setFormName(agent.name);
+		setFormCommand(agent.command);
+		setFormArgs(agent.args.join(" "));
+	};
+
+	const onCancel = () => {
+		resetForm();
+		setEditing(false);
+	};
+
+	const onSave = async () => {
+		const done = await onSubmit({
+			id: agent.id,
+			name: formName,
+			command: formCommand,
+			args: formArgs,
+		});
+		if (done) {
+			setEditing(false);
+		}
+	};
+
 	return (
-		<div className="flex items-center justify-between gap-3 border-b py-2.5 pr-1.5 pl-3.5 last:border-b-0">
-			<div className="flex min-w-0 flex-1 items-center gap-4">
-				<div className="flex w-32 shrink-0 items-center gap-2">
-					<AgentLogo template={agent.template} />
-					<span className="min-w-0 truncate font-medium text-[13px]">
-						{agent.name}
-					</span>
+		<div className="border-b last:border-b-0">
+			<div className="flex items-center justify-between gap-3 py-2.5 pr-1.5 pl-3.5">
+				<div className="flex min-w-0 flex-1 items-center gap-4">
+					<div className="flex w-32 shrink-0 items-center gap-2">
+						<AgentLogo template={agent.template} />
+						<span className="min-w-0 truncate font-medium text-sm">
+							{agent.name}
+						</span>
+					</div>
+					<div className="flex min-w-0 flex-wrap items-center gap-1.5">
+						{isDefault ? (
+							<StatusBadge tone="primary">
+								{t("agent.badges.default")}
+							</StatusBadge>
+						) : null}
+						{isProbing ? (
+							<ProbingBadge label={t("agent.probing")} />
+						) : agent.lastProbeOk === true ? (
+							<StatusBadge tone="ok">{t("agent:acpStatus.ready")}</StatusBadge>
+						) : agent.lastProbeOk === false ? (
+							<StatusBadge
+								tone={isAgentAuthFailure(agent.lastProbeError) ? "warn" : "err"}
+								title={agent.lastProbeError ?? undefined}
+							>
+								{isAgentAuthFailure(agent.lastProbeError)
+									? t("agent:acpStatus.notLoggedIn")
+									: t("agent:acpStatus.failed")}
+							</StatusBadge>
+						) : agent.available ? (
+							<ProbingBadge label={t("agent.probing")} />
+						) : (
+							<StatusBadge tone="muted">
+								{t("agent:acpStatus.notInstalled")}
+							</StatusBadge>
+						)}
+					</div>
 				</div>
-				<div className="flex min-w-0 flex-wrap items-center gap-1.5">
-					{isDefault ? (
-						<StatusBadge tone="primary">
-							{t("agent.badges.default")}
-						</StatusBadge>
-					) : null}
-					{isProbing ? (
-						<ProbingBadge label={t("agent.probing")} />
-					) : agent.lastProbeOk === true ? (
-						<StatusBadge tone="ok">{t("agent:acpStatus.ready")}</StatusBadge>
-					) : agent.lastProbeOk === false ? (
-						<StatusBadge
-							tone={isAgentAuthFailure(agent.lastProbeError) ? "warn" : "err"}
-							title={agent.lastProbeError ?? undefined}
+				<div className="flex h-7 w-20 shrink-0 items-center justify-center gap-1">
+					<Button
+						type="button"
+						variant="ghost"
+						size="icon-xs"
+						className="size-7"
+						aria-label={editing ? t("common:cancel") : t("common:edit")}
+						title={editing ? t("common:cancel") : t("common:edit")}
+						disabled={!isTauri()}
+						onClick={() => {
+							if (editing) {
+								onCancel();
+							} else {
+								resetForm();
+								setEditing(true);
+							}
+						}}
+					>
+						<Pencil className="size-3.5" aria-hidden />
+					</Button>
+					<Button
+						type="button"
+						variant="ghost"
+						size="icon-xs"
+						className="size-7"
+						aria-label={t("common:remove")}
+						title={t("common:remove")}
+						disabled={!isTauri()}
+						onClick={() =>
+							openUninstallDialog({
+								kind: "custom",
+								id: agent.id,
+								name: agent.name,
+								template: agent.template,
+							})
+						}
+					>
+						<Trash2 className="size-3.5 text-destructive" aria-hidden />
+					</Button>
+				</div>
+			</div>
+			{editing ? (
+				<div className="space-y-2.5 px-3.5 pb-3">
+					<p className="text-muted-foreground text-xs leading-relaxed">
+						{t("agent.form.hint")}
+					</p>
+					<div className="space-y-1">
+						<Label className="font-normal text-sm">
+							{t("agent.form.name")}
+						</Label>
+						<Input
+							value={formName}
+							onChange={(e) => setFormName(e.target.value)}
+							spellCheck={false}
+						/>
+					</div>
+					<div className="space-y-1">
+						<Label className="font-normal text-sm">
+							{t("agent.form.command")}
+						</Label>
+						<Input
+							value={formCommand}
+							onChange={(e) => setFormCommand(e.target.value)}
+							spellCheck={false}
+							autoComplete="off"
+						/>
+					</div>
+					<div className="space-y-1">
+						<Label className="font-normal text-sm">
+							{t("agent.form.args")}
+						</Label>
+						<Input
+							value={formArgs}
+							onChange={(e) => setFormArgs(e.target.value)}
+							spellCheck={false}
+							autoComplete="off"
+						/>
+					</div>
+					<div className="flex justify-end gap-1.5 pt-1">
+						<Button type="button" variant="ghost" size="sm" onClick={onCancel}>
+							{t("common:cancel")}
+						</Button>
+						<Button
+							type="button"
+							size="sm"
+							disabled={!formCommand.trim()}
+							onClick={() => void onSave()}
 						>
-							{isAgentAuthFailure(agent.lastProbeError)
-								? t("agent:acpStatus.notLoggedIn")
-								: t("agent:acpStatus.failed")}
-						</StatusBadge>
-					) : agent.available ? (
-						<ProbingBadge label={t("agent.probing")} />
-					) : (
-						<StatusBadge tone="muted">
-							{t("agent:acpStatus.notInstalled")}
-						</StatusBadge>
-					)}
+							{t("common:save")}
+						</Button>
+					</div>
 				</div>
-			</div>
-			<div className="flex h-7 w-20 shrink-0 items-center justify-center gap-1">
-				<Button
-					type="button"
-					variant="ghost"
-					size="icon-xs"
-					className="size-7"
-					aria-label={t("common:remove")}
-					title={t("common:remove")}
-					disabled={!isTauri()}
-					onClick={() =>
-						openUninstallDialog({
-							kind: "custom",
-							id: agent.id,
-							name: agent.name,
-							template: agent.template,
-						})
-					}
-				>
-					<Trash2 className="size-3.5 text-destructive" aria-hidden />
-				</Button>
-			</div>
+			) : null}
 		</div>
 	);
 }
@@ -389,7 +626,7 @@ export function RemoteAgentCatalogRow({
 					<AgentLogo template={entry.templateId} />
 					<span
 						className={cn(
-							"min-w-0 truncate font-medium text-[13px]",
+							"min-w-0 truncate font-medium text-sm",
 							notInstalled && "text-muted-foreground",
 							notInstalled && !installAcp && "opacity-50",
 						)}
@@ -413,7 +650,9 @@ export function RemoteAgentCatalogRow({
 							tone={entry.binaryAvailable ? "warn" : "muted"}
 							title={entry.lastProbeError ?? undefined}
 						>
-							{t("agent.badges.acpMissing")}
+							{entry.acpBundled && entry.binaryAvailable
+								? t("agent.badges.acpNodeBlocker")
+								: t("agent.badges.acpMissing")}
 						</StatusBadge>
 					) : isProbing ? (
 						<ProbingBadge label={t("agent.probing")} />

@@ -1,4 +1,10 @@
-import { FolderOpen, FolderPlus, Server, Trash2 } from "lucide-react";
+import {
+	FolderOpen,
+	FolderPlus,
+	Server,
+	Trash2,
+	UserRound,
+} from "lucide-react";
 import { type ReactNode, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { SiZotero } from "react-icons/si";
@@ -7,7 +13,10 @@ import {
 	RemoteVaultDialog,
 } from "@/components/dialogs/remote-vault-dialog";
 import { Button } from "@/components/ui/button";
+import { accountSurfaceEnabled } from "@/features/account/visibility";
+import { displayPath } from "@/lib/core/path";
 import { cn } from "@/lib/core/utils";
+import { openSettingsWindow } from "@/lib/shell/settings-window";
 import { vaultDisplayName } from "@/lib/vault";
 import {
 	getRecentRemoteVaults,
@@ -48,7 +57,7 @@ function RecentRow({
 					{badge}
 				</span>
 				<span
-					className="w-full truncate text-[11px] text-muted-foreground"
+					className="w-full truncate text-caption text-muted-foreground"
 					title={subtitle}
 				>
 					{subtitle}
@@ -93,7 +102,7 @@ export function VaultWelcome({
 	onRemoveRecent: (path: string) => void;
 	className?: string;
 }) {
-	const { t } = useTranslation(["app", "sidebar"]);
+	const { t } = useTranslation(["app", "sidebar", "settings"]);
 	const [remoteOpen, setRemoteOpen] = useState(false);
 	const [connecting, setConnecting] = useState(false);
 	const [recentRemotes, setRecentRemotes] = useState<RecentRemoteVault[]>(() =>
@@ -113,12 +122,22 @@ export function VaultWelcome({
 	return (
 		<div
 			className={cn(
-				"agentero-scroll flex min-h-0 flex-1 flex-col items-center justify-center bg-muted/20 p-8",
+				"agentero-scroll flex min-h-0 flex-1 select-none flex-col items-center justify-center bg-muted/20 p-8",
 				className,
 			)}
 		>
 			<div className="flex w-full max-w-lg flex-col gap-6">
-				<div className="mx-auto flex size-12 items-center justify-center rounded-xl border bg-background shadow-sm">
+				{accountSurfaceEnabled ? (
+					<Button
+						variant="ghost"
+						className="self-center"
+						onClick={() => openSettingsWindow("account")}
+					>
+						<UserRound className="size-4" />
+						{t("settings:nav.account")}
+					</Button>
+				) : null}
+				<div className="mx-auto flex size-12 items-center justify-center rounded-xl border bg-background shadow-raised">
 					<FolderOpen className="size-6 text-muted-foreground" />
 				</div>
 
@@ -166,7 +185,7 @@ export function VaultWelcome({
 				</div>
 
 				{recentVaults.length > 0 || recentRemotes.length > 0 ? (
-					<div className="overflow-hidden rounded-lg border bg-background shadow-sm">
+					<div className="overflow-hidden rounded-lg border bg-background shadow-raised">
 						<div className="border-b px-3 py-2">
 							<p className="font-medium text-muted-foreground text-xs">
 								{t("vault.recentTitle")}
@@ -185,7 +204,7 @@ export function VaultWelcome({
 											<Server className="size-3 shrink-0 text-muted-foreground" />
 										}
 										badge={
-											<span className="shrink-0 rounded bg-muted px-1 py-0.5 text-[10px] text-muted-foreground">
+											<span className="shrink-0 rounded bg-muted px-1 py-0.5 text-caption text-muted-foreground">
 												{t("app:vault.remoteBadge")}
 											</span>
 										}
@@ -214,7 +233,7 @@ export function VaultWelcome({
 										key={path}
 										disabled={busy}
 										title={name}
-										subtitle={path}
+										subtitle={displayPath(path)}
 										onOpen={() => onOpenRecent(path)}
 										onRemove={() => onRemoveRecent(path)}
 										removeAria={t("vault.removeRecent", { name })}

@@ -1,4 +1,3 @@
-import { homeDir, join } from "@tauri-apps/api/path";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import {
 	BookOpen,
@@ -7,9 +6,16 @@ import {
 	Import,
 	Loader2,
 	Search,
+	TriangleAlert,
 } from "lucide-react";
-import { useEffect, useMemo, useState } from "react";
+import { useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
+import {
+	chooseZoteroFolder,
+	loadStoredOpts,
+	Toggle,
+	useZoteroDirDetect,
+} from "@/components/dialogs/zotero-dialog-shared";
 import { Button } from "@/components/ui/button";
 import { Checkbox } from "@/components/ui/checkbox";
 import {
@@ -32,14 +38,15 @@ import {
 } from "@/components/ui/select";
 import { useOverlayRegistration } from "@/hooks/use-overlay-registration";
 import i18n from "@/i18n";
-import { enqueueBackgroundTask } from "@/lib/core/background-tasks";
 import { errorText } from "@/lib/core/error";
-import { readJsonStorage, writeJsonStorage } from "@/lib/core/storage";
-import { isTauri } from "@/lib/core/tauri";
+import { writeJsonStorage } from "@/lib/core/storage";
+import { runLocalActivity } from "@/lib/core/tasks";
 import {
+	discoverZoteroDirs,
+	isSqliteMissingError,
 	migrateZotero,
-	pickZoteroDir,
 	scanZotero,
+	suggestZoteroParentDir,
 	type ZoteroMigrateResult,
 	type ZoteroScan,
 } from "@/lib/paper/import/zotero-migrate";
@@ -76,17 +83,13 @@ const STANDARD_ITEM_TYPES = new Set([
 	"report",
 	"document",
 ]);
-function loadOpts(): SavedOpts {
-	const stored = readJsonStorage<Partial<SavedOpts>>(OPTS_KEY, {});
-	return { ...DEFAULT_OPTS, ...stored };
-}
 function saveOpts(o: SavedOpts) {
 	writeJsonStorage(OPTS_KEY, o);
 }
 
-/** "View import tutorial" target. Replace with your hosted tutorial/docs URL. */
+/** "View import tutorial" target: the "Migrate from Zotero" section of the docs site. */
 const IMPORT_TUTORIAL_URL =
-	"https://github.com/poco-ai/motif/blob/main/docs/backend/identifier-lookup.md";
+	"https://agentero-docs.poco-ai.com/usage/import-papers/#zotero";
 function openTutorial() {
 	void openUrl(IMPORT_TUTORIAL_URL).catch(() => {
 		window.open(IMPORT_TUTORIAL_URL, "_blank");
@@ -110,11 +113,11 @@ export function ZoteroMigrateDialog({
 	onDone: () => void;
 }) {
 	const { t } = useTranslation(["sidebar", "app"]);
-	const saved = useMemo(loadOpts, []);
+	const saved = useMemo(() => loadStoredOpts(OPTS_KEY, DEFAULT_OPTS), []);
 	const [dir, setDir] = useState<string | null>(null);
 	const [scan, setScan] = useState<ZoteroScan | null>(null);
 	const [scanning, setScanning] = useState(false);
-	const [detecting, setDetecting] = useState(false);
+	const [suggestedDir, setSuggestedDir] = useState<string | null>(null);
 	const [copyPdfs, setCopyPdfs] = useState(saved.copyPdfs);
 	const [preserveCollections, setPreserveCollections] = useState(
 		saved.preserveCollections,
@@ -145,13 +148,18 @@ export function ZoteroMigrateDialog({
 		setCollFilter("all");
 		setProgress(null);
 		setScanning(false);
+		setSuggestedDir(null);
 		setError(null);
 		setBusy(false);
 		setResult(null);
 	};
 
 	const handleOpenChange = (next: boolean) => {
-		if (!next && !busy) reset();
+		if (!next && !busy) {
+			reset();
+			// Closing after Vault creation must clear the initial tree loading state.
+			onDone();
+		}
 		onOpenChange(next);
 	};
 
@@ -161,46 +169,42 @@ export function ZoteroMigrateDialog({
 		setSelectedItems(new Set(r.items.map((i) => i.id)));
 	};
 
-	const chooseFolder = async () => {
-		setError(null);
-		const picked = await pickZoteroDir();
-		if (!picked) return;
+	const scanDir = async (picked: string) => {
 		setDir(picked);
 		setScan(null);
+		setSuggestedDir(null);
 		setScanning(true);
 		try {
 			applyScan(picked, await scanZotero(picked));
 		} catch (e) {
-			setError(errorText(e));
+			if (isSqliteMissingError(e)) {
+				// Common wrong pick (e.g. storage/): the parent is the data dir.
+				const parent = await suggestZoteroParentDir(picked);
+				if (parent) setSuggestedDir(parent);
+				else setError(t("sidebar:zoteroMigrate.sqliteMissing"));
+			} else {
+				setError(errorText(e));
+			}
 		} finally {
 			setScanning(false);
 		}
 	};
 
+	const chooseFolder = () =>
+		chooseZoteroFolder(setError, (picked) => scanDir(picked));
+
 	// On open, try the default ~/Zotero folder so most users skip browsing.
-	useEffect(() => {
-		if (!open || dir || !isTauri()) return;
-		let cancelled = false;
-		void (async () => {
-			setDetecting(true);
-			try {
-				const candidate = await join(await homeDir(), "Zotero");
+	const detecting = useZoteroDirDetect(open, dir, {
+		detect: async (isCancelled) => {
+			for (const candidate of await discoverZoteroDirs()) {
 				const r = await scanZotero(candidate);
-				if (!cancelled && r.valid && r.itemCount > 0) {
-					setDir(candidate);
-					setScan(r);
-					setSelectedItems(new Set(r.items.map((i) => i.id)));
+				if (!isCancelled() && r.valid && r.itemCount > 0) {
+					applyScan(candidate, r);
+					break;
 				}
-			} catch {
-				// no default library here — the user picks the folder manually
-			} finally {
-				if (!cancelled) setDetecting(false);
 			}
-		})();
-		return () => {
-			cancelled = true;
-		};
-	}, [open, dir]);
+		},
+	});
 
 	// Collection helpers: depth + descendant-inclusive item counts, so picking
 	// a parent folder clearly means "this folder and everything inside it".
@@ -255,6 +259,16 @@ export function ZoteroMigrateDialog({
 			return it.collections.includes(collFilter);
 		});
 	}, [scan, query, collFilter, collectionInfo]);
+	// A paper unit has one physical folder. Count the entries that would be
+	// visible in more than one Zotero collection so the user can make an
+	// informed choice before recreating the collection tree as folders.
+	const multiCollectionCount = useMemo(
+		() =>
+			scan?.items.filter(
+				(item) => item.itemType !== "note" && item.collections.length > 1,
+			).length ?? 0,
+		[scan],
+	);
 
 	const allFilteredSelected =
 		filtered.length > 0 && filtered.every((it) => selectedItems.has(it.id));
@@ -286,9 +300,9 @@ export function ZoteroMigrateDialog({
 		setError(null);
 		setProgress({ current: 0, total: selectedItems.size });
 		try {
-			const res = await enqueueBackgroundTask(
+			const res = await runLocalActivity(
 				{
-					kind: "import",
+					kind: "zoteroMigrate",
 					title: t("sidebar:zoteroMigrate.task"),
 					detail: dir,
 				},
@@ -373,6 +387,13 @@ export function ZoteroMigrateDialog({
 										})}
 									</li>
 								) : null}
+								{result.standaloneNotes > 0 ? (
+									<li>
+										{t("sidebar:zoteroMigrate.summaryStandaloneNotes", {
+											count: result.standaloneNotes,
+										})}
+									</li>
+								) : null}
 								{result.relocated > 0 ? (
 									<li>
 										{t("sidebar:zoteroMigrate.summaryRelocated", {
@@ -401,6 +422,13 @@ export function ZoteroMigrateDialog({
 										})}
 									</li>
 								) : null}
+								{result.ignoredUnsupported > 0 ? (
+									<li>
+										{t("sidebar:zoteroMigrate.summaryIgnoredUnsupported", {
+											count: result.ignoredUnsupported,
+										})}
+									</li>
+								) : null}
 								{result.mergedDuplicates > 0 ? (
 									<li>
 										{t("sidebar:zoteroMigrate.summaryDuplicates", {
@@ -419,6 +447,9 @@ export function ZoteroMigrateDialog({
 						</div>
 					) : (
 						<div className="space-y-4">
+							<p className="text-muted-foreground text-xs">
+								{t("sidebar:zoteroMigrate.stepsHint")}
+							</p>
 							<div className="space-y-1.5">
 								<Button
 									type="button"
@@ -441,6 +472,28 @@ export function ZoteroMigrateDialog({
 										? t("sidebar:zoteroMigrate.detecting")
 										: t("sidebar:zoteroMigrate.scanning")}
 								</p>
+							) : null}
+
+							{suggestedDir && !scanning ? (
+								<div className="flex items-center gap-2 rounded-md border border-amber-500/40 bg-amber-500/5 px-3 py-2 text-sm">
+									<TriangleAlert className="size-4 shrink-0 text-amber-500" />
+									<span
+										className="min-w-0 flex-1 truncate text-muted-foreground"
+										title={suggestedDir}
+									>
+										{t("sidebar:zoteroMigrate.parentFound")}
+									</span>
+									<Button
+										type="button"
+										variant="outline"
+										size="sm"
+										className="h-7 shrink-0 px-2 text-xs"
+										disabled={busy}
+										onClick={() => void scanDir(suggestedDir)}
+									>
+										{t("sidebar:zoteroMigrate.useParent")}
+									</Button>
+								</div>
 							) : null}
 
 							{scan ? (
@@ -489,6 +542,14 @@ export function ZoteroMigrateDialog({
 											label={t("sidebar:zoteroMigrate.migrateAnnotations")}
 										/>
 									</div>
+
+									{preserveCollections && multiCollectionCount > 0 ? (
+										<div className="rounded-md border border-amber-500/40 bg-amber-500/5 px-3 py-2 text-amber-950 text-xs dark:text-amber-200">
+											{t("sidebar:zoteroMigrate.multiCollectionWarning", {
+												count: multiCollectionCount,
+											})}
+										</div>
+									) : null}
 
 									<div className="space-y-1.5">
 										<div className="flex items-center justify-between">
@@ -595,12 +656,12 @@ export function ZoteroMigrateDialog({
 														</label>
 														{it.itemType &&
 														!STANDARD_ITEM_TYPES.has(it.itemType) ? (
-															<span className="shrink-0 rounded bg-muted px-1 text-[10px] text-muted-foreground">
+															<span className="shrink-0 rounded bg-muted px-1 text-caption text-muted-foreground">
 																{it.itemType}
 															</span>
 														) : null}
 														{it.hasPdf ? (
-															<span className="shrink-0 rounded bg-muted px-1 text-[10px] text-muted-foreground uppercase">
+															<span className="shrink-0 rounded bg-muted px-1 text-caption text-muted-foreground uppercase">
 																pdf
 															</span>
 														) : null}
@@ -682,34 +743,5 @@ export function ZoteroMigrateDialog({
 				</DialogFooter>
 			</DialogContent>
 		</Dialog>
-	);
-}
-
-/** A checkbox + label option row. */
-function Toggle({
-	id,
-	checked,
-	onChange,
-	disabled,
-	label,
-}: {
-	id: string;
-	checked: boolean;
-	onChange: (v: boolean) => void;
-	disabled?: boolean;
-	label: string;
-}) {
-	return (
-		<div className="flex items-center gap-2">
-			<Checkbox
-				id={id}
-				checked={checked}
-				onCheckedChange={(v) => onChange(v === true)}
-				disabled={disabled}
-			/>
-			<label htmlFor={id} className="cursor-pointer text-sm">
-				{label}
-			</label>
-		</div>
 	);
 }

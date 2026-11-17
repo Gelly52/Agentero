@@ -1,3 +1,8 @@
+export { ERR_TRANSLATE_NO_BUILTIN_KEY } from "@/lib/translate/api";
+export {
+	displayTranslateError,
+	isTranslateTransportError,
+} from "@/lib/translate/errors";
 export {
 	langsFromSettings,
 	resolveTargetLangCode,
@@ -10,16 +15,28 @@ export type {
 	FreeMtProbeStatus,
 } from "@/lib/translate/probe";
 export {
-	hasTranslateApiKey,
 	isCommercialProviderConfigured,
-	isTranslateApiKeyMask,
-	maskTranslateApiKey,
 	probeCommercialMtProvider,
 	probeFreeMtProviders,
 } from "@/lib/translate/probe";
-export { buildTranslatePrompt } from "@/lib/translate/prompt";
+export type { TranslateTemplateIssue } from "@/lib/translate/prompt";
+export {
+	buildTranslateMessages,
+	buildTranslatePrompt,
+	DEFAULT_TRANSLATE_PROMPT_TEMPLATE,
+	fillTranslateTextPlaceholder,
+	hasNumberedMarkers,
+	isShortColloquialPrompt,
+	renderTranslatePromptTemplate,
+	stripUnknownTranslatePlaceholders,
+	translateSystemTemplateIssue,
+	translateTemplateHasText,
+	translateUserTemplateIssue,
+	unknownTranslatePlaceholders,
+} from "@/lib/translate/prompt";
 export {
 	listAvailableAgents,
+	resolveConfiguredTranslateAgent,
 	resolveTranslateAgent,
 } from "@/lib/translate/resolve-agent";
 export { prepareTranslateTask, runTranslate } from "@/lib/translate/run";

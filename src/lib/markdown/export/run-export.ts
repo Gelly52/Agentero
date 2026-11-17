@@ -1,7 +1,8 @@
 import { createElement } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import i18n from "@/i18n";
-import { invokeApi } from "@/lib/core/ipc";
+import { commands } from "@/lib/core/bindings";
+import { callApi } from "@/lib/core/ipc";
 import { isTauri } from "@/lib/core/tauri";
 import {
 	applyPngWatermark,
@@ -17,18 +18,17 @@ import type {
 	MarkdownExportResult,
 	MarkdownExportSurfaceComponent,
 } from "@/lib/markdown/export/types";
-import { writeVaultBytes } from "@/lib/vault/fs";
+import { splitFrontmatter } from "@/lib/markdown/frontmatter";
+import { writeVaultBytes, writeVaultFile } from "@/lib/vault/fs";
 import { WikiNavContext } from "@/lib/wiki/nav-context";
 
 const EXPORT_WIDTH_PX = 800;
 
 async function loadSystemCjkFontBytes(): Promise<Uint8Array | null> {
 	try {
-		const payload = await invokeApi<{ path: string; bytesBase64: string }>(
-			"export_system_cjk_font",
-			undefined,
-			{ fallback: "export_system_cjk_font failed" },
-		);
+		const payload = await callApi(() => commands.exportSystemCjkFont(), {
+			fallback: "export_system_cjk_font failed",
+		});
 		if (!payload?.bytesBase64) return null;
 		const binary = atob(payload.bytesBase64);
 		const bytes = new Uint8Array(binary.length);
@@ -55,6 +55,20 @@ export async function runMarkdownExport(
 ): Promise<MarkdownExportResult> {
 	if (!isTauri()) {
 		throw new Error("export-desktop-only");
+	}
+
+	if (request.options.format === "md") {
+		const { save } = await import("@tauri-apps/plugin-dialog");
+		const path = await save({
+			defaultPath: `${request.defaultName}.md`,
+			filters: [{ name: "Markdown", extensions: ["md"] }],
+		});
+		if (!path) return { status: "cancelled" };
+
+		// Frontmatter is vault-internal metadata; standalone exports drop it.
+		const { body } = splitFrontmatter(request.markdown);
+		await writeVaultFile(path, body);
+		return { status: "saved", path, format: "md" };
 	}
 
 	const host = document.createElement("div");

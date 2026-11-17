@@ -4,27 +4,37 @@
  * API when Rust emits `job:offer` for a `layoutAnalyze` job.
  */
 
-import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import i18n from "@/i18n";
-import { errorText } from "@/lib/core/error";
-import { invokeApi } from "@/lib/core/ipc";
 import {
-	type JobOfferPayload,
-	type JobState,
-	jobReport,
-	registerJobExecutor,
-	startJobCenterExecutorListener,
-	startJobTaskProjection,
-	stopJobCenterExecutorListener,
-	stopJobTaskProjection,
-} from "@/lib/core/job-center";
+	backgroundTasksStore,
+	cancelBackgroundTask,
+} from "@/lib/core/background-tasks";
+import { commands } from "@/lib/core/bindings";
+import { errorText } from "@/lib/core/error";
+import { callApiResult } from "@/lib/core/ipc";
 import { logger } from "@/lib/core/logger";
+import { sameRelPaperPath } from "@/lib/core/path";
+import {
+	registerTaskExecutor,
+	type TaskExecutorContext,
+	type TaskReportArgs,
+} from "@/lib/core/tasks";
+import { findCanonicalPaperPdfPath } from "@/lib/paper/media";
 import { analyzePaperLayoutHeadless } from "@/lib/pdf/layout/headless-analyze";
-import { readLayoutSidecar } from "@/lib/pdf/layout/io";
+import {
+	layoutIndexPath,
+	layoutSidecarPath,
+	readLayoutSidecar,
+} from "@/lib/pdf/layout/io";
 import { layoutAnalysisStore } from "@/lib/pdf/layout/store";
+import {
+	isPathMissingError,
+	joinVaultPath,
+	removeVaultPath,
+	vaultPathExists,
+	vaultRelativePath,
+} from "@/lib/vault";
 import { getVaultPath } from "@/lib/vault/store";
-
-const JOB_CHANGED_EVENT = "job:changed";
 
 const queuedPapers = new Set<string>();
 
@@ -32,87 +42,61 @@ function normalizePaperKey(paperAbsPath: string): string {
 	return paperAbsPath.replace(/[/\\]+$/, "").replace(/\\/g, "/");
 }
 
-/** Caller owns the returned disposer. */
-export function initJobCenterExecutors(): () => void {
-	registerJobExecutor("layoutAnalyze", runLayoutAnalyzeExecutor);
-	startJobCenterExecutorListener();
-	startJobTaskProjection();
-	return () => {
-		stopJobCenterExecutorListener();
-		stopJobTaskProjection();
-	};
+/**
+ * Register the renderer-side `layoutAnalyze` executor. Call before
+ * `startTaskRuntime` (see `use-app-bootstrap`).
+ */
+export function registerLayoutTaskExecutor(): void {
+	registerTaskExecutor("layoutAnalyze", runLayoutAnalyzeExecutor);
 }
 
-async function runLayoutAnalyzeExecutor(offer: JobOfferPayload): Promise<void> {
-	const paperAbsPath = offer.paperPath
-		? `${offer.vaultPath}/${offer.paperPath}`.replace(/\\/g, "/")
-		: offer.vaultPath;
+async function runLayoutAnalyzeExecutor(
+	ctx: TaskExecutorContext,
+): Promise<void> {
+	const { jobId, vaultPath, paperPath, signal } = ctx;
+	const paperAbsPath = paperPath
+		? joinVaultPath(vaultPath, paperPath)
+		: vaultPath;
 	const paperLabel =
-		offer.paperPath?.split("/").filter(Boolean).pop() || paperAbsPath;
-	const documentId = `headless-layout-${offer.jobId}`;
+		paperPath?.split("/").filter(Boolean).pop() || paperAbsPath;
+	const documentId = `headless-layout-${jobId}`;
 
-	const abortController = new AbortController();
-	let cancelledUnlisten: UnlistenFn | null = null;
-
-	const report = (args: Parameters<typeof jobReport>[0]) =>
-		jobReport(args).catch((error) => {
+	const report = (args: TaskReportArgs) =>
+		ctx.report(args).catch((error) => {
 			logger.warn("layout analyze job report failed", {
-				jobId: offer.jobId,
+				jobId,
 				error: errorText(error),
 			});
 		});
 
-	try {
-		cancelledUnlisten = await listen<{ job: { id: string; state: JobState } }>(
-			JOB_CHANGED_EVENT,
-			(event) => {
-				if (event.payload.job.id !== offer.jobId) return;
-				if (event.payload.job.state === "cancelled") {
-					abortController.abort();
-				}
-			},
-		);
-
-		const unsub = layoutAnalysisStore.subscribe((state) => {
-			const { ui, activeDocumentId } = state;
-			if (activeDocumentId !== documentId) return;
-			if (ui.stage !== "running" || typeof ui.progress !== "number") return;
-			void report({
-				jobId: offer.jobId,
-				progress: ui.progress,
-				phase: ui.message?.trim() || i18n.t("viewer:figures.analyzing"),
-			});
+	const unsub = layoutAnalysisStore.subscribe((state) => {
+		const { ui, activeDocumentId } = state;
+		if (activeDocumentId !== documentId) return;
+		if (ui.stage !== "running" || typeof ui.progress !== "number") return;
+		void report({
+			progress: ui.progress,
+			phase: ui.message?.trim() || i18n.t("viewer:figures.analyzing"),
 		});
+	});
 
-		try {
-			if (abortController.signal.aborted) throw new Error("cancelled");
-			await analyzePaperLayoutHeadless({
-				paperAbsPath,
-				paperLabel,
-				documentId,
-				signal: abortController.signal,
-			});
-			await report({
-				jobId: offer.jobId,
-				progress: 100,
-				phase: "completed",
-				state: "succeeded",
-			});
-		} catch (e) {
-			const message = errorText(e);
-			const state = message.toLowerCase().includes("cancel")
-				? "cancelled"
-				: "failed";
-			await report({
-				jobId: offer.jobId,
-				state,
-				error: state === "failed" ? message : undefined,
-			});
-		} finally {
-			unsub();
-		}
+	try {
+		if (signal.aborted) throw new Error("cancelled");
+		await analyzePaperLayoutHeadless({
+			paperAbsPath,
+			paperLabel,
+			documentId,
+			signal,
+			force: ctx.force,
+		});
+		await report({ progress: 100, phase: "completed", state: "succeeded" });
+	} catch (e) {
+		const message = errorText(e);
+		const state = message.toLowerCase().includes("cancel")
+			? "cancelled"
+			: "failed";
+		await report({ state, error: state === "failed" ? message : undefined });
 	} finally {
-		cancelledUnlisten?.();
+		unsub();
 	}
 }
 
@@ -125,16 +109,32 @@ async function runLayoutAnalyzeExecutor(offer: JobOfferPayload): Promise<void> {
 export function enqueuePaperLayoutAnalysis(opts: {
 	paperAbsPath: string;
 	paperLabel?: string;
+	/** Explicit reading action takes priority over background imports. */
+	focus?: boolean;
+	/**
+	 * When true and Settings → Translate → auto-translate after layout
+	 * analysis is on, the Host also queues a `layoutTranslate` job that
+	 * starts only after this layout analysis succeeds. Import, download, and
+	 * manual reparse set it. Opening a paper leaves it false.
+	 */
+	autoTranslate?: boolean;
+	onError?: (error: unknown) => void;
 }): void {
 	const paperAbsPath = normalizePaperKey(opts.paperAbsPath);
-	if (!paperAbsPath || queuedPapers.has(paperAbsPath)) return;
+	if (!paperAbsPath || (!opts.focus && queuedPapers.has(paperAbsPath))) return;
 
 	const vaultPath = getVaultPath();
-	if (!vaultPath) return;
-	const paperRelPath = paperAbsPath
-		.slice(vaultPath.length)
-		.replace(/^[/\\]+/, "");
-	if (!paperRelPath) return;
+	const paperRelPath = vaultPath
+		? vaultRelativePath(vaultPath, paperAbsPath)
+		: null;
+	if (!vaultPath || !paperRelPath) {
+		// The caller parks the UI synchronously, so report invalid scope on
+		// the next microtask rather than silently leaving it waiting forever.
+		queueMicrotask(() =>
+			opts.onError?.(new Error(i18n.t("viewer:pdf.layoutTranslate.failed"))),
+		);
+		return;
+	}
 
 	queuedPapers.add(paperAbsPath);
 
@@ -142,25 +142,141 @@ export function enqueuePaperLayoutAnalysis(opts: {
 		try {
 			const cached = await readLayoutSidecar(paperAbsPath);
 			if (cached?.regions?.length) return;
-			await invokeApi(
-				"job_layout_analyze_enqueue",
-				{
-					args: {
+			await callApiResult(
+				() =>
+					commands.jobLayoutAnalyzeEnqueue({
 						vaultPath,
 						path: paperRelPath,
-						lane: "normal",
+						lane: opts.focus ? "focus" : "normal",
 						force: false,
-					},
-				},
+						autoTranslate: opts.autoTranslate ?? false,
+					}),
 				{ fallback: "layout analysis enqueue failed" },
 			);
+			// Enqueue dedupes with an existing job without changing its lane.
+			if (opts.focus) {
+				await callApiResult(
+					() => commands.jobFocusPaper({ vaultPath, path: paperRelPath }),
+					{ fallback: "layout analysis priority failed" },
+				);
+			}
 		} catch (e) {
 			logger.warn("enqueue paper layout analysis failed", {
 				paperAbsPath,
 				error: errorText(e),
 			});
+			opts.onError?.(e);
 		} finally {
 			queuedPapers.delete(paperAbsPath);
 		}
 	})();
+}
+
+export class LayoutReanalyzeError extends Error {
+	readonly code: "missing-pdf" | "missing-paper";
+
+	constructor(code: "missing-pdf" | "missing-paper") {
+		super(code);
+		this.name = "LayoutReanalyzeError";
+		this.code = code;
+	}
+}
+
+async function removePaperLayoutSidecars(paperAbsPath: string): Promise<void> {
+	await Promise.all(
+		[layoutSidecarPath(paperAbsPath), layoutIndexPath(paperAbsPath)].map(
+			async (path) => {
+				try {
+					if (!(await vaultPathExists(path))) return;
+					await removeVaultPath(path);
+				} catch (error) {
+					if (isPathMissingError(error)) return;
+					logger.warn("layout sidecar remove failed", {
+						path,
+						error: errorText(error),
+					});
+				}
+			},
+		),
+	);
+}
+
+/**
+ * Enqueue a focus `layoutAnalyze` job with `force: true` for one paper.
+ * The executor forwards `force` into `analyzePaperLayoutHeadless`, which
+ * otherwise returns when `layout.json` already has regions. After the job
+ * is queued, the two sidecar files are removed so other readers do not
+ * keep the old parse. The root `{id}.pdf` must already be on disk; this
+ * does not fall through to `source/assets/`.
+ *
+ * An in-flight layout analysis or translation for this paper is cancelled
+ * first, so the replacement does not keep writing the old layout. The
+ * enqueue asks for a dependent translation; the Host queues it only when
+ * auto-translate after layout analysis is on, and only after this analysis
+ * succeeds.
+ */
+export async function forcePaperLayoutAnalysis(opts: {
+	paperAbsPath: string;
+	paperRelPath?: string | null;
+}): Promise<void> {
+	const paperAbsPath = opts.paperAbsPath.trim().replace(/[/\\]+$/, "");
+	if (!paperAbsPath) throw new LayoutReanalyzeError("missing-paper");
+
+	const vaultPath = getVaultPath();
+	if (!vaultPath) throw new LayoutReanalyzeError("missing-paper");
+
+	const explicitRel = (opts.paperRelPath ?? "")
+		.replace(/\\/g, "/")
+		.replace(/^[/\\]+/, "");
+	const paperRelPath =
+		explicitRel ||
+		vaultRelativePath(vaultPath, paperAbsPath)?.replace(/^[/\\]+/, "") ||
+		"";
+	if (!paperRelPath) throw new LayoutReanalyzeError("missing-paper");
+
+	const pdfPath = await findCanonicalPaperPdfPath(paperAbsPath);
+	if (!pdfPath) throw new LayoutReanalyzeError("missing-pdf");
+
+	const inflight = backgroundTasksStore
+		.getState()
+		.tasks.filter(
+			(task) =>
+				(task.kind === "layoutAnalyze" || task.kind === "layoutTranslate") &&
+				(task.status === "queued" || task.status === "running") &&
+				sameRelPaperPath(task.paperPath, paperRelPath),
+		);
+	await Promise.all(
+		inflight.map(async (task) => {
+			try {
+				await callApiResult(() => commands.jobCancel(task.id), {
+					fallback: "layout job cancel failed",
+				});
+			} catch (error) {
+				logger.warn(
+					"cancel layout or translation job before force reanalyze failed",
+					{
+						jobId: task.id,
+						error: errorText(error),
+					},
+				);
+			}
+			cancelBackgroundTask(task.id);
+		}),
+	);
+
+	await callApiResult(
+		() =>
+			commands.jobLayoutAnalyzeEnqueue({
+				vaultPath,
+				path: paperRelPath,
+				lane: "focus",
+				force: true,
+				autoTranslate: true,
+			}),
+		{ fallback: "layout analysis enqueue failed" },
+	);
+	// Drop the old parse only after the force job is queued. A failed enqueue
+	// leaves the sidecar in place. `force` makes the new run ignore whatever
+	// is still on disk, then overwrite it.
+	await removePaperLayoutSidecars(paperAbsPath);
 }

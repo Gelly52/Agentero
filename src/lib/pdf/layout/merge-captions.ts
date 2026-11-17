@@ -1,5 +1,7 @@
 import { clamp01 } from "@/lib/core/math";
 import type { PdfAskNormalizedRect } from "@/lib/pdf/ask/types";
+import { LAYOUT_SIDEBAR_MIN_SCORE } from "@/lib/pdf/layout/constants";
+import { figureCaptionKey } from "@/lib/pdf/layout/figure-caption-text";
 import {
 	isAlgorithmLayoutKind,
 	isCaptionLayoutKind,
@@ -25,7 +27,7 @@ export type CaptionPlacement = "below" | "above";
  * Documented in docs/frontend/pdf-layout-analysis.md §规则清单.
  */
 export const LAYOUT_MERGE = {
-	/** Title width ≥ this → full-page multi-panel figure (take all band panels). */
+	/** Title width ≥ this → allow several caption-anchored panel groups. */
 	fullWidthTitle: 0.55,
 	/**
 	 * Max vertical reach above a *half-width* title when no previous caption ceiling.
@@ -80,6 +82,12 @@ export const LAYOUT_MERGE = {
 	figureTextCover: 0.55,
 	/** Min score for text/header/abstract to veto a figure detection. */
 	figureTextMinScore: 0.3,
+	/** A heading taller than this may be a misclassified diagram, not reliable text evidence. */
+	figureTextMaxHeaderHeight: 0.12,
+	/** Minimum geometric score lead before assigning an unreadable caption to a non-figure host. */
+	captionFamilyMinScoreMargin: 0.2,
+	/** Only explicit numbered captions may attach beside a figure across a small gutter. */
+	sideCaptionMaxGap: 0.06,
 } as const;
 
 /**
@@ -133,6 +141,11 @@ export function figureCoveredByBodyText(
 	for (const t of bodyBlocks) {
 		if (t.pageIndex !== pageIndex) continue;
 		if (!isLayoutBodyTextKind(t.kind)) continue;
+		if (
+			t.kind === "header" &&
+			t.bbox.h > LAYOUT_MERGE.figureTextMaxHeaderHeight
+		)
+			continue;
 		if (t.score < LAYOUT_MERGE.figureTextMinScore) continue;
 		if (bboxCoveredBy(box, t.bbox) >= coverThreshold) return true;
 	}
@@ -150,6 +163,9 @@ export function suppressSpuriousFigureDetections(
 	const bodyBlocks = regions.filter(
 		(r) =>
 			isLayoutBodyTextKind(r.kind) &&
+			!(
+				r.kind === "header" && r.bbox.h > LAYOUT_MERGE.figureTextMaxHeaderHeight
+			) &&
 			r.score >= LAYOUT_MERGE.figureTextMinScore,
 	);
 	if (!bodyBlocks.length) return [...regions];
@@ -276,7 +292,9 @@ export function captionCompatibleWithHost(
 	if (r === "subpanel") return family === "figure";
 	// Unclassified model labels:
 	if (captionKind === "figure_title") return family === "figure";
-	if (captionKind === "header") return true;
+	// A running header or section heading is not a caption merely because it
+	// happens to be near a figure/table. Explicit caption roles above still work.
+	if (captionKind === "header") return false;
 	return false;
 }
 
@@ -304,7 +322,7 @@ export function isSubpanelCaption(c: PdfLayoutRegion): boolean {
 
 /**
  * Vertical band for a main figure title: from previous main caption bottom
- * down to this title top (prevents Fig 6/7/8 vertical over-merge).
+ * down to this title top, restricted to horizontally overlapping captions.
  */
 export function verticalCeilingForTitle(
 	title: PdfLayoutRegion,
@@ -314,6 +332,7 @@ export function verticalCeilingForTitle(
 	for (const other of mainCaptions) {
 		if (other.id === title.id) continue;
 		if (other.pageIndex !== title.pageIndex) continue;
+		if (horizontalOverlapRatio(other.bbox, title.bbox) < 0.2) continue;
 		const otherBottom = other.bbox.y + other.bbox.h;
 		// Captions strictly above this title.
 		if (otherBottom <= title.bbox.y + 0.01) {
@@ -364,6 +383,7 @@ export function areFigureNeighbors(
 
 export function connectedPanelGroups(
 	panels: PdfLayoutRegion[],
+	blockers: readonly PdfLayoutRegion[] = [],
 ): PdfLayoutRegion[][] {
 	if (!panels.length) return [];
 	const n = panels.length;
@@ -383,7 +403,10 @@ export function connectedPanelGroups(
 	};
 	for (let i = 0; i < n; i++) {
 		for (let j = i + 1; j < n; j++) {
-			if (areFigureNeighbors(panels[i].bbox, panels[j].bbox)) {
+			if (
+				areFigureNeighbors(panels[i].bbox, panels[j].bbox) &&
+				!hasFigureSeparator(panels[i], panels[j], blockers)
+			) {
 				unite(i, j);
 			}
 		}
@@ -421,6 +444,52 @@ export function captionAttachScore(
 	}
 	if (!aboveOk) return Number.NEGATIVE_INFINITY;
 	return hOverlap * 2 + 0.2 - Math.abs(gapAbove) * 8;
+}
+
+/** Resolve text-free generic caption detections using competing host families. */
+function resolveMergeCaptionRole(
+	caption: PdfLayoutRegion,
+	regions: readonly PdfLayoutRegion[],
+): PdfLayoutRegion["captionRole"] {
+	const role = resolveCaptionRole(caption);
+	if (
+		caption.kind !== "figure_title" ||
+		caption.title?.trim() ||
+		caption.text?.trim() ||
+		(role !== "figure_main" && role !== "other")
+	)
+		return role;
+	const scores = new Map<LayoutHostFamily, number>();
+	for (const host of regions) {
+		const family = hostFamily(host.kind);
+		if (
+			!family ||
+			host.pageIndex !== caption.pageIndex ||
+			host.score < LAYOUT_SIDEBAR_MIN_SCORE
+		)
+			continue;
+		const score =
+			captionAttachScore(
+				host.bbox,
+				caption.bbox,
+				preferredCaptionPlacement(family),
+			) +
+			host.score * 0.1;
+		if (Number.isFinite(score))
+			scores.set(family, Math.max(scores.get(family) ?? -Infinity, score));
+	}
+	const ranked = [...scores].sort((a, b) => b[1] - a[1]);
+	const best = ranked[0];
+	// Keep the existing figure fallback when host families are ambiguous. Textual
+	// semantics always win; this only repairs the geometry-only generic label.
+	if (
+		!best ||
+		best[0] === "figure" ||
+		(ranked[1] &&
+			best[1] - ranked[1][1] < LAYOUT_MERGE.captionFamilyMinScoreMargin)
+	)
+		return role;
+	return best[0] === "table" ? "table_main" : "algorithm_main";
 }
 
 /**
@@ -478,7 +547,7 @@ export function panelsAboveTitle(
 		if (
 			ceiling <= 0 &&
 			Number.isFinite(maxHeightAbove) &&
-			titleTop - p.bbox.y > maxHeightAbove
+			titleTop - p.bbox.y > maxHeightAbove + 1e-9
 		) {
 			return false;
 		}
@@ -486,54 +555,192 @@ export function panelsAboveTitle(
 	});
 }
 
+/** A confident block in the vertical gap separates floats, not text inside panels. */
+function hasFigureSeparator(
+	a: PdfLayoutRegion,
+	b: PdfLayoutRegion,
+	blockers: readonly PdfLayoutRegion[],
+): boolean {
+	const [upper, lower] =
+		a.bbox.y < b.bbox.y ? [a.bbox, b.bbox] : [b.bbox, a.bbox];
+	const top = upper.y + upper.h;
+	const bottom = lower.y;
+	if (bottom <= top) return false;
+	const x = Math.max(upper.x, lower.x);
+	const right = Math.min(upper.x + upper.w, lower.x + lower.w);
+	if (right <= x) return false;
+	return blockers.some((block) => {
+		if (
+			block.pageIndex !== a.pageIndex ||
+			block.id === a.id ||
+			block.id === b.id
+		)
+			return false;
+		if (!(block.score >= LAYOUT_SIDEBAR_MIN_SCORE)) return false;
+		const r = block.bbox;
+		const overlap = Math.max(0, Math.min(right, r.x + r.w) - Math.max(x, r.x));
+		return (
+			r.y >= top - 0.005 &&
+			r.y + r.h <= bottom + 0.005 &&
+			r.h >= 0.015 &&
+			overlap / (right - x) >= 0.5
+		);
+	});
+}
+
 /**
- * Full-width caption (e.g. Figure 2 / Figure 4): take every panel in the
- * vertical band — connectivity is optional (image/chart gaps, mixed kinds).
- * Half-width caption (side-by-side Fig 7 | Fig 8): column + connectivity.
+ * Grow connected panels from groups close to the caption. Full-width captions
+ * can seed several disconnected columns, but never collect an entire page band.
  */
 export function selectClusterForTitle(
 	title: PdfLayoutRegion,
 	panels: PdfLayoutRegion[],
 	mainFigureCaptions: PdfLayoutRegion[],
+	blockers: readonly PdfLayoutRegion[] = [],
 ): PdfLayoutRegion[] {
 	const ceiling = verticalCeilingForTitle(title, mainFigureCaptions);
 	const fullWidth = title.bbox.w >= LAYOUT_MERGE.fullWidthTitle;
-	const figurePanels = panels.filter((p) => isFigureLayoutKind(p.kind));
-	const candidates = panelsAboveTitle(title, figurePanels, {
-		ceiling,
-		fullWidth,
-	});
-	if (!candidates.length) return [];
-
-	// ── Pattern A: full-width multi-panel figure under one caption ──
-	if (fullWidth) {
-		return candidates;
-	}
-
-	// ── Pattern B: column figure — only panels in this title's column ──
-	const inColumn = candidates.filter((g) =>
-		panelInTitleColumn(g.bbox, title.bbox),
+	const captionText = title.title ?? title.text ?? "";
+	const panelReferences = new Set(
+		[...captionText.matchAll(/\(([a-z])\)|\bpanel\s+([a-z])\b/gi)].map(
+			(match) => (match[1] ?? match[2]).toLowerCase(),
+		),
 	);
-	const pool = inColumn.length ? inColumn : candidates;
-	const groups = connectedPanelGroups(pool);
-	if (!groups.length) return pool;
-
-	let best: PdfLayoutRegion[] = groups[0];
+	const candidates = panelsAboveTitle(
+		title,
+		panels.filter((p) => p.score >= LAYOUT_SIDEBAR_MIN_SCORE),
+		{
+			ceiling,
+			fullWidth,
+			// A numbered caption explicitly referring to several panels can span
+			// a full column. Connectivity still requires a nearby caption seed.
+			maxHeightAbove:
+				figureCaptionKey(captionText) && panelReferences.size >= 2
+					? Number.POSITIVE_INFINITY
+					: undefined,
+		},
+	);
+	const groups = connectedPanelGroups(candidates, blockers);
+	const anchored = groups.filter((group) =>
+		group.some((panel) => {
+			const gap = title.bbox.y - (panel.bbox.y + panel.bbox.h);
+			const slack = fullWidth
+				? LAYOUT_MERGE.fullWidthPanelBottomSlack
+				: LAYOUT_MERGE.panelBottomSlack;
+			return (
+				gap >= -slack &&
+				gap <= 0.12 + 1e-9 &&
+				horizontalOverlapRatio(panel.bbox, title.bbox) >= 0.2 &&
+				!hasFigureSeparator(panel, title, blockers)
+			);
+		}),
+	);
+	if (fullWidth) return anchored.flat();
+	let best: PdfLayoutRegion[] = [];
 	let bestScore = Number.NEGATIVE_INFINITY;
-	for (const group of groups) {
-		const body = unionMany(group.map((g) => g.bbox));
+	for (const group of anchored) {
+		const body = unionMany(group.map((p) => p.bbox));
 		if (!body) continue;
-		const bodyBottom = body.y + body.h;
-		const gap = title.bbox.y - bodyBottom;
-		const hOv = horizontalOverlapRatio(body, title.bbox);
-		const gapScore = gap >= -0.04 && gap <= 0.12 ? 1 - Math.abs(gap) * 6 : -2;
-		const score = group.length * 0.35 + hOv * 2.5 + gapScore;
+		const gap = title.bbox.y - (body.y + body.h);
+		const score =
+			horizontalOverlapRatio(body, title.bbox) * 2.5 - Math.abs(gap) * 6;
 		if (score > bestScore) {
 			bestScore = score;
 			best = group;
 		}
 	}
 	return best;
+}
+
+/** A numbered caption can wrap into a second column below a multi-row grid.
+ * Require model-caption evidence and two aligned panel rows, not adjacent prose.
+ */
+function joinGridCaptionColumns(
+	captions: PdfLayoutRegion[],
+	panels: PdfLayoutRegion[],
+	blockers: readonly PdfLayoutRegion[],
+): PdfLayoutRegion[] {
+	const used = new Set<string>();
+	const joined = new Map<string, PdfLayoutRegion>();
+	const numbered = captions.filter((c) =>
+		figureCaptionKey(c.title ?? c.text ?? ""),
+	);
+	for (const title of numbered) {
+		if (title.bbox.w >= LAYOUT_MERGE.fullWidthTitle) continue;
+		const candidates = captions.filter((next) => {
+			const gap = next.bbox.x - title.bbox.x - title.bbox.w;
+			return (
+				next.pageIndex === title.pageIndex &&
+				next.kind === "figure_title" &&
+				next.id !== title.id &&
+				!used.has(next.id) &&
+				next.score >= LAYOUT_SIDEBAR_MIN_SCORE &&
+				Boolean((next.title ?? next.text)?.trim()) &&
+				resolveCaptionRole(next) === "other" &&
+				gap >= 0 &&
+				gap <= 0.06 &&
+				Math.abs(next.bbox.y - title.bbox.y) <= 0.012 &&
+				next.bbox.h <= 0.2 &&
+				title.bbox.h <= 0.2 &&
+				next.bbox.w / title.bbox.w >= 0.6 &&
+				next.bbox.w / title.bbox.w <= 1.67
+			);
+		});
+		if (candidates.length !== 1) continue;
+		const next = candidates[0];
+		const span = unionBbox(title.bbox, next.bbox);
+		if (span.w < LAYOUT_MERGE.fullWidthTitle) continue;
+		// Another numbered caption in the same strip makes ownership ambiguous.
+		if (
+			numbered.some(
+				(c) =>
+					c.id !== title.id &&
+					c.pageIndex === title.pageIndex &&
+					Math.abs(c.bbox.y - title.bbox.y) <= 0.04 &&
+					horizontalOverlapRatio(c.bbox, span) >= 0.2,
+			)
+		)
+			continue;
+		const grid = { ...title, bbox: span };
+		const group = selectClusterForTitle(grid, panels, numbered, blockers);
+		if (group.length < 4) continue;
+		const ceiling = verticalCeilingForTitle({ ...title, bbox: span }, numbered);
+		const left = panelsAboveTitle(title, group, { fullWidth: true, ceiling });
+		const right = panelsAboveTitle(next, group, { fullWidth: true, ceiling });
+		const rows = left
+			.filter((a) =>
+				right.some((b) => {
+					const gap = b.bbox.x - a.bbox.x - a.bbox.w;
+					return (
+						gap >= -0.01 &&
+						gap <= LAYOUT_MERGE.panelNeighborGap + 1e-9 &&
+						verticalOverlapRatio(a.bbox, b.bbox) >= 0.75 &&
+						Math.abs(a.bbox.h - b.bbox.h) <=
+							Math.max(a.bbox.h, b.bbox.h) * 0.25 &&
+						!hasFigureSeparator(a, b, blockers)
+					);
+				}),
+			)
+			.sort((a, b) => a.bbox.y - b.bbox.y);
+		const distinctRows: PdfLayoutRegion[] = [];
+		for (const row of rows) {
+			const previous = distinctRows.at(-1);
+			if (!previous || row.bbox.y >= previous.bbox.y + previous.bbox.h * 0.7)
+				distinctRows.push(row);
+		}
+		if (distinctRows.length < 2) continue;
+		used.add(next.id);
+		joined.set(title.id, {
+			...title,
+			bbox: span,
+			rect: unionBbox(title.rect, next.rect),
+			title: `${title.title ?? title.text} ${next.title ?? next.text}`,
+			text: `${title.title ?? title.text} ${next.title ?? next.text}`,
+		});
+	}
+	return captions
+		.filter((c) => !used.has(c.id))
+		.map((c) => joined.get(c.id) ?? c);
 }
 
 /** True if outer fully covers inner (title must never stick out of the figure box). */
@@ -585,17 +792,6 @@ export function buildFigureBboxWithFullTitle(
 	return bbox;
 }
 
-/**
- * @deprecated Use buildFigureBboxWithFullTitle — never clip title out of the box.
- */
-export function clipFigureBboxToTitleColumn(
-	bbox: PdfAskNormalizedRect,
-	title: PdfAskNormalizedRect,
-): PdfAskNormalizedRect {
-	// Preserve full title; only used as a soft body clamp then re-union title.
-	return buildFigureBboxWithFullTitle([bbox], title);
-}
-
 function isHalfWidthFigureHost(h: PdfLayoutRegion): boolean {
 	const tw = h.titleBbox?.w ?? h.bbox.w;
 	return tw < LAYOUT_MERGE.fullWidthTitle;
@@ -614,8 +810,18 @@ export function resolveFigureBboxOverlaps(
 			const a = out[i];
 			const b = out[j];
 			if (!isFigureLayoutKind(a.kind) || !isFigureLayoutKind(b.kind)) continue;
+			// Untitled/cross-page figures have no same-page caption anchor for a split.
+			if (!a.titleBbox || !b.titleBbox) continue;
 			if (a.pageIndex !== b.pageIndex) continue;
 			if (!isHalfWidthFigureHost(a) || !isHalfWidthFigureHost(b)) continue;
+			if (verticalOverlapRatio(a.bbox, b.bbox) < 0.2) continue;
+			// Same-column/stacked captions do not establish a left/right split.
+			if (
+				a.titleBbox &&
+				b.titleBbox &&
+				horizontalOverlapRatio(a.titleBbox, b.titleBbox) > 0.2
+			)
+				continue;
 
 			const ax2 = a.bbox.x + a.bbox.w;
 			const bx2 = b.bbox.x + b.bbox.w;
@@ -673,7 +879,8 @@ export function suppressOrphanFiguresInsideClusters(
 			// Prefer keeping titled/full-width clusters over bare panel leftovers.
 			const bigIsCluster =
 				(big.titleBbox?.w ?? 0) >= 0.5 || Boolean(big.title?.match(/^fig/i));
-			const smallIsOrphan = !small.titleBbox || (small.titleBbox.w ?? 1) < 0.4;
+			const smallIsOrphan =
+				!small.titleBbox && !figureCaptionKey(small.title ?? "");
 			if (!bigIsCluster || !smallIsOrphan) continue;
 			const cont = (() => {
 				const a = small.bbox;
@@ -826,8 +1033,8 @@ function attachCaptionToHost(
 }
 
 /**
- * Every figure must have a title fully inside its box.
- * - No titleBbox → drop (panel without Figure N caption = mis-clustered)
+ * Preserve optional titles; same-page title boxes must stay fully inside hosts.
+ * - No titleBbox → keep reliable uncaptioned/text-only/cross-page figures.
  * - Title sticks out → expand bbox to cover full title
  */
 export function requireFigureTitles(
@@ -839,7 +1046,10 @@ export function requireFigureTitles(
 			result.push(h);
 			continue;
 		}
-		if (!h.titleBbox) continue;
+		if (!h.titleBbox) {
+			result.push(h);
+			continue;
+		}
 		let bbox = h.bbox;
 		if (!bboxFullyContains(bbox, h.titleBbox)) {
 			bbox = unionBbox(bbox, h.titleBbox);
@@ -854,6 +1064,7 @@ function pairCaptionsOneToOne(
 	hosts: PdfLayoutRegion[],
 	captions: PdfLayoutRegion[],
 	familyFilter: LayoutHostFamily,
+	blockers: readonly PdfLayoutRegion[] = [],
 ): Map<string, PdfLayoutRegion> {
 	type Pair = { hostId: string; caption: PdfLayoutRegion; score: number };
 	const pairs: Pair[] = [];
@@ -861,13 +1072,17 @@ function pairCaptionsOneToOne(
 
 	for (const host of hosts) {
 		const family = hostFamily(host.kind);
-		if (family !== familyFilter) continue;
+		// A host that will be discarded by the sidebar must not consume a caption.
+		if (family !== familyFilter || host.score < LAYOUT_SIDEBAR_MIN_SCORE)
+			continue;
 		for (const caption of captions) {
 			if (caption.pageIndex !== host.pageIndex) continue;
 			const role = resolveCaptionRole(caption);
 			if (!captionCompatibleWithHost(caption.kind, family, role)) continue;
 			// Subpanels handled separately.
 			if (role === "subpanel") continue;
+			if (family === "figure" && hasFigureSeparator(host, caption, blockers))
+				continue;
 
 			const place =
 				role === "figure_main"
@@ -876,7 +1091,27 @@ function pairCaptionsOneToOne(
 						? "above"
 						: preferred;
 
-			const spatial = captionAttachScore(host.bbox, caption.bbox, place);
+			let spatial = captionAttachScore(host.bbox, caption.bbox, place);
+			if (
+				!Number.isFinite(spatial) &&
+				family === "figure" &&
+				role === "figure_main" &&
+				figureCaptionKey(caption.title ?? caption.text ?? "")
+			) {
+				const h = host.bbox,
+					c = caption.bbox;
+				const gap = Math.max(c.x - h.x - h.w, h.x - c.x - c.w);
+				const overlap = verticalOverlapRatio(h, c);
+				if (
+					gap >= -0.01 &&
+					gap <= LAYOUT_MERGE.sideCaptionMaxGap &&
+					overlap >= 0.5 &&
+					c.w <= h.w &&
+					c.h <= h.h * 1.25
+				) {
+					spatial = overlap * 2 + 0.2 - Math.max(0, gap) * 8;
+				}
+			}
 			if (!Number.isFinite(spatial)) continue;
 
 			let score = spatial + caption.score * 0.1;
@@ -1072,6 +1307,180 @@ export function mergeFormulasByNumber(
 }
 
 /**
+ * A model can confidently call a caption `text` (ViT Figures 6 and 11).
+ * Recover numbered caption starts (including caption-only pages);
+ * prose such as "Figure 5 contains ..." remains body text. Keep raw unchanged.
+ */
+function recoverFigureCaptionLabels(
+	regions: PdfLayoutRegion[],
+): PdfLayoutRegion[] {
+	const recovered = regions.map((r) => {
+		if (
+			!(r.kind === "text" || r.kind === "header") ||
+			r.score < LAYOUT_SIDEBAR_MIN_SCORE ||
+			!r.text
+		)
+			return r;
+		if (!figureCaptionKey(r.text)) return r;
+		// OCR can omit a line and split a caption into two body paragraphs. A
+		// weak caption detection may still locate the whole paragraph correctly:
+		// trust it only when two confident text fragments corroborate its text.
+		const complete = regions.filter((candidate) => {
+			const text = candidate.title ?? candidate.text ?? "";
+			if (
+				candidate.kind !== "figure_title" ||
+				candidate.pageIndex !== r.pageIndex ||
+				candidate.score >= LAYOUT_SIDEBAR_MIN_SCORE ||
+				candidate.bbox.h > 0.2 ||
+				Math.abs(candidate.bbox.y - r.bbox.y) > 0.01 ||
+				Math.abs(candidate.bbox.w - r.bbox.w) > 0.01 ||
+				bboxCoveredBy(r.bbox, candidate.bbox) < 0.95 ||
+				!text.startsWith(`${r.text} `) ||
+				/[.!?。！？]\s*$/.test(r.text ?? "")
+			)
+				return false;
+			const tail = text.slice((r.text?.length ?? 0) + 1);
+			return (
+				/^[a-z]/.test(tail) &&
+				regions.some(
+					(part) =>
+						part.kind === "text" &&
+						part.pageIndex === r.pageIndex &&
+						part.score >= LAYOUT_SIDEBAR_MIN_SCORE &&
+						part.text === tail &&
+						part.bbox.y >= r.bbox.y + r.bbox.h &&
+						part.bbox.y - r.bbox.y - r.bbox.h <= 0.02 &&
+						Math.abs(part.bbox.x - r.bbox.x) <= 0.01 &&
+						bboxCoveredBy(part.bbox, candidate.bbox) >= 0.95,
+				)
+			);
+		});
+		const source = complete.length === 1 ? complete[0] : r;
+		return {
+			...source,
+			id: r.id,
+			score: r.score,
+			readingOrder: r.readingOrder,
+			kind: "figure_title" as const,
+			title: source.title ?? source.text,
+			captionRole: "figure_main" as const,
+		};
+	});
+	// Prefer the complete text-run caption over an overlapping model/text duplicate.
+	return recovered.filter((r, index) => {
+		const key =
+			r.kind === "figure_title" ? figureCaptionKey(r.title ?? "") : null;
+		if (!key) return true;
+		return !recovered.some(
+			(other, otherIndex) =>
+				otherIndex !== index &&
+				other.kind === "figure_title" &&
+				other.score >= LAYOUT_SIDEBAR_MIN_SCORE &&
+				other.pageIndex === r.pageIndex &&
+				figureCaptionKey(other.title ?? "") === key &&
+				Math.max(
+					bboxCoveredBy(r.bbox, other.bbox),
+					bboxCoveredBy(other.bbox, r.bbox),
+				) >= 0.55 &&
+				(other.bbox.w > r.bbox.w + 0.005 ||
+					(Math.abs(other.bbox.w - r.bbox.w) <= 0.005 && otherIndex < index)),
+		);
+	});
+}
+
+/** Only pair an adjacent-page main caption with a unique, figure-dominated group. */
+function associateCrossPageCaptions(
+	panels: PdfLayoutRegion[],
+	titles: PdfLayoutRegion[],
+	allCaptions: PdfLayoutRegion[],
+	blockers: PdfLayoutRegion[],
+	usedPanelIds: Set<string>,
+	usedCaptionIds: Set<string>,
+): PdfLayoutRegion[] {
+	const groups: PdfLayoutRegion[][] = [];
+	for (const page of new Set(panels.map((p) => p.pageIndex))) {
+		if (titles.some((t) => t.pageIndex === page)) continue;
+		const free = panels.filter(
+			(p) => p.pageIndex === page && !usedPanelIds.has(p.id),
+		);
+		const connected = connectedPanelGroups(free, blockers);
+		if (connected.length !== 1) continue;
+		const group = connected[0];
+		const bounds = unionMany(group.map((p) => p.bbox));
+		if (!bounds || bounds.w * bounds.h < 0.15) continue;
+		// Prose between panels makes a group ambiguous; article text above/below it does not.
+		if (
+			blockers.some(
+				(b) =>
+					b.pageIndex === page &&
+					b.kind === "text" &&
+					b.bbox.w * b.bbox.h > 0.03 &&
+					bboxCoveredBy(b.bbox, bounds) > 0.2 &&
+					!group.some((p) => bboxCoveredBy(b.bbox, p.bbox) >= 0.85),
+			)
+		)
+			continue;
+		groups.push(group);
+	}
+	const proposals = groups.map((group) => ({
+		group,
+		captions: titles.filter((t) => {
+			if (usedCaptionIds.has(t.id) || !figureCaptionKey(t.title ?? ""))
+				return false;
+			const key = figureCaptionKey(t.title ?? "");
+			if (
+				allCaptions.some(
+					(c) =>
+						c.pageIndex === group[0].pageIndex &&
+						/see\s+next\s+page\s+for\s+caption/i.test(c.title ?? "") &&
+						figureCaptionKey(c.title ?? "") !== key,
+				)
+			)
+				return false;
+			if (
+				group.some((p) => {
+					const known = figureCaptionKey(p.title ?? "");
+					return known && known !== key;
+				})
+			)
+				return false;
+			const delta = t.pageIndex - group[0].pageIndex;
+			return (
+				(delta === -1 && t.bbox.y >= 0.6) || (delta === 1 && t.bbox.y <= 0.25)
+			);
+		}),
+	}));
+	const result: PdfLayoutRegion[] = [];
+	for (const { group, captions } of proposals) {
+		if (captions.length !== 1) continue;
+		const caption = captions[0];
+		if (
+			proposals.filter((p) => p.captions.some((c) => c.id === caption.id))
+				.length !== 1
+		)
+			continue;
+		const bbox = unionMany(group.map((p) => p.bbox));
+		if (!bbox) continue;
+		const rect = group
+			.slice(1)
+			.reduce((r, p) => unionRect(r, p.rect), group[0].rect);
+		result.push({
+			...group[0],
+			bbox,
+			rect,
+			title: caption.title,
+			captionPageIndex: caption.pageIndex,
+			captionBbox: caption.bbox,
+			score: Math.max(...group.map((p) => p.score)),
+			captionRole: "figure_main",
+		});
+		for (const panel of group) usedPanelIds.add(panel.id);
+		usedCaptionIds.add(caption.id);
+	}
+	return result;
+}
+
+/**
  * Title-first 联图 for figures; tables/algorithms use text-aware above captions.
  * "Table N" mislabeled as figure_title binds to tables; (a)(b) are subpanels only.
  * Formulas: number-first aggregation; unnumbered formulas dropped.
@@ -1080,18 +1489,42 @@ export function mergeCaptionsIntoHosts(
 	regions: PdfLayoutRegion[],
 ): PdfLayoutRegion[] {
 	// Drop image/chart that are dual-labeled text/header before figure clustering.
-	const cleaned = suppressSpuriousFigureDetections(regions);
+	const cleaned = suppressSpuriousFigureDetections(
+		recoverFigureCaptionLabels(regions),
+	).filter(
+		(r) =>
+			!(isFigureLayoutKind(r.kind) || isCaptionLayoutKind(r.kind)) ||
+			r.score >= LAYOUT_SIDEBAR_MIN_SCORE,
+	);
 	// Ensure roles are resolved for merge decisions.
 	const tagged = cleaned.map((r) =>
 		isCaptionLayoutKind(r.kind)
-			? { ...r, captionRole: resolveCaptionRole(r) }
+			? { ...r, captionRole: resolveMergeCaptionRole(r, cleaned) }
 			: r,
 	);
 
-	const figures = tagged.filter((r) => isFigureLayoutKind(r.kind));
 	const tables = tagged.filter((r) => isTableLayoutKind(r.kind));
+	const figures = tagged.filter(
+		(r) =>
+			isFigureLayoutKind(r.kind) &&
+			!tables.some(
+				(t) =>
+					t.pageIndex === r.pageIndex &&
+					t.score >= r.score * 0.85 &&
+					bboxCoveredBy(r.bbox, t.bbox) >= 0.85,
+			),
+	);
 	const algorithms = tagged.filter((r) => isAlgorithmLayoutKind(r.kind));
-	const captions = tagged.filter((r) => isCaptionLayoutKind(r.kind));
+	const captions = joinGridCaptionColumns(
+		tagged.filter((r) => isCaptionLayoutKind(r.kind)),
+		figures,
+		tagged.filter(
+			(r) =>
+				isTableLayoutKind(r.kind) ||
+				isAlgorithmLayoutKind(r.kind) ||
+				isLayoutBodyTextKind(r.kind),
+		),
+	);
 	// formula + formula_number only (text no longer used as a formula merge gate).
 	const formulaRelated = tagged.filter(
 		(r) => isFormulaLayoutKind(r.kind) || isFormulaNumberLayoutKind(r.kind),
@@ -1107,7 +1540,11 @@ export function mergeCaptionsIntoHosts(
 			!isTextLayoutKind(r.kind),
 	);
 
-	const mainFigureTitles = captions.filter(isMainFigureCaption);
+	const mainFigureTitles = captions.filter(
+		(c) =>
+			isMainFigureCaption(c) &&
+			!/see\s+next\s+page\s+for\s+caption/i.test(c.title ?? ""),
+	);
 	const tableCaptions = captions.filter(isMainTableCaption);
 	const algorithmCaptions = captions.filter(isMainAlgorithmCaption);
 	const subpanels = captions.filter(isSubpanelCaption);
@@ -1130,15 +1567,33 @@ export function mergeCaptionsIntoHosts(
 	const clustered: PdfLayoutRegion[] = [];
 
 	// ── Phase 1: main Figure N titles → multi-panel image/chart only ──
-	const sortedMainFigs = [...mainFigureTitles].sort(
-		(a, b) => a.pageIndex - b.pageIndex || a.bbox.y - b.bbox.y,
+	const byPosition = (a: PdfLayoutRegion, b: PdfLayoutRegion) =>
+		a.pageIndex - b.pageIndex || a.bbox.y - b.bbox.y || a.bbox.x - b.bbox.x;
+	// Unreadable narrow captions are ambiguous. Let known main titles claim
+	// their panels first, then recover still-unassigned caption/panel groups.
+	const fallbackTitles = otherCaptions.filter(
+		(c) => c.kind === "figure_title" && !c.title?.trim(),
 	);
+	const sortedMainFigs = [...mainFigureTitles]
+		.sort(byPosition)
+		.concat(fallbackTitles.sort(byPosition));
 
 	const tableAlgBlockers = [...tables, ...algorithms];
+	const figureBlockers = [
+		...tableAlgBlockers,
+		...tagged.filter(
+			(r) => isLayoutBodyTextKind(r.kind) && resolveCaptionRole(r) === "other",
+		),
+	];
 
 	for (const title of sortedMainFigs) {
 		const freePanels = panelsWithSubs.filter((f) => !usedPanelIds.has(f.id));
-		const cluster = selectClusterForTitle(title, freePanels, mainFigureTitles);
+		const cluster = selectClusterForTitle(
+			title,
+			freePanels,
+			mainFigureTitles,
+			figureBlockers,
+		);
 		if (!cluster.length) continue;
 
 		const body = unionMany(cluster.map((c) => c.bbox));
@@ -1179,6 +1634,17 @@ export function mergeCaptionsIntoHosts(
 		for (const s of extraSubs) usedCaptionIds.add(s.id);
 	}
 
+	clustered.push(
+		...associateCrossPageCaptions(
+			panelsWithSubs,
+			mainFigureTitles,
+			captions,
+			figureBlockers,
+			usedPanelIds,
+			usedCaptionIds,
+		),
+	);
+
 	// ── Phase 2: tables (above caption, including mislabeled figure_title) ──
 	const freeTableCaps = [
 		...tableCaptions.filter((c) => !usedCaptionIds.has(c.id)),
@@ -1201,15 +1667,19 @@ export function mergeCaptionsIntoHosts(
 		...mainFigureTitles.filter((c) => !usedCaptionIds.has(c.id)),
 		...otherCaptions.filter((c) => !usedCaptionIds.has(c.id)),
 	];
-	const figPairs = pairCaptionsOneToOne(freeFigures, freeFigCaps, "figure");
+	const figPairs = pairCaptionsOneToOne(
+		freeFigures,
+		freeFigCaps,
+		"figure",
+		figureBlockers,
+	);
 	for (const cap of figPairs.values()) usedCaptionIds.add(cap.id);
 
 	const singles: PdfLayoutRegion[] = [];
-	// Figures without a paired title are dropped — not a valid figure entry.
+	// Missing captions are not evidence that a detected figure is invalid.
 	for (const host of freeFigures) {
 		const cap = figPairs.get(host.id);
-		if (!cap) continue;
-		singles.push(attachCaptionToHost(host, cap));
+		singles.push(cap ? attachCaptionToHost(host, cap) : host);
 	}
 	for (const host of tables) {
 		const cap = tablePairs.get(host.id);
@@ -1230,7 +1700,7 @@ export function mergeCaptionsIntoHosts(
 		...numberedFormulas,
 	];
 	// Orphans inside 联图 → soft half-width split (title always re-included)
-	// → keep only figures with full title inside bbox.
+	// → include same-page titles in full, preserving uncaptioned figures.
 	return requireFigureTitles(
 		resolveFigureBboxOverlaps(suppressOrphanFiguresInsideClusters(hosts)),
 	);

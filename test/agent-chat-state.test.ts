@@ -4,6 +4,7 @@ import {
 	agentHasContent,
 	agentTextFromParts,
 	appendStreamPart,
+	applyToolToLines,
 	applyToolToParts,
 	buildLocalTranscriptPrompt,
 	buildOptions,
@@ -13,18 +14,22 @@ import {
 	ensureModelsInclude,
 	errorChatLine,
 	errorText,
+	failIncompleteTools,
 	formatAskUserAnswers,
 	isBackgroundWorkflowHistoryTitle,
 	isPendingAskUserToolStatus,
+	mergeModelChoices,
 	parseAskUserQuestions,
 	providerSessionIdForHistoryLoad,
 	questionsFromAskUserDtos,
 	questionsFromElicitationFields,
 	resolveSelected,
+	shouldAttachLocalTranscript,
 	shouldDeferSessionEvent,
 	upsertChatSessionTurn,
 	upsertPlanPart,
 } from "@/lib/agent/chat-state";
+import { encodeMentionToken } from "@/lib/agent/composer-inline-tokens";
 import { resetAgentChatIds } from "@/lib/pdf-visual/ids";
 
 beforeEach(() => {
@@ -79,6 +84,185 @@ describe("stream / tool / plan parts", () => {
 			type: "tool",
 			tool: { id: "t1", status: "completed", output: "ok" },
 		});
+	});
+
+	it("applies a late tool update to the completed turn that owns its id", () => {
+		const lines: ChatLine[] = [
+			{
+				id: "a1",
+				kind: "agent",
+				streaming: false,
+				parts: [
+					{
+						type: "tool",
+						id: "p1",
+						tool: {
+							id: "t1",
+							title: "terminal: pwd",
+							kind: "execute",
+							status: "failed",
+						},
+					},
+				],
+			},
+		];
+
+		const lateProgress = applyToolToLines(lines, {
+			id: "t1",
+			status: "in_progress",
+			output: "partial",
+		});
+		expect(lateProgress).toMatchObject([
+			{ parts: [{ tool: { status: "failed", output: "partial" } }] },
+		]);
+		const completed = applyToolToLines(lateProgress, {
+			id: "t1",
+			status: "completed",
+			output: "ok",
+		});
+		expect(completed).toMatchObject([
+			{
+				parts: [{ tool: { id: "t1", status: "completed", output: "ok" } }],
+			},
+		]);
+		expect(
+			applyToolToLines(completed, {
+				id: "t1",
+				status: "pending",
+				output: "late output",
+			}),
+		).toMatchObject([
+			{ parts: [{ tool: { status: "completed", output: "late output" } }] },
+		]);
+		expect(
+			applyToolToLines(lines, { id: "unknown", status: "completed" }),
+		).toBe(lines);
+	});
+
+	it("keeps recorded ask-user answers on the tool card across later updates", () => {
+		const questions = [
+			{
+				question: "Which language?",
+				options: [{ label: "English" }, { label: "Chinese" }],
+			},
+		];
+		const lines: ChatLine[] = [
+			{
+				id: "a1",
+				kind: "agent",
+				streaming: true,
+				parts: [
+					{
+						type: "tool",
+						id: "p1",
+						tool: {
+							id: "ask-1",
+							title: "Ask 1 question",
+							kind: "other",
+							status: "in_progress",
+						},
+					},
+				],
+			},
+		];
+
+		const answered = applyToolToLines(lines, {
+			id: "ask-1",
+			status: "completed",
+			askUser: { questions, answers: ["Chinese"] },
+		});
+		expect(answered).toMatchObject([
+			{
+				parts: [
+					{
+						tool: {
+							status: "completed",
+							askUser: { questions, answers: ["Chinese"] },
+						},
+					},
+				],
+			},
+		]);
+
+		const late = applyToolToLines(answered, {
+			id: "ask-1",
+			output: "done",
+		});
+		expect(late).toMatchObject([
+			{
+				parts: [
+					{
+						tool: {
+							output: "done",
+							askUser: { questions, answers: ["Chinese"] },
+						},
+					},
+				],
+			},
+		]);
+	});
+
+	it("fails only unfinished tools when a turn ends", () => {
+		const parts = [
+			{
+				type: "tool" as const,
+				id: "p1",
+				tool: {
+					id: "t1",
+					title: "Pending",
+					kind: "execute",
+					status: "in_progress" as const,
+				},
+			},
+			{
+				type: "tool" as const,
+				id: "p2",
+				tool: {
+					id: "t2",
+					title: "Done",
+					kind: "read",
+					status: "completed" as const,
+				},
+			},
+		];
+
+		expect(failIncompleteTools(parts)).toMatchObject([
+			{ tool: { id: "t1", status: "failed" } },
+			{ tool: { id: "t2", status: "completed" } },
+		]);
+	});
+
+	it("keeps an answered ask-user tool completed when its blocked turn cancels", () => {
+		const lines: ChatLine[] = [
+			{
+				id: "a1",
+				kind: "agent",
+				streaming: true,
+				parts: [
+					{
+						type: "tool",
+						id: "p1",
+						tool: {
+							id: "ask-1",
+							title: "Question",
+							kind: "other",
+							status: "pending",
+						},
+					},
+				],
+			},
+		];
+		const answered = applyToolToLines(lines, {
+			id: "ask-1",
+			status: "completed",
+		});
+		const turn = answered[0];
+		expect(turn?.kind).toBe("agent");
+		if (turn?.kind !== "agent") throw new Error("expected agent turn");
+
+		expect(failIncompleteTools(turn.parts)).toMatchObject([
+			{ tool: { id: "ask-1", status: "completed" } },
+		]);
 	});
 
 	it("keeps a single plan part", () => {
@@ -478,21 +662,34 @@ describe("buildOptions / resolveSelected", () => {
 		enabled: true,
 	};
 
+	const claudeAgent: AgentListResponse["agents"][number] = {
+		id: "claude-1",
+		name: "Claude",
+		template: "claude-acp",
+		command: "claude-agent-acp",
+		args: [],
+		env: {},
+		available: true,
+		lastProbeOk: true,
+	};
+
+	const claudeEntry: CatalogScanResponse["entries"][number] = {
+		templateId: "claude-acp",
+		name: "Claude",
+		description: "",
+		command: "claude",
+		args: [],
+		installHint: "",
+		binaryAvailable: true,
+		acpCommandAvailable: true,
+		acpStatus: "ready",
+		registeredId: "claude-1",
+		isDefault: true,
+	};
+
 	const catalog: CatalogScanResponse = {
 		entries: [
-			{
-				templateId: "claude-acp",
-				name: "Claude",
-				description: "",
-				command: "claude",
-				args: [],
-				installHint: "",
-				binaryAvailable: true,
-				acpCommandAvailable: true,
-				acpStatus: "ready",
-				registeredId: "claude-1",
-				isDefault: true,
-			},
+			claudeEntry,
 			{
 				templateId: "missing",
 				name: "Missing",
@@ -519,10 +716,184 @@ describe("buildOptions / resolveSelected", () => {
 		expect(opts.find((o) => o.name === "Missing")).toBeUndefined();
 	});
 
+	it.each([
+		"missing",
+		"ready",
+	] as const)("omits a bundled historical default without its host (acpStatus=%s)", (acpStatus) => {
+		const staleRegistry: AgentListResponse = {
+			...registry,
+			defaultId: "claude-1",
+			agents: [...registry.agents, { ...claudeAgent, available: false }],
+		};
+		const opts = buildOptions(staleRegistry, {
+			...catalog,
+			entries: [
+				{
+					...claudeEntry,
+					binaryAvailable: false,
+					acpCommandAvailable: false,
+					acpBundled: true,
+					acpStatus,
+				},
+			],
+		});
+
+		expect(opts.map((o) => o.id)).toEqual(["reg-1"]);
+		expect(resolveSelected(opts, "claude-1", staleRegistry)?.id).toBe("reg-1");
+	});
+
+	it.each([
+		{
+			registeredId: "claude-1",
+			id: "claude-1",
+			template: "custom",
+		},
+		{
+			registeredId: "claude-1",
+			id: "legacy-claude",
+			template: "claude-acp",
+		},
+		{
+			registeredId: null,
+			id: "legacy-claude",
+			template: "claude-acp",
+		},
+	] as const)("does not restore a failed catalog entry via registry ($registeredId / $id / $template)", ({
+		registeredId,
+		id,
+		template,
+	}) => {
+		const opts = buildOptions(
+			{
+				...registry,
+				agents: [...registry.agents, { ...claudeAgent, id, template }],
+			},
+			{
+				...catalog,
+				entries: [{ ...claudeEntry, acpStatus: "failed", registeredId }],
+			},
+		);
+
+		expect(opts.map((o) => o.id)).toEqual(["reg-1"]);
+	});
+
+	it.each([
+		"claude-acp",
+		"custom",
+	] as const)("uses current registry availability without a catalog (%s)", (template) => {
+		const state: AgentListResponse = {
+			...registry,
+			defaultId: "claude-1",
+			agents: [
+				...registry.agents,
+				{ ...claudeAgent, template, available: false },
+			],
+		};
+
+		expect(buildOptions(state, null).map((o) => o.id)).toEqual(["reg-1"]);
+		expect(
+			buildOptions(
+				{
+					...state,
+					agents: state.agents.map((agent) => ({
+						...agent,
+						available: true,
+					})),
+				},
+				null,
+			).map((o) => o.id),
+		).toEqual(["claude-1", "reg-1"]);
+	});
+
+	it("keeps available catalog custom agents but ignores their historical probes", () => {
+		const opts = buildOptions(null, {
+			...catalog,
+			entries: [],
+			customAgents: [
+				...registry.agents,
+				{ ...claudeAgent, template: "custom", available: false },
+			],
+		});
+
+		expect(opts.map((o) => o.id)).toEqual(["reg-1"]);
+	});
+
+	it("offers a ready PATH adapter without requiring its host CLI", () => {
+		const opts = buildOptions(null, {
+			...catalog,
+			entries: [
+				{
+					...claudeEntry,
+					command: "claude-agent-acp",
+					binaryAvailable: false,
+					acpBundled: false,
+					canInstall: true,
+				},
+			],
+		});
+
+		expect(opts).toHaveLength(1);
+		expect(opts[0]).toMatchObject({ id: "claude-1", source: "catalog" });
+	});
+
 	it("prefers selected id then default", () => {
 		const opts = buildOptions(registry, catalog);
 		expect(resolveSelected(opts, "reg-1", registry)?.id).toBe("reg-1");
 		expect(resolveSelected(opts, null, registry)?.isDefault).toBe(true);
+	});
+
+	it("sorts catalog entries alphabetically regardless of input order", () => {
+		const shuffledCatalog: CatalogScanResponse = {
+			...catalog,
+			entries: [
+				{
+					templateId: "opencode",
+					name: "OpenCode",
+					description: "",
+					command: "opencode",
+					args: [],
+					installHint: "",
+					binaryAvailable: true,
+					acpCommandAvailable: true,
+					acpStatus: "ready",
+					registeredId: "opencode-1",
+					isDefault: false,
+				},
+				{
+					templateId: "claude-acp",
+					name: "Claude",
+					description: "",
+					command: "claude",
+					args: [],
+					installHint: "",
+					binaryAvailable: true,
+					acpCommandAvailable: true,
+					acpStatus: "ready",
+					registeredId: "claude-1",
+					isDefault: true,
+				},
+				{
+					templateId: "codex-acp",
+					name: "Codex",
+					description: "",
+					command: "codex",
+					args: [],
+					installHint: "",
+					binaryAvailable: true,
+					acpCommandAvailable: true,
+					acpStatus: "ready",
+					registeredId: "codex-1",
+					isDefault: false,
+				},
+			],
+		};
+		const opts = buildOptions(registry, shuffledCatalog);
+		expect(opts.map((o) => o.name)).toEqual([
+			"Claude",
+			"Codex",
+			"OpenCode",
+			"Reg",
+		]);
 	});
 });
 
@@ -557,6 +928,40 @@ describe("ensureModelsInclude", () => {
 			group: "Custom",
 		});
 		expect(out.map((m) => m.id)).toEqual(["deepseek-chat", "gpt-5", "gpt-4.1"]);
+	});
+});
+
+describe("mergeModelChoices", () => {
+	it("keeps the richer catalog and appends new ids (openCode stale snapshot)", () => {
+		const richer = [
+			{ id: "opencode/gpt-5", name: "opencode/GPT-5" },
+			{ id: "deepseek/deepseek-flash", name: "deepseek/DeepSeek V4.1 Flash" },
+			{ id: "xai/grok-4.3", name: "xai/Grok 4.3" },
+		];
+		// session/new partial snapshot (custom providers only) arrives after the
+		// complete list; it must not drop the built-in provider.
+		const stale = [
+			{ id: "deepseek/deepseek-flash", name: "deepseek/DeepSeek V4.1 Flash" },
+			{ id: "xai/grok-4.3", name: "xai/Grok 4.3" },
+		];
+		const merged = mergeModelChoices(richer, stale);
+		expect(merged.map((m) => m.id)).toEqual([
+			"opencode/gpt-5",
+			"deepseek/deepseek-flash",
+			"xai/grok-4.3",
+		]);
+	});
+
+	it("adds genuinely new ids from the extra list", () => {
+		const merged = mergeModelChoices(
+			[{ id: "a", name: "A" }],
+			[
+				{ id: "a", name: "A again" },
+				{ id: "b", name: "B", group: "g" },
+			],
+		);
+		expect(merged.map((m) => m.id)).toEqual(["a", "b"]);
+		expect(merged[1]?.group).toBe("g");
 	});
 });
 
@@ -713,5 +1118,48 @@ describe("buildLocalTranscriptPrompt", () => {
 
 	it("returns empty when there is no prior dialogue", () => {
 		expect(buildLocalTranscriptPrompt([])).toBe("");
+	});
+
+	it("replays a mention chip as a readable label", () => {
+		const lines: ChatLine[] = [
+			{
+				id: "u1",
+				kind: "user",
+				text: "梳理一下",
+				markup: `梳理一下 ${encodeMentionToken("notes/论文关系图.md")}`,
+			},
+		];
+		expect(buildLocalTranscriptPrompt(lines)).toContain(
+			"User: 梳理一下 @论文关系图.md",
+		);
+	});
+});
+
+describe("shouldAttachLocalTranscript", () => {
+	it("attaches when the provider session cannot be resumed", () => {
+		expect(
+			shouldAttachLocalTranscript({
+				resumeAllowed: false,
+				historyStatus: "completed",
+			}),
+		).toBe(true);
+	});
+
+	it("attaches after a failed turn so a dead connection does not drop the chat", () => {
+		expect(
+			shouldAttachLocalTranscript({
+				resumeAllowed: true,
+				historyStatus: "failed",
+			}),
+		).toBe(true);
+	});
+
+	it("omits the transcript on a healthy resume", () => {
+		expect(
+			shouldAttachLocalTranscript({
+				resumeAllowed: true,
+				historyStatus: "completed",
+			}),
+		).toBe(false);
 	});
 });

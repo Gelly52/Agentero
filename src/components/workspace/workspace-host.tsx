@@ -42,12 +42,17 @@ import { renameWikiHeadingAction } from "@/lib/wiki/actions";
 import {
 	closePlazaTabs,
 	closeTab,
+	compileTexOnManualSave,
 	ensureLibraryTabPresent,
 	handleActivePanelChange,
 	hydratePlaceholderTabs,
 	openTab,
 	openTabNotes,
+	openTranslationTab,
+	persistExcalidrawFile,
 	persistFile,
+	persistTextFile,
+	rehydrateMisclassifiedPaperTabs,
 } from "@/lib/workspace/actions";
 import { registerDockHandle } from "@/lib/workspace/dock-registry";
 import { evictPdfBuffers, nextPdfLru } from "@/lib/workspace/pdf-retention";
@@ -59,13 +64,18 @@ import {
 	toggleTabHtmlMode,
 	updateTab,
 } from "@/lib/workspace/store";
-import { savePersistedTabs } from "@/lib/workspace/tabs";
+import {
+	applyMarkdownConflictChoice,
+	savePersistedTabs,
+} from "@/lib/workspace/tabs";
+import { viewerModeSpec } from "@/lib/workspace/viewer";
 
 /**
  * Number of PDF *viewers* kept mounted (most recent first). Dockview already
  * keeps PDF panel shells mounted (`renderer: 'always'`); this LRU only gates
  * EmbedPDF/PDFium so switching among recent PDFs is instant without holding
- * every open document on the main thread.
+ * every open document on the main thread. Which modes join this pool is
+ * declared per mode in the viewer registry (`keepAlive: "pdf"`).
  */
 const PDF_TAB_MOUNT_LRU = 2;
 
@@ -73,8 +83,11 @@ const PDF_TAB_MOUNT_LRU = 2;
  * Number of Plate Markdown editors kept mounted (most recent first). Same
  * shell/LRU split as PDF: switching back to a recent note skips plugin init
  * and full-document deserialization without retaining every open editor.
+ * Raised to 4 so a few split notes stay warm; heavier documents deserialize
+ * through the content-trimmed remark pipeline. Pool membership is declared
+ * per mode in the viewer registry (`keepAlive: "editor"`).
  */
-const EDITOR_TAB_MOUNT_LRU = 2;
+const EDITOR_TAB_MOUNT_LRU = 4;
 
 function handleWorkspaceDrop(drop: WorkspaceExternalDrop): void {
 	const path = drop.paths[0];
@@ -95,6 +108,7 @@ function handleLibraryColumnsChange(cols: LibraryColumnPref[]): void {
 export function WorkspaceHost() {
 	const { t } = useTranslation(["app"]);
 	const vaultPath = useVaultStore((s) => s.vaultPath);
+	const treeLoading = useVaultStore((s) => s.treeLoading);
 	const tabs = useWorkspaceStore((s) => s.tabs);
 	const activeTabId = useWorkspaceStore((s) => s.activeTabId);
 	const dockLayout = useWorkspaceStore((s) => s.dockLayout);
@@ -138,51 +152,73 @@ export function WorkspaceHost() {
 	const visiblePdfIds = useMemo(() => {
 		const visible = new Set(visiblePanelIds);
 		return tabs
-			.filter((tab) => tab.mode === "pdf" && visible.has(tab.id))
+			.filter(
+				(tab) =>
+					viewerModeSpec(tab.mode).keepAlive === "pdf" && visible.has(tab.id),
+			)
 			.map((tab) => tab.id);
 	}, [tabs, visiblePanelIds]);
 
 	const visibleEditorIds = useMemo(() => {
 		const visible = new Set(visiblePanelIds);
 		return tabs
-			.filter((tab) => tab.mode === "markdown" && visible.has(tab.id))
+			.filter(
+				(tab) =>
+					viewerModeSpec(tab.mode).keepAlive === "editor" &&
+					visible.has(tab.id),
+			)
 			.map((tab) => tab.id);
 	}, [tabs, visiblePanelIds]);
 
+	// Registry keep-alive pool membership of the active tab (drives LRU
+	// promotion and PDF-buffer retention below).
+	const activePdfId =
+		activeTab && viewerModeSpec(activeTab.mode).keepAlive === "pdf"
+			? activeTab.id
+			: null;
+	const activeEditorId =
+		activeTab && viewerModeSpec(activeTab.mode).keepAlive === "editor"
+			? activeTab.id
+			: null;
+
 	// Keep visible/recent PDF panels mounted without bootstrapping every restored PDF.
 	useEffect(() => {
-		const ids = tabs.filter((tab) => tab.mode === "pdf").map((tab) => tab.id);
-		const activePdf = activeTab?.mode === "pdf" ? activeTab.id : null;
+		const ids = tabs
+			.filter((tab) => viewerModeSpec(tab.mode).keepAlive === "pdf")
+			.map((tab) => tab.id);
 		if (!ids.length) {
 			setPdfLru((previous) => (previous.length ? [] : previous));
 			return;
 		}
-		const promoted = activePdf
-			? [activePdf, ...visiblePdfIds.filter((id) => id !== activePdf)]
+		const promoted = activePdfId
+			? [activePdfId, ...visiblePdfIds.filter((id) => id !== activePdfId)]
 			: visiblePdfIds;
 		setPdfLru((previous) =>
 			nextPdfLru(previous, ids, promoted, PDF_TAB_MOUNT_LRU),
 		);
-	}, [activeTab?.mode, activeTab?.id, tabs, visiblePdfIds]);
+	}, [activePdfId, tabs, visiblePdfIds]);
 
-	// Same keep-alive for Markdown editors: evicted tabs drop back to a
-	// placeholder and re-deserialize only when their group exposes them again.
+	// Same keep-alive for Markdown editors (and the CodeMirror text editor):
+	// evicted tabs drop back to a placeholder and re-deserialize only when
+	// their group exposes them again.
 	useEffect(() => {
 		const ids = tabs
-			.filter((tab) => tab.mode === "markdown")
+			.filter((tab) => viewerModeSpec(tab.mode).keepAlive === "editor")
 			.map((tab) => tab.id);
-		const activeEditor = activeTab?.mode === "markdown" ? activeTab.id : null;
 		if (!ids.length) {
 			setEditorLru((previous) => (previous.length ? [] : previous));
 			return;
 		}
-		const promoted = activeEditor
-			? [activeEditor, ...visibleEditorIds.filter((id) => id !== activeEditor)]
+		const promoted = activeEditorId
+			? [
+					activeEditorId,
+					...visibleEditorIds.filter((id) => id !== activeEditorId),
+				]
 			: visibleEditorIds;
 		setEditorLru((previous) =>
 			nextPdfLru(previous, ids, promoted, EDITOR_TAB_MOUNT_LRU),
 		);
-	}, [activeTab?.mode, activeTab?.id, tabs, visibleEditorIds]);
+	}, [activeEditorId, tabs, visibleEditorIds]);
 
 	// Local PDF ArrayBuffers are large and keep PDFium documents alive indirectly.
 	// Evicted tabs become placeholders and reload only when one of their groups
@@ -191,18 +227,22 @@ export function WorkspaceHost() {
 		const retained = new Set([
 			...pdfLru,
 			...visiblePanelIds,
-			...(activeTab?.mode === "pdf" ? [activeTab.id] : []),
+			...(activePdfId ? [activePdfId] : []),
 		]);
 		setTabs((previous) => evictPdfBuffers(previous, retained));
-	}, [activeTab?.mode, activeTab?.id, pdfLru, visiblePanelIds]);
+	}, [activePdfId, pdfLru, visiblePanelIds]);
 
 	// Tree selection / create-parent follows the active document.
-	// Scoped library keeps the tree highlight on the org folder.
+	// Scoped library keeps the tree highlight on the org folder. The resident
+	// full Library tab is active by default and must not claim the tree
+	// selection, otherwise every folder click snaps the cursor to `papers/`.
 	const selectedPath = activeTab?.path ?? null;
 	useEffect(() => {
 		if (!selectedPath) return;
-		if (isLibraryVirtualPath(selectedPath) && libraryScopePath && vaultPath) {
-			setTreeSelectedPath(joinVaultPath(vaultPath, libraryScopePath));
+		if (isLibraryVirtualPath(selectedPath)) {
+			if (libraryScopePath && vaultPath) {
+				setTreeSelectedPath(joinVaultPath(vaultPath, libraryScopePath));
+			}
 			return;
 		}
 		setTreeSelectedPath(selectedPath);
@@ -216,15 +256,21 @@ export function WorkspaceHost() {
 			: activeTabId
 				? [activeTabId]
 				: [];
+		if (!ids.length) return;
+		if (!treeLoading) rehydrateMisclassifiedPaperTabs();
 		hydratePlaceholderTabs(ids);
-	}, [activeTabId, visiblePanelIds]);
+	}, [activeTabId, visiblePanelIds, treeLoading]);
 
-	// Default page: empty strip with a Vault open → show full Library.
+	// Library is resident: with a Vault open its tab must exist (fresh open,
+	// restore from a layout saved without it, or after other tabs closed).
+	const hasLibraryTab = useMemo(
+		() => tabs.some((t) => isLibraryVirtualPath(t.path)),
+		[tabs],
+	);
 	useEffect(() => {
-		if (!vaultPath) return;
-		if (tabs.length > 0) return;
+		if (!vaultPath || hasLibraryTab) return;
 		ensureLibraryTabPresent();
-	}, [vaultPath, tabs.length]);
+	}, [vaultPath, hasLibraryTab]);
 
 	// Layout alone is persisted (panels + order + active + path/mode in params).
 	useEffect(() => {
@@ -282,6 +328,15 @@ export function WorkspaceHost() {
 			notesPlaceholder: t("editor.notesPlaceholder"),
 			markdownPlaceholder: t("editor.markdownPlaceholder"),
 			onPersistFile: persistFile,
+			onResolveMarkdownConflict: (
+				tabId: string,
+				action: "keep" | "load" | "hold",
+				disk: string,
+			) => {
+				setTabs((prev) =>
+					applyMarkdownConflictChoice(prev, tabId, action, disk),
+				);
+			},
 			onAssetsChanged: handleAssetsChanged,
 			onTabPatch: updateTab,
 			onRenameHeading:
@@ -306,8 +361,25 @@ export function WorkspaceHost() {
 			onHighlightsChange: setTabHighlights,
 			onAsksChange: setTabAsks,
 			onVisualTracesChange: setTabVisualTraces,
+			onOpenTranslationTab: openTranslationTab,
 		}),
 		[handleOpenSettings],
+	);
+	const excalidrawProps = useMemo(
+		() => ({
+			onPersistFile: persistExcalidrawFile,
+			onTabPatch: updateTab,
+		}),
+		[],
+	);
+	const textProps = useMemo(
+		() => ({
+			onPersistFile: persistTextFile,
+			// ⌘S: save landed — TeX compiles, everything else no-ops inside.
+			onManualSave: (path: string) => void compileTexOnManualSave(path),
+			onTabPatch: updateTab,
+		}),
+		[],
 	);
 	const centerProps = useMemo(
 		() => ({
@@ -315,6 +387,8 @@ export function WorkspaceHost() {
 			library: libraryProps,
 			editor: editorProps,
 			pdf: pdfProps,
+			excalidraw: excalidrawProps,
+			text: textProps,
 			onTrashChanged: handleTrashReload,
 			trashReloadSignal,
 		}),
@@ -323,6 +397,8 @@ export function WorkspaceHost() {
 			libraryProps,
 			editorProps,
 			pdfProps,
+			excalidrawProps,
+			textProps,
 			handleTrashReload,
 			trashReloadSignal,
 		],

@@ -6,7 +6,6 @@ export {
 	type PointerOrigin,
 } from "@/lib/pdf/layout/click-guard";
 export {
-	LAYOUT_KIND_BADGE_CLASS,
 	LAYOUT_KIND_BORDER,
 	LAYOUT_KIND_FILL,
 	LAYOUT_KIND_HEX,
@@ -14,6 +13,10 @@ export {
 	layoutKindFill,
 	layoutKindHex,
 } from "@/lib/pdf/layout/colors";
+export {
+	formatLayoutPageRanges,
+	type LayoutCompletenessWarning,
+} from "@/lib/pdf/layout/completeness";
 export {
 	LAYOUT_HINT_MIN_REGION_H_PX,
 	LAYOUT_HINT_MIN_REGION_W_PX,
@@ -25,11 +28,20 @@ export {
 	type DedupeLayoutOptions,
 	dedupeLayoutRegions,
 } from "@/lib/pdf/layout/dedupe";
-export { enqueuePaperLayoutAnalysis } from "@/lib/pdf/layout/enqueue-paper-layout";
+export {
+	enqueuePaperLayoutAnalysis,
+	forcePaperLayoutAnalysis,
+	LayoutReanalyzeError,
+} from "@/lib/pdf/layout/enqueue-paper-layout";
 export {
 	analyzePaperLayoutHeadless,
 	type HeadlessLayoutResult,
 } from "@/lib/pdf/layout/headless-analyze";
+export {
+	type HeadlessTranslateResult,
+	registerLayoutTranslateTaskExecutor,
+	translatePaperLayoutHeadless,
+} from "@/lib/pdf/layout/headless-translate";
 export {
 	bboxArea,
 	hoverableLayoutRegions,
@@ -38,14 +50,15 @@ export {
 	pickLayoutRegionAtPoint,
 	pointInBbox,
 	rawLayoutRegionsByPage,
-	rawLayoutRegionsOnPage,
 } from "@/lib/pdf/layout/hit-test";
 export {
-	LAYOUT_INDEX_FILE,
 	LAYOUT_SIDECAR_FILE,
 	LAYOUT_SIDECAR_SCHEMA_VERSION,
 	layoutIndexPath,
+	layoutSidecarBlocksAnalysis,
+	layoutSidecarNeedsViewerReload,
 	layoutSidecarPath,
+	layoutSidecarWasReplaced,
 	type PdfLayoutSidecar,
 	parseLayoutSidecar,
 	readLayoutIndex,
@@ -65,7 +78,6 @@ export {
 	isLayoutTranslateHeadingKind,
 	isSidebarLayoutKind,
 	isTableLayoutKind,
-	isTargetLayoutLabel,
 	isTextLayoutKind,
 	layoutDedupeGroup,
 	layoutKindI18nKey,
@@ -85,30 +97,25 @@ export {
 } from "@/lib/pdf/layout/layout-index";
 export {
 	applyLayoutTranslateSidecar,
+	countPendingLayoutTranslateItems,
 	currentLayoutTranslateCacheKey,
+	flushLayoutTranslateSidecar,
 	groupLayoutTranslateItemsByPage,
 	hasPendingLayoutTranslateItems,
-	LAYOUT_TRANSLATE_CONCURRENCY,
+	hydrateLayoutTranslateItems,
+	isLayoutTranslateItemPainted,
 	LAYOUT_TRANSLATE_MAX_CHARS,
-	LAYOUT_TRANSLATE_SIDECAR_FILE,
-	LAYOUT_TRANSLATE_SIDECAR_SCHEMA_VERSION,
+	type LayoutTranslateCacheHydration,
 	type LayoutTranslateCacheKey,
 	type LayoutTranslateItem,
-	type LayoutTranslateItemStatus,
 	type LayoutTranslateJobStatus,
-	type LayoutTranslateRegion,
-	type LayoutTranslateSidecar,
-	type LayoutTranslateSidecarItem,
-	layoutRegionSourceText,
-	layoutTranslateSidecarPath,
-	listTranslatableLayoutRegions,
-	parseLayoutTranslateSidecar,
+	type LayoutTranslateRunScope,
+	layoutTranslatePendingPageRange,
 	persistLayoutTranslateSidecarBestEffort,
 	readLayoutTranslateSidecar,
 	runLayoutRegionTranslate,
 	toLayoutTranslateItems,
-	writeLayoutTranslateSidecar,
-} from "@/lib/pdf/layout/layout-translate";
+} from "@/lib/pdf/layout/layout-translate-reliable";
 export {
 	buildLayoutTranslateChains,
 	isLayoutParagraphContinuation,
@@ -127,7 +134,6 @@ export {
 	type CaptionPlacement,
 	captionAttachScore,
 	captionCompatibleWithHost,
-	clipFigureBboxToTitleColumn,
 	compareLayoutReadingOrder,
 	connectedPanelGroups,
 	formulaSortAnchor,
@@ -154,11 +160,8 @@ export {
 	verticalCeilingForTitle,
 } from "@/lib/pdf/layout/merge-captions";
 export {
-	attachLayoutModelTaskListener,
 	ensureLayoutModel,
 	getLayoutModelStatus,
-	LAYOUT_MODEL_TASK_ID,
-	type LayoutModelStatus,
 	layoutModelLocalUrl,
 	prefetchLayoutModel,
 } from "@/lib/pdf/layout/model";
@@ -174,16 +177,23 @@ export {
 	runDocumentLayoutAnalysis,
 } from "@/lib/pdf/layout/run-analysis";
 export {
+	CITATION_FOCUS_FLASH_MS,
 	clearLayoutDocumentResult,
-	getFocusedLayoutRegion,
+	type FocusedLayoutSnapshot,
+	type FocusedLayoutState,
 	getLayoutDocumentResult,
-	isLayoutOverlayVisible,
 	layoutAnalysisStore,
+	layoutDocumentKey,
+	layoutKindFromCitationFragment,
+	layoutKindFromRegionId,
+	mirrorLayoutResultToTranslation,
+	normalizeLayoutPaperKey,
 	setFocusedLayoutRegion,
 	setLayoutAnalysisUi,
 	setLayoutDocumentResult,
 	setLayoutOverlayVisible,
 	toggleLayoutOverlayVisible,
+	translationSourceKey,
 } from "@/lib/pdf/layout/store";
 export {
 	attachTitlesFromTextRuns,
@@ -191,10 +201,15 @@ export {
 	captionRoleFromGeometry,
 	captionRoleFromText,
 	enrichCaptionRegionsWithText,
-	looksLikeFigureCaption,
 	resolveCaptionRole,
 	textFromRunsInBbox,
 } from "@/lib/pdf/layout/title-text";
+export { listTranslatableLayoutRegions } from "@/lib/pdf/layout/translatable";
+export {
+	isInsidePreservedRegion,
+	type LayoutPreserveReason,
+	preservedLayoutRegions,
+} from "@/lib/pdf/layout/translation-exclusions";
 export type {
 	LayoutAnalysisUiStatus,
 	PdfLayoutDocumentResult,

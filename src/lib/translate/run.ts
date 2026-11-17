@@ -11,6 +11,7 @@ import type {
 	TranslateRunOptions,
 	TranslateTask,
 } from "@/lib/translate/types";
+import { defaultGlossaryConstraint } from "./terminology";
 
 /**
  * App-wide translation entry: resolve default provider, run service, return text.
@@ -45,11 +46,15 @@ export async function runTranslate(
 
 	const runOpts: TranslateRunOptions = {
 		...opts,
+		glossary: defaultGlossaryConstraint("", text, task.targetLang),
 		providerConfig:
 			opts.providerConfig ??
 			(isCommercialTranslateProvider(providerId)
 				? settings.translate.providerConfigs[providerId]
 				: undefined),
+		customPrompt: opts.customPrompt ?? settings.translate.customPrompt,
+		customSystem: opts.customSystem ?? settings.translate.customSystem,
+		customUser: opts.customUser ?? settings.translate.customUser,
 	};
 
 	try {
@@ -75,12 +80,25 @@ export function prepareTranslateTask(
 	task: TranslateTask;
 	providerId: TranslateProviderId;
 	targetLangName: string;
+	/** Legacy settings prompt (empty = built-in instructions). */
+	customPrompt: string;
+	customSystem: string;
+	customUser: string;
+	glossary: string;
 } {
 	const settings = loadSettings();
 	const langs = langsFromSettings(settings.translate, i18n.language ?? "en");
 	return {
 		providerId: settings.translate.provider,
 		targetLangName: langs.targetLangName,
+		customPrompt: settings.translate.customPrompt,
+		customSystem: settings.translate.customSystem,
+		customUser: settings.translate.customUser,
+		glossary: defaultGlossaryConstraint(
+			"",
+			partial.text,
+			partial.targetLang ?? langs.targetLang,
+		),
 		task: {
 			text: partial.text,
 			sourceLang: partial.sourceLang ?? langs.sourceLang,

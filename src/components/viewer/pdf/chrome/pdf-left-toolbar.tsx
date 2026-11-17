@@ -8,10 +8,17 @@ import {
 	TooltipProvider,
 	TooltipTrigger,
 } from "@/components/ui/tooltip";
+import {
+	PDF_CHROME_CHIP,
+	PDF_CHROME_VIS,
+	PDF_CHROME_VIS_HIDE,
+	PDF_CHROME_VIS_SHOW,
+} from "@/components/viewer/pdf/chrome/pdf-chrome-surface";
 import { cn } from "@/lib/core/utils";
 
 type PdfLeftToolbarProps = {
 	outline: PdfBookmarkObject[];
+	canEditBookmarks?: boolean;
 	showOutline: boolean;
 	onToggleOutline: () => void;
 	paperPath: string | null;
@@ -22,6 +29,10 @@ type PdfLeftToolbarProps = {
 	analyzing?: boolean;
 	/** Auto show/hide driven by scroll + pointer proximity (issue #400). */
 	visible: boolean;
+	/** True for remote papers with no local sidecar. */
+	isRemotePaper?: boolean;
+	/** True for PDFs outside papers/: no figures/layout-analysis entry. */
+	plainViewer?: boolean;
 };
 
 /** Top-left toggle group: outline, references, figures. Buttons are only
@@ -29,6 +40,7 @@ type PdfLeftToolbarProps = {
  *  visible ones aligned without fixed left-offset magic numbers. */
 export function PdfLeftToolbar({
 	outline,
+	canEditBookmarks = false,
 	showOutline,
 	onToggleOutline,
 	paperPath,
@@ -38,21 +50,26 @@ export function PdfLeftToolbar({
 	onToggleFigures,
 	analyzing,
 	visible,
+	isRemotePaper = false,
+	plainViewer = false,
 }: PdfLeftToolbarProps) {
 	const { t } = useTranslation("viewer");
-	const hasOutline = outline.length > 0;
+	const hasOutline = outline.length > 0 || canEditBookmarks;
 
 	return (
 		<div
 			className={cn(
-				"pointer-events-none absolute top-2 left-3 z-30 transition-opacity duration-200",
-				visible ? "opacity-100" : "opacity-0",
+				"pointer-events-none absolute top-2 left-3 z-30 origin-top-left",
+				PDF_CHROME_VIS,
+				visible ? PDF_CHROME_VIS_SHOW : PDF_CHROME_VIS_HIDE,
 			)}
 		>
 			<TooltipProvider delayDuration={200}>
 				<div
+					data-pdf-chrome
 					className={cn(
-						"flex h-7 items-center gap-0.5 rounded-lg border border-border/80 bg-background/95 p-0.5 shadow-sm backdrop-blur-sm",
+						"flex h-7 select-none items-center gap-0.5 rounded-lg p-0.5",
+						PDF_CHROME_CHIP,
 						visible ? "pointer-events-auto" : "pointer-events-none",
 					)}
 				>
@@ -92,22 +109,26 @@ export function PdfLeftToolbar({
 							</TooltipContent>
 						</Tooltip>
 					) : null}
-					<Tooltip>
-						<TooltipTrigger asChild>
-							<Button
-								type="button"
-								size="icon-xs"
-								variant={showFigures ? "secondary" : "ghost"}
-								aria-label={t("figures.title")}
-								aria-pressed={showFigures}
-								disabled={analyzing}
-								onClick={onToggleFigures}
-							>
-								<Boxes className="size-3.5" />
-							</Button>
-						</TooltipTrigger>
-						<TooltipContent side="bottom">{t("figures.title")}</TooltipContent>
-					</Tooltip>
+					{!plainViewer ? (
+						<Tooltip>
+							<TooltipTrigger asChild>
+								<Button
+									type="button"
+									size="icon-xs"
+									variant={showFigures ? "secondary" : "ghost"}
+									aria-label={t("figures.title")}
+									aria-pressed={showFigures}
+									disabled={analyzing || isRemotePaper}
+									onClick={onToggleFigures}
+								>
+									<Boxes className="size-3.5" />
+								</Button>
+							</TooltipTrigger>
+							<TooltipContent side="bottom">
+								{t("figures.title")}
+							</TooltipContent>
+						</Tooltip>
+					) : null}
 				</div>
 			</TooltipProvider>
 		</div>

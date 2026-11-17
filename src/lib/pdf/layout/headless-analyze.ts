@@ -16,24 +16,25 @@ import {
 import { RenderPluginPackage } from "@embedpdf/plugin-render";
 import { errorText } from "@/lib/core/error";
 
-import { logger } from "@/lib/core/logger";
-import { findLocalPdfPath, localFileToArrayBuffer } from "@/lib/paper";
+import { findCanonicalPaperPdfPath, localFileToArrayBuffer } from "@/lib/paper";
+import { createPdfEngine } from "@/lib/pdf/engine";
 import { getPdfAiRuntime } from "@/lib/pdf/layout/ai-runtime";
 import {
+	assessLayoutReadiness,
+	buildLayoutCompleteness,
+} from "@/lib/pdf/layout/completeness";
+import {
+	layoutSidecarBlocksAnalysis,
 	readLayoutSidecar,
 	writeLayoutIndexFromRaw,
+	writeLayoutTextBackfill,
 } from "@/lib/pdf/layout/io";
 import type { LayoutTaskLike } from "@/lib/pdf/layout/run-analysis";
-import { runDocumentLayoutAnalysis } from "@/lib/pdf/layout/run-analysis";
+import {
+	enrichRawRegionsWithPageText,
+	runDocumentLayoutAnalysis,
+} from "@/lib/pdf/layout/run-analysis";
 import { clearLayoutDocumentResult } from "@/lib/pdf/layout/store";
-
-function taskToPromise<T>(task: {
-	wait: (ok: (v: T) => void, err: (e: unknown) => void) => void;
-}): Promise<T> {
-	return new Promise((resolve, reject) => {
-		task.wait(resolve, reject);
-	});
-}
 
 let analysisEngine: PdfEngine | null = null;
 let analysisEnginePromise: Promise<PdfEngine> | null = null;
@@ -41,56 +42,10 @@ let analysisEnginePromise: Promise<PdfEngine> | null = null;
 export async function getHeadlessPdfEngine(): Promise<PdfEngine> {
 	if (analysisEngine) return analysisEngine;
 	if (analysisEnginePromise) return analysisEnginePromise;
-	const pending = (async () => {
-		// Prefer worker engine (same as the app viewer).
-		try {
-			const pdfiumWasmUrl = (await import("@embedpdf/pdfium/pdfium.wasm?url"))
-				.default;
-			const abs =
-				typeof document !== "undefined"
-					? new URL(pdfiumWasmUrl, document.baseURI).href
-					: pdfiumWasmUrl;
-			const { createPdfiumEngine } = await import(
-				"@embedpdf/engines/pdfium-worker-engine"
-			);
-			const created = createPdfiumEngine(abs, {
-				fontFallback: null,
-			});
-			const engine = (
-				created instanceof Promise ? await created : created
-			) as PdfEngine & {
-				whenReady?: () => { toPromise(): Promise<unknown> };
-			};
-			const ready = engine.whenReady?.();
-			if (ready) {
-				await Promise.race([
-					ready.toPromise(),
-					new Promise<never>((_, reject) => {
-						setTimeout(() => reject(new Error("worker ready timeout")), 8000);
-					}),
-				]);
-			}
-			analysisEngine = engine;
-			return engine;
-		} catch (e) {
-			logger.warn("headless layout: worker engine failed, using direct", {
-				error: errorText(e),
-			});
-			const pdfiumWasmUrl = (await import("@embedpdf/pdfium/pdfium.wasm?url"))
-				.default;
-			const { createPdfiumEngine } = await import(
-				"@embedpdf/engines/pdfium-direct-engine"
-			);
-			const created = createPdfiumEngine(pdfiumWasmUrl, {
-				fontFallback: null,
-			});
-			const engine = (
-				created instanceof Promise ? await created : created
-			) as PdfEngine;
-			analysisEngine = engine;
-			return engine;
-		}
-	})();
+	const pending = createPdfEngine().then((engine) => {
+		analysisEngine = engine;
+		return engine;
+	});
 	analysisEnginePromise = pending;
 	try {
 		return await pending;
@@ -106,8 +61,9 @@ export type HeadlessLayoutResult = {
 };
 
 /**
- * Ensure layout sidecar exists for a paper folder. Hits cache when present;
- * otherwise opens the local PDF in a headless EmbedPDF stack and analyzes.
+ * Ensure layout sidecar exists for a paper folder. Hits cache when present
+ * unless `force` is set. Opens `{paper}/{id}.pdf` only — never an
+ * illustration PDF under `source/assets/`.
  */
 export async function analyzePaperLayoutHeadless(opts: {
 	paperAbsPath: string;
@@ -115,17 +71,28 @@ export async function analyzePaperLayoutHeadless(opts: {
 	paperLabel?: string;
 	/** Caller-owned EmbedPDF document id, so progress can be attributed to this run. */
 	documentId?: string;
+	/**
+	 * Re-run even when `source/layout.json` already has regions. JobCenter
+	 * stores this on the task; it has to be read here or a force enqueue
+	 * still returns the cached sidecar.
+	 */
+	force?: boolean;
 	signal?: AbortSignal;
 }): Promise<HeadlessLayoutResult> {
 	const paperAbsPath = opts.paperAbsPath.replace(/[/\\]+$/, "");
 	if (opts.signal?.aborted) throw new Error("cancelled");
 
 	const existing = await readLayoutSidecar(paperAbsPath);
-	if (existing?.regions?.length) {
+	if (opts.signal?.aborted) throw new Error("cancelled");
+	if (existing && layoutSidecarBlocksAnalysis(opts.force, existing)) {
 		// Ensure CLI-facing sidebar index exists even on raw-only cache hits.
 		try {
+			if (opts.signal?.aborted) throw new Error("cancelled");
 			await writeLayoutIndexFromRaw(paperAbsPath, existing.regions);
-		} catch {
+		} catch (error) {
+			if (opts.signal?.aborted || errorText(error) === "cancelled") {
+				throw new Error("cancelled");
+			}
 			// non-fatal
 		}
 		return {
@@ -135,9 +102,15 @@ export async function analyzePaperLayoutHeadless(opts: {
 		};
 	}
 
-	const pdfPath = await findLocalPdfPath(paperAbsPath);
+	const pdfPath = await findCanonicalPaperPdfPath(paperAbsPath);
 	if (!pdfPath) {
-		throw new Error("No local PDF for layout analysis");
+		// Soft-skip: callers may race ahead of DownloadAssets. Re-enqueue after
+		// the PDF lands rather than failing the job with "No local PDF".
+		return {
+			fromCache: false,
+			summary: "skipped: no local PDF",
+			regionCount: 0,
+		};
 	}
 	const buffer = await localFileToArrayBuffer(pdfPath);
 	if (!buffer) {
@@ -178,19 +151,83 @@ export async function analyzePaperLayoutHeadless(opts: {
 			layoutPlugin as unknown as { provides: () => LayoutAnalysisCapability }
 		).provides();
 
-		const openRes = await taskToPromise(
-			docCap.openDocumentBuffer({
+		const openRes = await docCap
+			.openDocumentBuffer({
 				buffer,
 				documentId,
 				name: "layout-analysis",
 				autoActivate: true,
-			}),
-		);
-		const doc = await taskToPromise(openRes.task);
+			})
+			.toPromise();
+		const doc = await openRes.task.toPromise();
 		const pageCount = doc.pageCount ?? 0;
 		if (opts.signal?.aborted) throw new Error("cancelled");
 
 		const scope = layoutCap.forDocument(documentId);
+		let forceAnalysis = opts.force === true;
+		if (existing && !forceAnalysis && pageCount > 0) {
+			const recordedPageCount = existing.source.completeness?.pageCount;
+			const highestRegionPage = existing.regions.reduce(
+				(max, region) => Math.max(max, region.pageIndex),
+				-1,
+			);
+			const stalePageRange =
+				(recordedPageCount != null && recordedPageCount !== pageCount) ||
+				highestRegionPage >= pageCount;
+			if (stalePageRange) {
+				forceAnalysis = true;
+			} else {
+				const pageSizes = new Map<number, { width: number; height: number }>();
+				for (let pageIndex = 0; pageIndex < pageCount; pageIndex++) {
+					const size = doc.pages[pageIndex]?.size;
+					pageSizes.set(
+						pageIndex,
+						size && size.width > 0 && size.height > 0
+							? size
+							: { width: 0, height: 0 },
+					);
+				}
+				const audited = await enrichRawRegionsWithPageText(
+					scope,
+					existing.regions,
+					pageSizes,
+					() => docCap.isDocumentOpen(documentId),
+				);
+				if (opts.signal?.aborted) throw new Error("cancelled");
+				if (!audited.complete) {
+					forceAnalysis = true;
+				} else {
+					const completeness = buildLayoutCompleteness({
+						pageCount,
+						pageStats: audited.pageStats,
+						textLayerComplete: true,
+						contentRepairAttempted:
+							existing.source.completeness?.contentRepairAttempted === true,
+					});
+					const wrote = await writeLayoutTextBackfill(
+						paperAbsPath,
+						existing,
+						audited.regions,
+						completeness,
+					);
+					if (!wrote) {
+						forceAnalysis = true;
+					} else {
+						const readiness = assessLayoutReadiness(completeness);
+						if (!readiness.needsContentRepair) {
+							await writeLayoutIndexFromRaw(paperAbsPath, audited.regions);
+							return {
+								fromCache: true,
+								summary: `audited ${audited.regions.length} regions`,
+								regionCount: audited.regions.length,
+							};
+						} else {
+							forceAnalysis = true;
+						}
+					}
+				}
+			}
+		}
 		const summary = await new Promise<string>((resolve, reject) => {
 			let settled = false;
 			let layoutTask: LayoutTaskLike | null = null;
@@ -210,7 +247,7 @@ export async function analyzePaperLayoutHeadless(opts: {
 				paperAbsPath,
 				paperLabel: opts.paperLabel,
 				totalPages: pageCount > 0 ? pageCount : null,
-				force: false,
+				force: forceAnalysis,
 				pageSizeAt: (pageIndex) => {
 					const size = doc.pages[pageIndex]?.size;
 					return size && size.width > 0 && size.height > 0 ? size : null;
@@ -239,6 +276,13 @@ export async function analyzePaperLayoutHeadless(opts: {
 		});
 
 		const sidecar = await readLayoutSidecar(paperAbsPath);
+		const readiness = assessLayoutReadiness(sidecar?.source.completeness);
+		if (
+			!sidecar ||
+			(readiness.status !== "ready" && readiness.status !== "warning")
+		) {
+			throw new Error("Layout analysis did not produce a complete sidecar");
+		}
 		return {
 			fromCache: false,
 			summary,
@@ -253,9 +297,10 @@ export async function analyzePaperLayoutHeadless(opts: {
 						provides: () => DocumentManagerCapability;
 					}
 				).provides();
-				await taskToPromise(docCap.closeDocument(documentId)).catch(
-					() => undefined,
-				);
+				await docCap
+					.closeDocument(documentId)
+					.toPromise()
+					.catch(() => undefined);
 			}
 		} catch {
 			// ignore close errors

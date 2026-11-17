@@ -1,24 +1,34 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
 	backgroundTasksStore,
+	clearFinishedBackgroundTasks,
+	completeBackgroundTask,
 	mapDownloadProgress,
 	startBackgroundTask,
 	updateBackgroundTask,
 } from "@/lib/core/background-tasks";
 
 describe("background task download progress", () => {
-	it("maps sequential PDF and TeX phases into one overall progress", () => {
-		expect(mapDownloadProgress("pdf", 0)).toBe(0);
-		expect(mapDownloadProgress("pdf", 80)).toBe(40);
-		expect(mapDownloadProgress("tex", 0)).toBe(50);
-		expect(mapDownloadProgress("tex", 60)).toBe(80);
+	it("passes the Host-merged byte progress through", () => {
+		// PDF and TeX download concurrently and the Host sums their bytes, so
+		// a finished TeX stream must not pin the shared row at 100%.
+		expect(mapDownloadProgress("assets", 0)).toBe(0);
+		expect(mapDownloadProgress("assets", 60)).toBe(60);
+		expect(mapDownloadProgress("assets", 100)).toBe(100);
+		expect(mapDownloadProgress("pdf", 80)).toBe(80);
 		expect(mapDownloadProgress("tex", 100)).toBe(100);
+		expect(mapDownloadProgress("assets", null)).toBeNull();
 		expect(mapDownloadProgress("parse", null)).toBe(90);
+	});
+
+	it("clamps out-of-range byte progress", () => {
+		expect(mapDownloadProgress("assets", 140)).toBe(100);
+		expect(mapDownloadProgress("assets", -20)).toBe(0);
 	});
 
 	it("never regresses a task when a late phase event arrives", () => {
 		const id = startBackgroundTask({
-			kind: "download",
+			kind: "downloadAssets",
 			title: "test",
 			progress: 40,
 		});
@@ -32,4 +42,27 @@ describe("background task download progress", () => {
 
 		backgroundTasksStore.setState({ tasks: [], expanded: false });
 	});
+
+	it("keeps a finished task until it is cleared", () => {
+		vi.useFakeTimers();
+		const id = startBackgroundTask({
+			kind: "layoutAnalyze",
+			title: "parse",
+		});
+		completeBackgroundTask(id);
+		vi.advanceTimersByTime(10_000);
+		expect(
+			backgroundTasksStore.getState().tasks.find((task) => task.id === id)
+				?.status,
+		).toBe("completed");
+		clearFinishedBackgroundTasks();
+		expect(
+			backgroundTasksStore.getState().tasks.find((task) => task.id === id),
+		).toBeUndefined();
+	});
+});
+
+afterEach(() => {
+	vi.useRealTimers();
+	backgroundTasksStore.setState({ tasks: [], expanded: false });
 });

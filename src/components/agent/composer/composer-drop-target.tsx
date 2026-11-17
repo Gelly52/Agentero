@@ -8,9 +8,10 @@ import {
 	type ReactNode,
 	useCallback,
 	useEffect,
+	useRef,
 } from "react";
 import { useTranslation } from "react-i18next";
-import { usePromptInputAttachments } from "@/components/ai-elements/prompt-input";
+import { usePromptInputAttachments } from "@/components/agent/composer/prompt-input";
 import {
 	COMPOSER_IMAGE_MAX_FILES,
 	imagePathsFromDataTransfer,
@@ -45,6 +46,40 @@ export const ComposerDropTarget = forwardRef<
 	const attachments = usePromptInputAttachments();
 	const addAttachments = attachments.add;
 	const attachedCount = attachments.files.length;
+	const localRef = useRef<HTMLDivElement | null>(null);
+	// Keep the forwarded ref (PopoverAnchor) and our own hit-test node in sync.
+	const setRefs = useCallback(
+		(node: HTMLDivElement | null) => {
+			localRef.current = node;
+			if (typeof ref === "function") ref(node);
+			else if (ref) ref.current = node;
+		},
+		[ref],
+	);
+
+	/**
+	 * Native OS drops are window-wide; only the composer under the pointer may
+	 * claim them. Hit-test this panel's own shell (and panel body) instead of
+	 * the first `[data-composer-drop-shell]` in the document — the rail and
+	 * every Zen slot mount their own composer.
+	 */
+	const overOwnPanel = useCallback(
+		(position: Parameters<typeof isPhysicalPointInRect>[0]) => {
+			const node = localRef.current;
+			if (!node) return false;
+			const shell = node.closest<HTMLElement>("[data-composer-drop-shell]");
+			if (
+				shell &&
+				isPhysicalPointInRect(position, shell.getBoundingClientRect())
+			)
+				return true;
+			const panel = node.closest<HTMLElement>("[data-agent-panel]");
+			return Boolean(
+				panel && isPhysicalPointInRect(position, panel.getBoundingClientRect()),
+			);
+		},
+		[],
+	);
 
 	const attachFromPaths = useCallback(
 		(paths: string[]) => {
@@ -79,18 +114,10 @@ export const ComposerDropTarget = forwardRef<
 				hasImageExtension(path),
 			);
 			if (!imagePaths.length) return;
-			const shell = document.querySelector("[data-composer-drop-shell]");
-			const panel = document.querySelector("[data-agent-panel]");
-			const overShell =
-				shell instanceof HTMLElement &&
-				isPhysicalPointInRect(payload.position, shell.getBoundingClientRect());
-			const overPanel =
-				panel instanceof HTMLElement &&
-				isPhysicalPointInRect(payload.position, panel.getBoundingClientRect());
-			if (!overShell && !overPanel) return;
+			if (!overOwnPanel(payload.position)) return;
 			attachFromPaths(imagePaths);
 		});
-	}, [attachFromPaths]);
+	}, [attachFromPaths, overOwnPanel]);
 
 	const onDropCapture = (event: ReactDragEvent) => {
 		const dt =
@@ -121,7 +148,7 @@ export const ComposerDropTarget = forwardRef<
 
 	return (
 		<div
-			ref={ref}
+			ref={setRefs}
 			className={className}
 			onDragOverCapture={onVaultPathDragOver}
 			onDropCapture={onDropCapture}

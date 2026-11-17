@@ -1,8 +1,10 @@
+import { perfActive } from "@/lib/core/perf";
 import {
 	readJsonStorage,
 	removeStorageKey,
 	writeJsonStorage,
 } from "@/lib/core/storage";
+import { isRemoteArxivPath } from "@/lib/paper";
 import { tabIdForPath } from "@/lib/workspace/tabs/model";
 import type {
 	DocTab,
@@ -10,28 +12,31 @@ import type {
 	PersistedTab,
 	PersistedTabs,
 } from "@/lib/workspace/tabs/types";
-import type { CenterViewMode } from "@/lib/workspace/viewer";
+import { isCenterViewMode } from "@/lib/workspace/viewer";
 
 const TABS_STORAGE_KEY = "agentero-open-tabs";
 
-const VALID_MODES = new Set<CenterViewMode>([
-	"markdown",
-	"pdf",
-	"html",
-	"image",
-]);
-
-function isCenterViewMode(v: unknown): v is CenterViewMode {
-	return typeof v === "string" && VALID_MODES.has(v as CenterViewMode);
-}
-
 export function panelPersistParams(tab: DocTab): PanelPersistParams {
-	return { panelId: tab.id, path: tab.path, mode: tab.mode, title: tab.title };
+	return {
+		panelId: tab.id,
+		path: tab.path,
+		mode: tab.mode,
+		title: tab.title,
+		...(tab.texLive ? { texLive: true } : {}),
+		...(tab.texRoot ? { texRoot: tab.texRoot } : {}),
+	};
 }
 
 type LayoutPanelState = {
 	id?: string;
-	params?: { panelId?: string; path?: string; mode?: string; title?: string };
+	params?: {
+		panelId?: string;
+		path?: string;
+		mode?: string;
+		title?: string;
+		texLive?: boolean;
+		texRoot?: string;
+	};
 };
 
 type LayoutLeafData = {
@@ -94,6 +99,7 @@ export function extractTabsFromLayout(layout: unknown): {
 			typeof panel.params?.path === "string" && panel.params.path
 				? panel.params.path
 				: id;
+		if (isRemoteArxivPath(path)) continue;
 		const mode = isCenterViewMode(panel.params?.mode)
 			? panel.params.mode
 			: "markdown";
@@ -107,7 +113,17 @@ export function extractTabsFromLayout(layout: unknown): {
 				: undefined;
 		if (seen.has(panelId)) continue;
 		seen.add(panelId);
-		tabs.push({ id: panelId, path, mode, title });
+		tabs.push({
+			id: panelId,
+			path,
+			mode,
+			title,
+			...(panel.params?.texLive === true ? { texLive: true } : {}),
+			...(typeof panel.params?.texRoot === "string" &&
+			panel.params.texRoot.trim()
+				? { texRoot: panel.params.texRoot }
+				: {}),
+		});
 	}
 	const activeId = findActivePanelIdInLayout(l);
 	return {
@@ -149,6 +165,7 @@ export function loadPersistedTabs(): PersistedTabs | null {
 	const seen = new Set<string>();
 	for (const pt of parsed.tabs) {
 		if (!pt || typeof pt.path !== "string" || !pt.path) continue;
+		if (isRemoteArxivPath(pt.path)) continue;
 		const id = tabIdForPath(pt.path);
 		if (seen.has(id)) continue;
 		seen.add(id);
@@ -172,6 +189,9 @@ export function loadPersistedTabs(): PersistedTabs | null {
  * Empty / missing layout clears storage.
  */
 export function savePersistedTabs(layout: unknown | null): void {
+	// A perf run shares WebView storage with the daily app. Do not replace
+	// the user's open tabs, and do not clear them when this process starts empty.
+	if (perfActive()) return;
 	if (layout == null || typeof layout !== "object") {
 		removeStorageKey(TABS_STORAGE_KEY);
 		return;

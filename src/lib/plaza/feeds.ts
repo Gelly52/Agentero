@@ -1,41 +1,19 @@
 /**
  * Plaza feed subscriptions — Host IPC + paper import.
  *
- * @see docs/development/plaza-feeds.md
+ * @see docs/backend/api.md §3.10.4
  */
 
+import { commands, type FeedItem, type FeedSub } from "@/lib/core/bindings";
 import { errorText } from "@/lib/core/error";
-import { invokeApi } from "@/lib/core/ipc";
+import { callApi } from "@/lib/core/ipc";
 import { notifyError } from "@/lib/core/notify";
 import { lookupSubmit } from "@/lib/paper/import-actions";
 
-export type FeedSub = {
-	id: string;
-	url: string;
-	title: string;
-	addedAt: string;
-	lastFetchedAt: string | null;
-	lastError: string | null;
-	itemCount: number;
-	pinned: boolean;
-	pinnedAt: string | null;
-};
+/** Wire shapes from the generated bindings (feeds.sqlite rows). */
+export type { FeedItem, FeedSub };
 
-export type FeedItem = {
-	id: string;
-	subscriptionId: string;
-	subscriptionTitle: string;
-	title: string;
-	url: string | null;
-	publishedAt: string | null;
-	summaryText: string;
-	contentHtml: string | null;
-	paperUrl: string | null;
-	importedAt: string | null;
-	bodyMarkdown: string | null;
-};
-
-export type FeedFilter = "all" | "paper" | "other";
+export type FeedFilter = "all" | "paper" | "other" | "unread";
 
 export const ARXIV_FEED_CHIPS = [
 	"cs.AI",
@@ -219,9 +197,33 @@ const META_PREFIXES = [
 	"abstract:",
 ] as const;
 
-/** Drop arXiv RSS headers so cards show the abstract, not the id / type. */
-export function cleanFeedSummary(raw: string): string {
-	let rest = raw.replace(/<[^>]+>/g, " ").trim();
+/**
+ * Relative ("3 hours ago") then short-date feed timestamp. Kept next to the
+ * feed display helpers so the list card and the Agent preview agree.
+ */
+export function formatFeedWhen(iso: string | null, locale: string): string {
+	if (!iso) return "";
+	const date = new Date(iso);
+	if (Number.isNaN(date.getTime())) return "";
+	const diffSec = Math.round((date.getTime() - Date.now()) / 1000);
+	const abs = Math.abs(diffSec);
+	const rtf = new Intl.RelativeTimeFormat(locale, { numeric: "auto" });
+	if (abs < 60) return rtf.format(diffSec, "second");
+	if (abs < 3600) return rtf.format(Math.round(diffSec / 60), "minute");
+	if (abs < 86400) return rtf.format(Math.round(diffSec / 3600), "hour");
+	if (abs < 86400 * 7) return rtf.format(Math.round(diffSec / 86400), "day");
+	return new Intl.DateTimeFormat(locale, {
+		month: "short",
+		day: "numeric",
+	}).format(date);
+}
+
+/**
+ * Drop arXiv RSS headers so cards show the abstract, not the id / type.
+ * Line breaks are preserved for callers that keep paragraph structure.
+ */
+export function stripFeedMeta(raw: string): string {
+	let rest = raw.trim();
 	for (;;) {
 		const lower = rest.toLowerCase();
 		const hit = META_PREFIXES.find((prefix) => lower.startsWith(prefix));
@@ -234,7 +236,15 @@ export function cleanFeedSummary(raw: string): string {
 		const skip = after.search(/\s/);
 		rest = (skip === -1 ? "" : after.slice(skip)).trimStart();
 	}
-	return stripTrailingEllipsis(rest.replace(/\s+/g, " ").trim());
+	return rest;
+}
+
+export function cleanFeedSummary(raw: string): string {
+	return stripTrailingEllipsis(
+		stripFeedMeta(raw.replace(/<[^>]+>/g, " "))
+			.replace(/\s+/g, " ")
+			.trim(),
+	);
 }
 
 /** Drop RSS teaser tails (`[...]`, `…`) from cards and the detail body. */
@@ -272,45 +282,40 @@ export function feedDetailMarkdown(item: FeedItem): string {
 const SETTLE_TIMEOUT_MS = 120_000;
 
 export async function feedsList(): Promise<FeedSub[]> {
-	const data = await invokeApi<{ subscriptions: FeedSub[] }>(
-		"feeds_list",
-		undefined,
-		{ fallback: "feeds.listFailed" },
-	);
+	const data = await callApi(() => commands.feedsList(), {
+		fallback: "feeds.listFailed",
+	});
 	return data.subscriptions;
 }
 
 export async function feedsAdd(url: string, title?: string): Promise<FeedSub> {
-	return invokeApi<FeedSub>(
-		"feeds_add",
-		{ args: { url, title } },
-		{ fallback: "feeds.addFailed" },
-	);
+	return callApi(() => commands.feedsAdd({ url, title: title ?? null }), {
+		fallback: "feeds.addFailed",
+	});
 }
 
 export async function feedsRemove(id: string): Promise<void> {
-	await invokeApi(
-		"feeds_remove",
-		{ args: { id } },
-		{ fallback: "feeds.removeFailed", allowVoid: true },
-	);
+	await callApi(() => commands.feedsRemove({ id }), {
+		fallback: "feeds.removeFailed",
+	});
 }
 
 export async function feedsRename(id: string, title: string): Promise<FeedSub> {
-	return invokeApi<FeedSub>(
-		"feeds_rename",
-		{ args: { id, title } },
-		{ fallback: "feeds.renameFailed" },
-	);
+	return callApi(() => commands.feedsRename({ id, title }), {
+		fallback: "feeds.renameFailed",
+	});
 }
 
 export async function feedsRefresh(opts?: {
 	id?: string;
 	staleOnly?: boolean;
 }): Promise<{ subscriptions: FeedSub[]; fetched: number; failed: number }> {
-	return invokeApi(
-		"feeds_refresh",
-		{ args: { id: opts?.id, staleOnly: opts?.staleOnly ?? false } },
+	return callApi(
+		() =>
+			commands.feedsRefresh({
+				id: opts?.id ?? null,
+				staleOnly: opts?.staleOnly ?? false,
+			}),
 		{ fallback: "feeds.refreshFailed" },
 	);
 }
@@ -322,47 +327,39 @@ export async function feedsItems(opts?: {
 	beforePublishedAt?: string;
 	beforeId?: string;
 }): Promise<FeedItem[]> {
-	const data = await invokeApi<{ items: FeedItem[] }>(
-		"feeds_items",
-		{
-			args: {
-				subscriptionId: opts?.subscriptionId,
+	const data = await callApi(
+		() =>
+			commands.feedsItems({
+				subscriptionId: opts?.subscriptionId ?? null,
 				filter: opts?.filter ?? "all",
 				limit: opts?.limit ?? 100,
-				beforePublishedAt: opts?.beforePublishedAt,
-				beforeId: opts?.beforeId,
-			},
-		},
+				beforePublishedAt: opts?.beforePublishedAt ?? null,
+				beforeId: opts?.beforeId ?? null,
+			}),
 		{ fallback: "feeds.itemsFailed" },
 	);
 	return data.items;
 }
 
 export async function feedsMarkImported(id: string): Promise<FeedItem> {
-	return invokeApi<FeedItem>(
-		"feeds_mark_imported",
-		{ args: { id } },
-		{ fallback: "feeds.markFailed" },
-	);
+	return callApi(() => commands.feedsMarkImported({ id }), {
+		fallback: "feeds.markFailed",
+	});
 }
 
 export async function feedsSetPinned(
 	id: string,
 	pinned: boolean,
 ): Promise<FeedSub> {
-	return invokeApi<FeedSub>(
-		"feeds_set_pinned",
-		{ args: { id, pinned } },
-		{ fallback: "feeds.pinFailed" },
-	);
+	return callApi(() => commands.feedsSetPinned({ id, pinned }), {
+		fallback: "feeds.pinFailed",
+	});
 }
 
 export async function feedsResolveBody(id: string): Promise<FeedItem> {
-	return invokeApi<FeedItem>(
-		"feeds_resolve_body",
-		{ args: { id } },
-		{ fallback: "feeds.resolveFailed" },
-	);
+	return callApi(() => commands.feedsResolveBody({ id }), {
+		fallback: "feeds.resolveFailed",
+	});
 }
 
 export function compareFeedSubs(a: FeedSub, b: FeedSub): number {
@@ -373,9 +370,9 @@ export function compareFeedSubs(a: FeedSub, b: FeedSub): number {
 	return a.addedAt.localeCompare(b.addedAt);
 }
 
-/** Import via the magic wand. Resolves true when the paper is in the library. */
-export function importFeedPaper(item: FeedItem): Promise<boolean> {
-	const url = item.paperUrl?.trim();
+/** Import a paper or webpage via the existing URL lookup flow. */
+export function importFeedItem(item: FeedItem): Promise<boolean> {
+	const url = item.paperUrl?.trim() || item.url?.trim();
 	if (!url) return Promise.resolve(false);
 	return new Promise<boolean>((resolve) => {
 		let settled = false;
@@ -416,6 +413,16 @@ const FEED_ERROR_KEYS = {
 	http: "plaza.feeds.errors.http",
 	fetch: "plaza.feeds.errors.fetch",
 	body: "plaza.feeds.errors.body",
+	// Operation-level codes: used when the Host error carries no message.
+	listFailed: "plaza.feeds.errors.opFailed",
+	addFailed: "plaza.feeds.errors.opFailed",
+	removeFailed: "plaza.feeds.errors.opFailed",
+	renameFailed: "plaza.feeds.errors.opFailed",
+	refreshFailed: "plaza.feeds.errors.opFailed",
+	itemsFailed: "plaza.feeds.errors.opFailed",
+	markFailed: "plaza.feeds.errors.opFailed",
+	pinFailed: "plaza.feeds.errors.opFailed",
+	resolveFailed: "plaza.feeds.errors.opFailed",
 } as const;
 
 export type FeedErrorKey =
@@ -428,4 +435,13 @@ export function hostErrorKey(message: string): FeedErrorKey | null {
 	return code in FEED_ERROR_KEYS
 		? FEED_ERROR_KEYS[code as keyof typeof FEED_ERROR_KEYS]
 		: null;
+}
+
+export async function feedsSetRead(
+	id: string,
+	read: boolean,
+): Promise<FeedItem> {
+	return callApi(() => commands.feedsSetRead({ id, read }), {
+		fallback: "feeds.markFailed",
+	});
 }

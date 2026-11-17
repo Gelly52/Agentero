@@ -7,6 +7,13 @@ import { useTranslation } from "react-i18next";
 import { useMarkdownDoc } from "@/components/editor/context/markdown-doc-context";
 import { ExternalLinkElement } from "@/components/editor/nodes/inline/external-link-popover";
 import { linkClassName } from "@/components/editor/nodes/inline/link-styles";
+import {
+	cleanCitationHref,
+	isAgentCitationHref,
+	isVaultPdfHref,
+} from "@/lib/agent/citation-href";
+import { errorText } from "@/lib/core/error";
+import { notifyError } from "@/lib/core/notify";
 import { cn } from "@/lib/core/utils";
 import {
 	isVaultLocalMarkdownLink,
@@ -17,6 +24,7 @@ import {
 	wikiFragmentSuffix,
 } from "@/lib/wiki";
 import { useWikiNav } from "@/lib/wiki/nav-context";
+import { openCitation, openHtmlPreviewLink } from "@/lib/workspace/actions";
 
 type LinkEl = TElement & {
 	url?: string;
@@ -27,11 +35,64 @@ type LinkEl = TElement & {
 export function LinkElement(props: PlateElementProps) {
 	const { t } = useTranslation("editor");
 	const { children, element } = props;
-	const url = (element as LinkEl).url ?? "";
+	const url = cleanCitationHref((element as LinkEl).url ?? "");
 	const wiki = url.startsWith(WIKI_HREF_PREFIX) ? parseWikiHref(url) : null;
 	const wikiNav = useWikiNav();
 	const markdownDoc = useMarkdownDoc();
-	const localMarkdown = !wiki && isVaultLocalMarkdownLink(url);
+	const citationJump =
+		!wiki && (isAgentCitationHref(url) || isVaultPdfHref(url));
+	const localMarkdown = !wiki && !citationJump && isVaultLocalMarkdownLink(url);
+	// Local `.html` destinations open in the right-side HTML preview; the wiki
+	// resolver only indexes Markdown, so they need their own branch (#825).
+	const localHtml =
+		!wiki &&
+		!citationJump &&
+		/\.html?($|[?#])/i.test(url) &&
+		isVaultLocalMarkdownLink(url);
+
+	if (citationJump) {
+		return (
+			<PlateElement
+				{...props}
+				as="a"
+				className={linkClassName}
+				attributes={{
+					...props.attributes,
+					href: url,
+					title: url,
+					"data-citation": "pdf",
+					onClick: async (event: MouseEvent) => {
+						event.preventDefault();
+						event.stopPropagation();
+						// Resolve local PDF paths relative to the source note before
+						// handing the canonical target to the shared citation jumper.
+						if (
+							isVaultPdfHref(url) &&
+							wikiNav?.vaultPath &&
+							markdownDoc.filePath
+						) {
+							try {
+								const resolved = await resolveWikiReference(
+									wikiNav.vaultPath,
+									markdownDoc.filePath,
+									`<${url}>`,
+									"markdown",
+								);
+								if (resolved)
+									wikiNav.onWikiNavigate(navFromResolvedLink(resolved));
+							} catch (error) {
+								notifyError(errorText(error));
+							}
+							return;
+						}
+						openCitation(url);
+					},
+				}}
+			>
+				{children}
+			</PlateElement>
+		);
+	}
 
 	if (wiki) {
 		return (
@@ -72,6 +133,28 @@ export function LinkElement(props: PlateElementProps) {
 							}
 						}
 						wikiNav?.onWikiNavigate(wiki);
+					},
+				}}
+			>
+				{children}
+			</PlateElement>
+		);
+	}
+
+	if (localHtml) {
+		return (
+			<PlateElement
+				{...props}
+				as="a"
+				className={linkClassName}
+				attributes={{
+					...props.attributes,
+					href: url,
+					title: url,
+					onClick: (event: MouseEvent) => {
+						event.preventDefault();
+						event.stopPropagation();
+						void openHtmlPreviewLink(url, markdownDoc.filePath);
 					},
 				}}
 			>

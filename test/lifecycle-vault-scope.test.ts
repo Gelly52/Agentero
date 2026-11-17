@@ -1,29 +1,77 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { emitScoped } from "@/lib/lifecycle/bus";
+import { emit, emitScoped } from "@/lib/lifecycle/bus";
+import { noteCommittedLibraryList } from "@/lib/lifecycle/refresh-wave";
 import { registerLifecycleHandlers } from "@/lib/lifecycle/register";
 
-const mocks = vi.hoisted(() => ({
-	invokeApi: vi.fn(async () => undefined),
-	clearLibraryVaultState: vi.fn(),
-	clearWikiVaultState: vi.fn(),
-	clearAgentVaultState: vi.fn(),
-	clearAnnotationsVaultState: vi.fn(),
-	clearLayoutVaultState: vi.fn(),
-	clearUiVaultState: vi.fn(),
-	refreshTree: vi.fn(async () => undefined),
-	refreshLibrary: vi.fn(async () => undefined),
-	seedVaultSkills: vi.fn(),
-	scheduleTreeRefresh: vi.fn(),
-	getVaultPath: vi.fn(() => "/vault-a"),
-}));
+const mocks = vi.hoisted(() => {
+	type CommandSpy = ReturnType<typeof vi.fn>;
+	const commandSpies = new Map<string, CommandSpy>();
+	return {
+		/** Plain `ApiResult<T>` envelope, as returned by non-typedError commands. */
+		commandSpy: (name: string): CommandSpy => {
+			let spy = commandSpies.get(name);
+			if (!spy) {
+				spy = vi.fn(async () => ({ ok: true, data: null }));
+				commandSpies.set(name, spy);
+			}
+			return spy;
+		},
+		// Faithful to the real helper: invoke the bound command and unwrap.
+		callApi: vi.fn(
+			async (fn: () => Promise<{ ok: boolean; data?: unknown }>) => {
+				const res = await fn();
+				if (!res.ok) throw new Error("host error");
+				return res.data;
+			},
+		),
+		callApiResult: vi.fn(async () => undefined),
+		callResult: vi.fn(async () => undefined),
+		clearLibraryVaultState: vi.fn(),
+		maybeShowPaperBackfill: vi.fn(),
+		dismissPaperBackfill: vi.fn(),
+		clearWikiVaultState: vi.fn(),
+		clearAgentVaultState: vi.fn(),
+		clearAnnotationsVaultState: vi.fn(),
+		clearLayoutVaultState: vi.fn(),
+		clearUiVaultState: vi.fn(),
+		refreshTree: vi.fn(async () => undefined),
+		refreshLibrary: vi.fn(async () => undefined),
+		seedVaultSkills: vi.fn(),
+		scheduleTreeRefresh: vi.fn(),
+		getVaultPath: vi.fn(() => "/vault-a"),
+	};
+});
 
-vi.mock("@/lib/core/ipc", () => ({ invokeApi: mocks.invokeApi }));
+vi.mock("@/lib/core/ipc", () => ({
+	callApi: mocks.callApi,
+	callApiResult: mocks.callApiResult,
+	callResult: mocks.callResult,
+}));
+vi.mock("@/lib/core/bindings", () => ({
+	commands: new Proxy({} as Record<string, unknown>, {
+		get: (_target, prop) =>
+			typeof prop === "string" ? mocks.commandSpy(prop) : undefined,
+	}),
+	events: new Proxy({} as Record<string, unknown>, {
+		get: () => ({ listen: vi.fn(async () => vi.fn()) }),
+	}),
+}));
 vi.mock("@/lib/core/tauri", () => ({ isTauri: () => true }));
 vi.mock("@/lib/core/logger", () => ({
 	logger: { error: vi.fn(), warn: vi.fn(), info: vi.fn(), debug: vi.fn() },
 }));
 vi.mock("@/lib/agent/agent-session-store", () => ({
 	clearAgentVaultState: mocks.clearAgentVaultState,
+}));
+vi.mock("@/lib/lifecycle/refresh-wave", () => ({
+	noteCommittedLibraryList: vi.fn(),
+	noteCommittedPaths: vi.fn(),
+	noteCommittedRename: vi.fn(),
+	registerExternalLibraryReconciler: vi.fn(),
+}));
+vi.mock("@/lib/paper/backfill", () => ({
+	maybeShowPaperBackfill: mocks.maybeShowPaperBackfill,
+	dismissPaperBackfill: mocks.dismissPaperBackfill,
 }));
 vi.mock("@/lib/paper/library-store", () => ({
 	clearLibraryVaultState: mocks.clearLibraryVaultState,
@@ -94,8 +142,13 @@ describe("vault:opened scope", () => {
 		await drain();
 
 		expect(mocks.refreshTree).toHaveBeenCalledWith("/vault-a");
+		expect(mocks.maybeShowPaperBackfill).toHaveBeenCalledWith("/vault-a");
 		expect(mocks.seedVaultSkills).toHaveBeenCalledWith("/vault-a");
+		// The window registers its hold in setup; the Host only releases when
+		// the last holder lets go (see `vault_session::VaultHolders`).
+		expect(mocks.commandSpy("vaultHold")).toHaveBeenCalledWith("/vault-a");
 		for (const clear of clears) expect(clear).not.toHaveBeenCalled();
+		expect(mocks.commandSpy("vaultRelease")).not.toHaveBeenCalled();
 
 		release();
 		await drain();
@@ -111,14 +164,14 @@ describe("vault:opened scope", () => {
 		await drain();
 
 		for (const clear of clears) expect(clear).toHaveBeenCalledTimes(1);
-		expect(mocks.invokeApi).toHaveBeenCalledWith(
-			"vault_release",
-			{ path: "/vault-a" },
-			expect.anything(),
-		);
+		expect(mocks.dismissPaperBackfill).toHaveBeenCalledWith("/vault-a");
+		expect(mocks.commandSpy("vaultRelease")).toHaveBeenCalledWith("/vault-a");
+		expect(mocks.callApi).toHaveBeenCalledWith(expect.any(Function), {
+			fallback: "vault release failed",
+		});
 	});
 
-	it("skips the Host release for remote vaults, which have no local catalog", async () => {
+	it("skips the Host hold and release for remote vaults, which have no local catalog", async () => {
 		const release = emitScoped("vault:opened", {
 			vaultId: "remote:abc",
 			timestamp: 1,
@@ -128,11 +181,33 @@ describe("vault:opened scope", () => {
 		await drain();
 
 		for (const clear of clears) expect(clear).toHaveBeenCalledTimes(1);
-		expect(mocks.invokeApi).not.toHaveBeenCalledWith(
-			"vault_release",
-			expect.anything(),
-			expect.anything(),
-		);
+		expect(mocks.maybeShowPaperBackfill).not.toHaveBeenCalled();
+		expect(mocks.commandSpy("vaultHold")).not.toHaveBeenCalled();
+		expect(mocks.commandSpy("vaultRelease")).not.toHaveBeenCalled();
+	});
+
+	it("refreshes paper capability flags when deferred assets finish", async () => {
+		await emit("paper:assets-ready", {
+			vaultId: "/vault-a",
+			paperId: "2401.00001",
+			path: "papers/nested/2401.00001",
+			timestamp: 1,
+		});
+		expect(mocks.scheduleTreeRefresh).toHaveBeenCalledWith([
+			"/vault-a/papers/nested/2401.00001",
+		]);
+		expect(noteCommittedLibraryList).toHaveBeenCalledTimes(1);
+	});
+
+	it("ignores assets that finish after switching vaults", async () => {
+		await emit("paper:assets-ready", {
+			vaultId: "/vault-b",
+			paperId: "2401.00001",
+			path: "papers/2401.00001",
+			timestamp: 1,
+		});
+		expect(mocks.scheduleTreeRefresh).not.toHaveBeenCalled();
+		expect(noteCommittedLibraryList).not.toHaveBeenCalled();
 	});
 
 	it("releases the previous vault before setting up the next one", async () => {

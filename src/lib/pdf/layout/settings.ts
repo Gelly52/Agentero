@@ -4,8 +4,14 @@
  * real API key; the WebView only ever sees a `*` mask.
  */
 
-/** Layout provider ids with remote credentials (shared with the body parser). */
+/**
+ * Layout provider ids with remote credentials (shared with the body parser).
+ * `agentero` is the built-in parser: the Host injects its compiled-in
+ * credential, so it has no user-facing config card. It is a PARSER backend
+ * only — layout analysis stays on the local ONNX model (`LAYOUT_BACKENDS`).
+ */
 export const LAYOUT_PROVIDER_IDS = [
+	"agentero",
 	"paddle",
 	"mineru",
 	"openaiCompatible",
@@ -24,9 +30,12 @@ export type LayoutBackend = (typeof LAYOUT_BACKENDS)[number];
  * PAPER.md body-parse engine (`local` = liteparse; the rest run in the cloud
  * and fall back to local on failure). `openaiCompatible` is per-page VLM OCR
  * through an OpenAI-style `/chat/completions` endpoint (SiliconFlow preset).
+ * `agentero` is the built-in VLM parser (no user credential); it is a parser
+ * backend only and never a layout-analysis backend.
  */
 export const PARSER_BACKENDS = [
 	"local",
+	"agentero",
 	"paddle",
 	"mineru",
 	"openaiCompatible",
@@ -45,6 +54,8 @@ export type LayoutProviderConfig = {
 	language: string;
 	/** MinerU force-OCR: OCR every page regardless of the PDF text layer. */
 	isOcr: boolean;
+	/** Treat `baseUrl` as a self-hosted MinerU server instead of the cloud API. */
+	selfHosted: boolean;
 };
 
 /**
@@ -54,7 +65,6 @@ export type LayoutProviderConfig = {
  * MinerU vocabulary (16 packs incl. `ch_server`) valid when stored.
  */
 export const MINERU_LANGUAGES = ["ch", "en"] as const;
-export type MineruLanguage = (typeof MINERU_LANGUAGES)[number];
 
 /** Document language used when a provider config has none stored. */
 export const DEFAULT_MINERU_LANGUAGE = "ch";
@@ -94,12 +104,10 @@ export const DEFAULT_LAYOUT_SETTINGS: LayoutSettings = {
 	providerConfigs: {},
 };
 
-/** Fixed AI Studio PaddleOCR jobs endpoint (shown read-only in Settings). */
-export const LAYOUT_PADDLE_JOBS_URL =
-	"https://paddleocr.aistudio-app.com/api/v2/ocr/jobs";
-
 /** Docs / console pages for obtaining keys (settings UI external link). */
 export const LAYOUT_PROVIDER_DOCS_URLS: Record<LayoutProviderId, string> = {
+	// Built-in provider has no key page; the card is never rendered.
+	agentero: "https://github.com/poco-ai/Agentero",
 	paddle: "https://aistudio.baidu.com/account/accessToken",
 	mineru: "https://mineru.net/apiManage/token",
 	openaiCompatible: "https://cloud.siliconflow.cn/i/b9LPNHTG",
@@ -143,15 +151,4 @@ export function isLayoutProviderId(value: unknown): value is LayoutProviderId {
 		typeof value === "string" &&
 		(LAYOUT_PROVIDER_IDS as readonly string[]).includes(value)
 	);
-}
-
-/** Same mask convention as translate BYOK keys (all `*`, same length). */
-export function maskLayoutApiKey(key: string): string {
-	const n = key.trim().length;
-	return n === 0 ? "" : "*".repeat(n);
-}
-
-export function isLayoutApiKeyMask(key: string): boolean {
-	const t = key.trim();
-	return t.length > 0 && t.split("").every((c) => c === "*");
 }

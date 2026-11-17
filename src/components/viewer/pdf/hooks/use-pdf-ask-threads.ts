@@ -3,12 +3,11 @@
  * conversation anchored to its rects, persisted as `marks/<id>.json` and reopened
  * from its gutter pin or from the annotations panel.
  *
- * Its own hook because a turn is a small state machine that nothing else shares:
- * optimistic user message → `runOnce` → three ACP listeners (stream / completed /
- * failed) that append into the *thread array* rather than into local state, with
- * one cleanup closure per turn. Persisting on every terminal event is what makes
- * an interrupted app run recoverable, so those write points are part of the
- * machine, not of the caller.
+ * The turn state machine (optimistic user message → runOnce → stream /
+ * completed / failed patches) lives in `@/lib/pdf/ask/run-turn`; this hook owns
+ * the thread-array container and the persist steps that make an interrupted
+ * app run recoverable, so those write points are wired in here, not in the
+ * engine.
  *
  * Boundaries:
  * - the thread array lives in {@link usePdfMarksIo}: setters and the mirror ref
@@ -36,31 +35,29 @@ import {
 } from "react";
 import { useTranslation } from "react-i18next";
 import type { CardScreenPoint } from "@/components/viewer/pdf/types";
-import {
-	attachAgentRun,
-	cancelAgentRun,
-	disposeAgentRun,
-	listAgents,
-	type PromptImage,
-	runOnce,
-} from "@/lib/agent";
-import { errorText } from "@/lib/core/error";
-import { notifyError } from "@/lib/core/notify";
+import { disposeAgentRun, type PromptImage } from "@/lib/agent";
+import { pdfAskContextRequest } from "@/lib/agent/context-request";
 import {
 	createEmptyThread,
 	deletePdfAskThread,
-	newMessageId,
 	writePdfAskThread,
 } from "@/lib/pdf/ask";
-import { buildPdfAskPrompt } from "@/lib/pdf/ask/prompt";
+import {
+	buildPdfAskPrompt,
+	rememberPairedAskTranslation,
+} from "@/lib/pdf/ask/prompt";
+import {
+	cancelAskRun,
+	dispatchAskTurn,
+	type ResolvedAskAgent,
+	resendBaseMessages,
+	resolveAskAgent,
+	runAskTurn,
+	stopAskRun,
+} from "@/lib/pdf/ask/run-turn";
 import { threadHasUserQuestion } from "@/lib/pdf/ask/schema";
 import type { PdfAskAnchor, PdfAskThread } from "@/lib/pdf/ask/types";
 import type { ActiveSelectionCard } from "@/lib/pdf/selection";
-import { loadSettings } from "@/lib/settings";
-import { resolveTranslateAgent } from "@/lib/translate";
-
-/** Agent seat + model chosen for a PDF-ask turn (also reused by visual marks). */
-type ResolvedAskAgent = Awaited<ReturnType<typeof resolveTranslateAgent>>;
 
 export type UsePdfAskThreadsOptions = {
 	/** Sidecar root for `marks/<id>.json` (null for loose PDFs — nothing persists). */
@@ -92,7 +89,7 @@ export type PdfAskThreads = {
 	/** Open (or re-open) a thread's conversation card. */
 	openThread: (thread: PdfAskThread) => void;
 	/** Selection-menu action: create an empty thread and open its card. */
-	startFromAnchor: (anchor: PdfAskAnchor) => void;
+	startFromAnchor: (anchor: PdfAskAnchor, translation?: string) => void;
 	/**
 	 * Resolve the configured PDF-ask agent (default seat + model), reporting a
 	 * missing agent through the ask error chrome. Also used by visual marks.
@@ -101,8 +98,8 @@ export type PdfAskThreads = {
 	sendAskQuestion: (question: string) => void;
 	/** Edit a user turn: drop it and everything after, then re-send. */
 	resendAskQuestion: (messageId: string, question: string) => void;
-	/** Card hide button: end the thread (or drop an empty draft) and dismiss. */
-	hideAskThread: () => void;
+	/** Card hide button: keep a started draft or end a thread with a question, then dismiss. */
+	hideAskThread: (draft?: string) => void;
 	deleteAskThread: () => void;
 	stopAskStreaming: () => void;
 	/** Per-kind chrome reset when an ask card opens (wired into `usePdfCards`). */
@@ -161,28 +158,42 @@ export function usePdfAskThreads({
 		[paperAbsPath],
 	);
 
-	/** A card closed without a question was never a thread — drop the draft. */
-	const discardIfEmptyDraft = useCallback(
-		(threadId: string | null) => {
-			if (!threadId) return;
-			const th = threadsRef.current.find((t) => t.id === threadId);
-			if (!th || threadHasUserQuestion(th)) return;
-			setThreads((prev) => prev.filter((t) => t.id !== threadId));
+	const patchThread = useCallback(
+		(
+			threadId: string,
+			transform: (thread: PdfAskThread) => PdfAskThread,
+			onApplied?: (thread: PdfAskThread) => void,
+		) => {
+			setThreads((prev) =>
+				prev.map((th) => {
+					if (th.id !== threadId) return th;
+					const done = transform(th);
+					onApplied?.(done);
+					return done;
+				}),
+			);
 		},
-		[setThreads, threadsRef],
+		[setThreads],
 	);
 
 	const clearAskError = useCallback(() => {
 		setAskError(null);
 	}, []);
 
-	const closeAskChrome = useCallback(
+	const removeThread = useCallback(
 		(threadId: string) => {
-			discardIfEmptyDraft(threadId);
-			setAskError(null);
+			setThreads((prev) => prev.filter((th) => th.id !== threadId));
+			rememberPairedAskTranslation(threadId, "");
+			if (paperAbsPath) void deletePdfAskThread(paperAbsPath, threadId);
 		},
-		[discardIfEmptyDraft],
+		[paperAbsPath, setThreads],
 	);
+
+	const closeAskChrome = useCallback((_threadId: string) => {
+		// Non-explicit closes keep a started draft (and its pin/highlight); the
+		// card itself deletes only when the composer was never touched.
+		setAskError(null);
+	}, []);
 
 	const openThread = useCallback(
 		(thread: PdfAskThread) => openCard({ kind: "ask", id: thread.id }),
@@ -193,15 +204,25 @@ export function usePdfAskThreads({
 		(anchor: PdfAskAnchor) => {
 			const paperPath = paperRelPath || paperAbsPath || "paper";
 			const thread = createEmptyThread({ paperPath, anchor });
-			setThreads((prev) => [thread, ...prev.filter(threadHasUserQuestion)]);
+			// Keep conversations and started drafts; only untouched empties are
+			// dropped when the next Ask starts.
+			setThreads((prev) => [
+				thread,
+				...prev.filter(
+					(th) => threadHasUserQuestion(th) || Boolean(th.draft?.trim()),
+				),
+			]);
 			return thread;
 		},
 		[paperAbsPath, paperRelPath, setThreads],
 	);
 
 	const startFromAnchor = useCallback(
-		(anchor: PdfAskAnchor) => {
+		(anchor: PdfAskAnchor, translation?: string) => {
 			const thread = createThreadFromAnchor(anchor);
+			if (translation?.trim()) {
+				rememberPairedAskTranslation(thread.id, translation);
+			}
 			openThread(thread);
 		},
 		[createThreadFromAnchor, openThread],
@@ -216,155 +237,63 @@ export function usePdfAskThreads({
 			baseMessages?: PdfAskThread["messages"],
 			/** Visual PDF crops attached to this turn. */
 			images?: PromptImage[],
-		) => {
-			const threadId = thread.id;
-			if (!question.trim()) return;
-			const userMsg = {
-				id: newMessageId(),
-				role: "user" as const,
-				content: question,
-				createdAt: new Date().toISOString(),
-			};
-			const prior = baseMessages ?? thread.messages;
-			const withUser: PdfAskThread = {
-				...thread,
-				status: "open",
-				messages: [...prior, userMsg],
-				updatedAt: new Date().toISOString(),
-			};
-			upsertThread(withUser);
-			void persist(withUser);
-			setAskError(null);
-			setStreaming(true);
-
-			const assistantId = newMessageId();
-			const prompt = buildPdfAskPrompt(withUser, question);
-			try {
-				const accepted = await runOnce({
-					prompt,
-					agentId: agentOpts?.agentId,
-					modelId: agentOpts?.modelId,
-					images,
-					vaultPath: vaultPath ?? undefined,
-					workflow: "free",
-					autoApprove: true,
-					hideFromChatHistory: true,
-				});
-				const withAssistant: PdfAskThread = {
-					...withUser,
-					messages: [
-						...withUser.messages,
-						{
-							id: assistantId,
-							role: "assistant",
-							content: "",
-							createdAt: new Date().toISOString(),
-							agentSessionId: accepted.sessionId,
-						},
-					],
-				};
-				await attachAgentRun({
-					accepted,
-					disposedRef: runDisposedRef,
-					unsubsRef: runUnsubsRef,
-					sessionRef: askSessionRef,
-					activeSessionRef,
-					onArmed: () => upsertThread(withAssistant),
-					onStream: (ev) => {
-						setThreads((prev) =>
-							prev.map((th) => {
-								if (th.id !== threadId) return th;
-								const msgs = [...th.messages];
-								const last = msgs[msgs.length - 1];
-								if (last?.id !== assistantId) return th;
-								msgs[msgs.length - 1] = {
-									...last,
-									content: last.content + ev.chunk,
-								};
-								return { ...th, messages: msgs };
-							}),
-						);
-					},
-					onCompleted: (ev) => {
-						setThreads((prev) =>
-							prev.map((th) => {
-								if (th.id !== threadId) return th;
-								const msgs = [...th.messages];
-								const last = msgs[msgs.length - 1];
-								if (last?.id === assistantId) {
-									msgs[msgs.length - 1] = {
-										...last,
-										content: ev.content || last.content,
-										sources: (ev.sources ?? []).map((uri) => ({ uri })),
-									};
-								}
-								const done: PdfAskThread = {
-									...th,
-									messages: msgs,
-									updatedAt: new Date().toISOString(),
-								};
-								void persist(done);
-								return done;
-							}),
-						);
-					},
-					onFailed: (ev) => {
-						setAskError(ev.error || t("pdfAsk.agentFailed"));
-						setThreads((prev) =>
-							prev.map((th) => {
-								if (th.id !== threadId) return th;
-								const msgs = th.messages.filter((m) => m.id !== assistantId);
-								const done = { ...th, messages: msgs };
-								void persist(done);
-								return done;
-							}),
-						);
-					},
-					onSettled: () => setStreaming(false),
-				});
-			} catch (e) {
-				setStreaming(false);
-				setAskError(e instanceof Error ? e.message : t("pdfAsk.agentFailed"));
-			}
-		},
-		[upsertThread, persist, vaultPath, t, setThreads, activeSessionRef],
+		) =>
+			runAskTurn({
+				thread,
+				question,
+				agent: agentOpts,
+				baseMessages,
+				images,
+				vaultPath: vaultPath ?? undefined,
+				buildPrompt: buildPdfAskPrompt,
+				context: pdfAskContextRequest(thread),
+				upsertThread,
+				patchThread,
+				persist,
+				setAskError,
+				setStreaming,
+				failureText: () => t("pdfAsk.agentFailed"),
+				disposedRef: runDisposedRef,
+				unsubsRef: runUnsubsRef,
+				sessionRef: askSessionRef,
+				activeSessionRef,
+			}),
+		[upsertThread, patchThread, persist, vaultPath, t, activeSessionRef],
 	);
 
-	const resolvePdfAskAgent = useCallback(async () => {
-		const registry = await listAgents().catch(() => null);
-		const resolved = resolveTranslateAgent(loadSettings().pdfAsk, registry);
-		if (!resolved.agentId) {
-			const msg = t("pdfAsk.noAgent");
-			notifyError(msg);
-			setAskError(msg);
-			return null;
-		}
-		return resolved;
-	}, [t]);
+	const resolvePdfAskAgent = useCallback(
+		async () => resolveAskAgent(() => t("pdfAsk.noAgent"), setAskError),
+		[t],
+	);
+
+	/** A sent question consumes the session-only composer draft. */
+	const clearDraft = useCallback(
+		(thread: PdfAskThread) => {
+			if (thread.draft === undefined) return thread;
+			const clean: PdfAskThread = { ...thread, draft: undefined };
+			upsertThread(clean);
+			return clean;
+		},
+		[upsertThread],
+	);
 
 	const sendAskQuestion = useCallback(
 		(question: string) => {
 			const card = activeCardRef.current;
 			const threadId = card?.kind === "ask" ? card.id : null;
 			if (!threadId) return;
-			const thread = threadsRef.current.find((th) => th.id === threadId);
-			if (!thread) return;
-			void (async () => {
-				try {
-					const resolved = await resolvePdfAskAgent();
-					if (!resolved) return;
-					void sendToThread(thread, question, {
-						agentId: resolved.agentId,
-						modelId: resolved.modelId,
-					});
-				} catch (e) {
-					const message = errorText(e);
-					notifyError(message);
-					setAskError(message);
-				}
-			})();
+			const current = threadsRef.current.find((th) => th.id === threadId);
+			if (!current) return;
+			const thread = clearDraft(current);
+			dispatchAskTurn({
+				thread,
+				question,
+				resolveAgent: resolvePdfAskAgent,
+				run: sendToThread,
+				onError: setAskError,
+			});
 		},
-		[sendToThread, resolvePdfAskAgent, activeCardRef, threadsRef],
+		[clearDraft, sendToThread, resolvePdfAskAgent, activeCardRef, threadsRef],
 	);
 
 	/** Edit last (or any) user turn: drop that message and everything after, then re-send. */
@@ -373,44 +302,26 @@ export function usePdfAskThreads({
 			const card = activeCardRef.current;
 			const threadId = card?.kind === "ask" ? card.id : null;
 			if (!threadId) return;
-			const thread = threadsRef.current.find((th) => th.id === threadId);
-			if (!thread) return;
-			const index = thread.messages.findIndex(
-				(m) => m.id === messageId && m.role === "user",
-			);
-			if (index < 0) return;
-			const baseMessages = thread.messages.slice(0, index);
-			void (async () => {
-				try {
-					const resolved = await resolvePdfAskAgent();
-					if (!resolved) return;
-					void sendToThread(
-						thread,
-						question,
-						{
-							agentId: resolved.agentId,
-							modelId: resolved.modelId,
-						},
-						baseMessages,
-					);
-				} catch (e) {
-					const message = errorText(e);
-					notifyError(message);
-					setAskError(message);
-				}
-			})();
+			const current = threadsRef.current.find((th) => th.id === threadId);
+			if (!current) return;
+			const baseMessages = resendBaseMessages(current.messages, messageId);
+			if (!baseMessages) return;
+			const thread = clearDraft(current);
+			dispatchAskTurn({
+				thread,
+				question,
+				baseMessages,
+				resolveAgent: resolvePdfAskAgent,
+				run: sendToThread,
+				onError: setAskError,
+			});
 		},
-		[sendToThread, resolvePdfAskAgent, activeCardRef, threadsRef],
+		[clearDraft, sendToThread, resolvePdfAskAgent, activeCardRef, threadsRef],
 	);
 
 	/** Cancel the run, clear the chrome, and close the card if it is an ask card. */
 	const dismissAskChrome = useCallback(() => {
-		const sid = askSessionRef.current;
-		if (sid) {
-			askSessionRef.current = null;
-			if (activeSessionRef.current === sid) activeSessionRef.current = null;
-			void cancelAgentRun(sid).catch(() => undefined);
-		}
+		cancelAskRun(askSessionRef, activeSessionRef);
 		setStreaming(false);
 		setAskError(null);
 		if (activeCardRef.current?.kind === "ask") {
@@ -419,52 +330,50 @@ export function usePdfAskThreads({
 		}
 	}, [activeCardRef, setActiveCard, setCardScreen, activeSessionRef]);
 
-	const hideAskThread = useCallback(() => {
-		const id =
-			activeCardRef.current?.kind === "ask" ? activeCardRef.current.id : null;
-		if (id) {
-			const thread = threadsRef.current.find((th) => th.id === id);
-			if (thread) {
-				if (!threadHasUserQuestion(thread)) {
-					setThreads((prev) => prev.filter((t) => t.id !== thread.id));
-				} else if (thread.status !== "ended") {
-					const ended: PdfAskThread = {
-						...thread,
-						status: "ended",
-						updatedAt: new Date().toISOString(),
-					};
-					upsertThread(ended);
-					void persist(ended);
+	const hideAskThread = useCallback(
+		(draft?: string) => {
+			const id =
+				activeCardRef.current?.kind === "ask" ? activeCardRef.current.id : null;
+			if (id) {
+				const thread = threadsRef.current.find((th) => th.id === id);
+				if (thread) {
+					const text = draft?.trim();
+					if (threadHasUserQuestion(thread)) {
+						// Keep an unsent follow-up too: the conversation stays ended
+						// until it is reopened, and the draft is restored with it.
+						const nextDraft = text || undefined;
+						if (thread.status !== "ended" || nextDraft !== thread.draft) {
+							const ended: PdfAskThread = {
+								...thread,
+								draft: nextDraft,
+								status: "ended",
+								updatedAt: new Date().toISOString(),
+							};
+							upsertThread(ended);
+							void persist(ended);
+						}
+					} else if (text && text !== thread.draft) {
+						// Keep a started draft (text, pin and highlight) so reopening
+						// continues where the user left off. The card calls
+						// deleteAskThread instead when the composer was untouched.
+						upsertThread({ ...thread, draft: text });
+					}
 				}
 			}
-		}
-		dismissAskChrome();
-	}, [
-		upsertThread,
-		persist,
-		dismissAskChrome,
-		activeCardRef,
-		setThreads,
-		threadsRef,
-	]);
+			dismissAskChrome();
+		},
+		[upsertThread, persist, dismissAskChrome, activeCardRef, threadsRef],
+	);
 
 	const deleteAskThread = useCallback(() => {
 		const id =
 			activeCardRef.current?.kind === "ask" ? activeCardRef.current.id : null;
-		if (id) {
-			setThreads((prev) => prev.filter((th) => th.id !== id));
-			if (paperAbsPath) void deletePdfAskThread(paperAbsPath, id);
-		}
+		if (id) removeThread(id);
 		dismissAskChrome();
-	}, [paperAbsPath, dismissAskChrome, activeCardRef, setThreads]);
+	}, [removeThread, dismissAskChrome, activeCardRef]);
 
 	const stopAskStreaming = useCallback(() => {
-		const sid = askSessionRef.current;
-		if (!sid) return;
-		void cancelAgentRun(sid).catch(() => undefined);
-		askSessionRef.current = null;
-		if (activeSessionRef.current === sid) activeSessionRef.current = null;
-		setStreaming(false);
+		stopAskRun(askSessionRef, activeSessionRef, () => setStreaming(false));
 	}, [activeSessionRef]);
 
 	return {

@@ -11,6 +11,7 @@
  * tab — always resolve through the paper folder, not only the active tab id.
  */
 
+import type { PdfAnnotationObject } from "@embedpdf/models";
 import { paperDirFromPath } from "@/lib/paper/detect";
 import { loadPdfVisualTraceImage } from "@/lib/pdf/agent-trace/image";
 import { listPdfVisualTraces } from "@/lib/pdf/agent-trace/io";
@@ -26,10 +27,13 @@ import {
 	highlightColorOf,
 	highlightQuoteOf,
 	highlightViewFromObject,
-	isHighlightObject,
+	isTextMarkupObject,
 	loadAnnotationItems,
+	textMarkupKindOf,
 } from "@/lib/pdf/highlight/annotation-store";
 import type { HighlightColor } from "@/lib/pdf/highlight/palette";
+import type { PdfTextMarkupKind } from "@/lib/pdf/highlight/types";
+import { normalizeSentenceKey } from "@/lib/pdf/layout/layout-sentences";
 import { readMarkRaw } from "@/lib/pdf/selection/marks-io";
 import type { PdfVisualNormalizedRect } from "@/lib/pdf-visual/types";
 import { joinVaultPath } from "@/lib/vault";
@@ -58,6 +62,8 @@ export type AnnotationRef = {
 	/** User comment / visual-trace comment. */
 	comment: string;
 	color?: HighlightColor;
+	/** Text-markup shape; highlights / legacy refs default to `highlight`. */
+	shape?: PdfTextMarkupKind;
 	/** Optional crop preview for visual traces. */
 	image?: PdfVisualTraceImage;
 	/** Normalized rects when known (for outline y matching). */
@@ -171,6 +177,48 @@ function transferItemId(item: unknown): string | null {
 	return typeof id === "string" && id ? id : null;
 }
 
+/**
+ * Highlight color for a composer reference. A saved annotation id wins; otherwise
+ * the quote (and page, when given) matches the note on disk.
+ */
+export function highlightColorFromItems(
+	items: readonly unknown[],
+	query: { id?: string; quote?: string; page?: number },
+): HighlightColor | null {
+	const quoteKey = query.quote ? normalizeSentenceKey(query.quote) : "";
+	let quoteMatch: HighlightColor | null = null;
+	for (const item of items) {
+		if (!item || typeof item !== "object") continue;
+		const annotation = (item as { annotation?: unknown }).annotation;
+		if (!annotation || typeof annotation !== "object") continue;
+		if (!isTextMarkupObject(annotation as PdfAnnotationObject)) continue;
+		const color = highlightColorOf(
+			annotation as Parameters<typeof highlightColorOf>[0],
+		);
+		const id = (annotation as { id?: string }).id;
+		if (query.id && id === query.id) return color;
+		if (!quoteKey) continue;
+		const stored = highlightQuoteOf(
+			annotation as Parameters<typeof highlightQuoteOf>[0],
+		);
+		if (normalizeSentenceKey(stored) !== quoteKey) continue;
+		const page = ((annotation as { pageIndex?: number }).pageIndex ?? 0) + 1;
+		if (query.page != null && page !== query.page) continue;
+		quoteMatch = color;
+	}
+	return quoteMatch;
+}
+
+export async function lookupHighlightColor(
+	paperAbsPath: string,
+	query: { id?: string; quote?: string; page?: number },
+): Promise<HighlightColor | null> {
+	if (!paperAbsPath) return null;
+	if (!query.id && !query.quote?.trim()) return null;
+	const items = await loadAnnotationItems(paperAbsPath);
+	return highlightColorFromItems(items, query);
+}
+
 /** Look up one id under a paper folder (highlight or visual-trace). */
 export async function lookupAnnotationRef(
 	paperAbsPath: string,
@@ -189,7 +237,7 @@ export async function lookupAnnotationRef(
 			contents?: string;
 		};
 		if (obj.id !== id) continue;
-		if (isHighlightObject(annotation as never)) {
+		if (isTextMarkupObject(annotation as never)) {
 			const hl = annotation as Parameters<typeof highlightQuoteOf>[0];
 			const comment = obj.contents?.trim() ?? "";
 			const rects = rectsFromHighlightObject(annotation);
@@ -201,6 +249,7 @@ export async function lookupAnnotationRef(
 				quote: highlightQuoteOf(hl),
 				comment,
 				color: highlightColorOf(hl),
+				shape: textMarkupKindOf(hl),
 				...(rects.length ? { rects } : {}),
 			};
 		}
@@ -250,14 +299,6 @@ export async function lookupAnnotationRef(
 	}
 
 	return null;
-}
-
-/** Whether the paper marks store currently has this id. */
-export async function annotationRefExists(
-	paperAbsPath: string,
-	id: string,
-): Promise<boolean> {
-	return (await lookupAnnotationRef(paperAbsPath, id)) !== null;
 }
 
 /**
@@ -404,7 +445,7 @@ export async function listPaperAnnotationSummaries(
 	for (const item of items) {
 		const annotation = (item as { annotation?: unknown }).annotation;
 		if (!annotation || typeof annotation !== "object") continue;
-		if (!isHighlightObject(annotation as never)) continue;
+		if (!isTextMarkupObject(annotation as never)) continue;
 		const view = highlightViewFromObject(
 			annotation as Parameters<typeof highlightViewFromObject>[0],
 			paperAbsPath,

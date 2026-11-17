@@ -10,6 +10,7 @@ import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { ChoiceCard } from "@/components/onboarding/choice-card";
 import type { OnboardingStepId } from "@/components/onboarding/flow";
+import { ProbeDot } from "@/components/settings/provider-card";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import {
@@ -24,6 +25,8 @@ import {
 	TooltipContent,
 	TooltipTrigger,
 } from "@/components/ui/tooltip";
+import { openExternalUrl } from "@/lib/core/open-external";
+import { isSecretMask, maskSecret } from "@/lib/core/secret-mask";
 import { cn } from "@/lib/core/utils";
 import type {
 	AppSettings,
@@ -37,63 +40,23 @@ import {
 	COMMERCIAL_MT_DOCS_URLS,
 	COMMERCIAL_MT_PROVIDER_IDS,
 	isCommercialTranslateProvider,
-	isTranslateApiKeyMask,
 	isTranslateProviderId,
-	maskTranslateApiKey,
 	probeCommercialMtProvider,
 } from "@/lib/translate";
-import { DEFAULT_TRANSLATE_SETTINGS } from "@/lib/translate/defaults";
-
-function openExternalUrl(url: string): void {
-	void import("@tauri-apps/plugin-opener")
-		.then(({ openUrl }) => openUrl(url))
-		.catch(() => {
-			window.open(url, "_blank", "noopener,noreferrer");
-		});
-}
+import {
+	DEFAULT_TRANSLATE_SETTINGS,
+	EMPTY_TRANSLATE_PROVIDER_CONFIG,
+} from "@/lib/translate/defaults";
+import type { ProbeStatus } from "@/lib/ui/probe-status";
 
 const FIRST_COMMERCIAL_PROVIDER: CommercialTranslateProviderId = "deepl";
 
-const EMPTY_PROVIDER_CONFIG: TranslateProviderConfig = {
-	apiKey: "",
-	baseUrl: "",
-	region: "",
-	model: "",
-};
-
-type ProbeStatus = "idle" | "probing" | "ok" | "fail";
-
-type ProbeLabelKey =
-	| "translate.probeOk"
-	| "translate.probeFail"
-	| "translate.probeProbing"
-	| "translate.probeIdle";
-
-function probeDotClass(status: ProbeStatus): string {
-	switch (status) {
-		case "ok":
-			return "bg-emerald-500";
-		case "fail":
-			return "bg-destructive";
-		case "probing":
-			return "bg-amber-500 animate-pulse";
-		default:
-			return "bg-muted-foreground/35";
-	}
-}
-
-function probeStatusLabelKey(status: ProbeStatus): ProbeLabelKey {
-	switch (status) {
-		case "ok":
-			return "translate.probeOk";
-		case "fail":
-			return "translate.probeFail";
-		case "probing":
-			return "translate.probeProbing";
-		default:
-			return "translate.probeIdle";
-	}
-}
+const PROBE_LABEL_KEYS = {
+	ok: "translate.probeOk",
+	fail: "translate.probeFail",
+	probing: "translate.probeProbing",
+	idle: "translate.probeIdle",
+} as const satisfies Record<ProbeStatus, string>;
 
 export function TranslateStep({
 	settings,
@@ -118,11 +81,11 @@ export function TranslateStep({
 	const [draft, setDraft] = useState<{ apiKey?: string; baseUrl?: string }>({});
 	const [probe, setProbe] = useState<ProbeStatus>("idle");
 
-	// Next is allowed once the user committed to the own-API flow ("use system
-	// default" advances immediately from the chooser instead).
+	// Free translation is preselected, so the step never blocks Next. The
+	// commercial-API flow is opt-in and can still be left unfinished.
 	useEffect(() => {
-		onNextChange("translate", mode === "configure");
-	}, [mode, onNextChange]);
+		onNextChange("translate", true);
+	}, [onNextChange]);
 
 	const enterConfigure = () => {
 		setMode("configure");
@@ -133,7 +96,7 @@ export function TranslateStep({
 		}
 	};
 
-	const useSystemDefault = () => {
+	const chooseSystemDefault = () => {
 		patch({
 			translate: {
 				...tr,
@@ -142,6 +105,40 @@ export function TranslateStep({
 		});
 		onUseDefault();
 	};
+
+	const setDisplayMode = (displayMode: "overlay" | "dualPane") => {
+		if (displayMode === tr.displayMode) return;
+		patch({ translate: { ...tr, displayMode } });
+	};
+
+	const displayModeRow = (
+		<div className="flex items-center justify-between gap-3">
+			<span className="text-muted-foreground text-sm">
+				{t("translate.displayMode.label")}
+			</span>
+			<div className="flex items-center rounded-lg border bg-muted p-0.5">
+				{(["overlay", "dualPane"] as const).map((mode) => {
+					const selected = tr.displayMode === mode;
+					return (
+						<button
+							key={mode}
+							type="button"
+							aria-pressed={selected}
+							onClick={() => setDisplayMode(mode)}
+							className={cn(
+								"rounded-md px-2.5 py-1 text-xs outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring/50",
+								selected
+									? "bg-background text-foreground shadow-raised"
+									: "text-muted-foreground hover:text-foreground",
+							)}
+						>
+							{t(`translate.displayMode.${mode}`)}
+						</button>
+					);
+				})}
+			</div>
+		</div>
+	);
 
 	const displayKey =
 		draft.apiKey !== undefined ? draft.apiKey : (stored?.apiKey ?? "");
@@ -158,16 +155,15 @@ export function TranslateStep({
 	const confirmCommercial = async () => {
 		if (!isCommercial) return;
 		const pid = tr.provider as CommercialTranslateProviderId;
-		const storedCfg = tr.providerConfigs[pid] ?? EMPTY_PROVIDER_CONFIG;
+		const storedCfg =
+			tr.providerConfigs[pid] ?? EMPTY_TRANSLATE_PROVIDER_CONFIG;
 		const apiKey = (draft.apiKey ?? storedCfg.apiKey).trim();
 		const baseUrl = (draft.baseUrl ?? storedCfg.baseUrl)
 			.trim()
 			.replace(/\/+$/, "");
 		if (!apiKey) return;
 		const toSave: TranslateProviderConfig = { ...storedCfg, apiKey, baseUrl };
-		const masked = isTranslateApiKeyMask(apiKey)
-			? apiKey
-			: maskTranslateApiKey(apiKey);
+		const masked = isSecretMask(apiKey) ? apiKey : maskSecret(apiKey);
 		const nextTranslate = {
 			...tr,
 			providerConfigs: {
@@ -193,17 +189,25 @@ export function TranslateStep({
 
 	if (mode === "choose") {
 		return (
-			<div className="grid grid-cols-2 gap-3">
-				<ChoiceCard
-					icon={<KeyRound className="size-5 text-muted-foreground" />}
-					title={t("translate.configureOwn")}
-					onClick={enterConfigure}
-				/>
-				<ChoiceCard
-					icon={<Sparkles className="size-5 text-muted-foreground" />}
-					title={t("translate.useDefault")}
-					onClick={useSystemDefault}
-				/>
+			<div className="space-y-4">
+				<div className="grid grid-cols-2 gap-3">
+					<ChoiceCard
+						icon={<Sparkles className="size-5 text-muted-foreground" />}
+						title={t("translate.useDefault")}
+						description={t("translate.useDefaultDesc")}
+						recommended
+						recommendedLabel={t("recommended")}
+						selected={!isCommercial}
+						onClick={chooseSystemDefault}
+					/>
+					<ChoiceCard
+						icon={<KeyRound className="size-5 text-muted-foreground" />}
+						title={t("translate.configureOwn")}
+						description={t("translate.configureOwnDesc")}
+						onClick={enterConfigure}
+					/>
+				</div>
+				{displayModeRow}
 			</div>
 		);
 	}
@@ -263,18 +267,18 @@ export function TranslateStep({
 					</TooltipContent>
 				</Tooltip>
 				<div className="ml-auto flex items-center gap-2">
-					<span
-						role="status"
-						aria-label={t(probeStatusLabelKey(probe))}
-						title={t(probeStatusLabelKey(probe))}
-						className={cn(
-							"inline-block size-1.5 shrink-0 rounded-full",
-							probeDotClass(probe),
-						)}
+					<ProbeDot
+						status={probe}
+						label={t(PROBE_LABEL_KEYS[probe])}
+						title={t(PROBE_LABEL_KEYS[probe])}
 					/>
 					<Button
 						type="button"
 						size="sm"
+						// Busy is not the same as invalid: keep the button solid while
+						// probing so the disabled fade cannot flash a grey block behind
+						// the spinner.
+						className={probe === "probing" ? "disabled:opacity-100" : undefined}
 						disabled={probe === "probing" || !displayKey.trim()}
 						onClick={() => void confirmCommercial()}
 					>
@@ -305,6 +309,8 @@ export function TranslateStep({
 				onChange={(e) => setDraft((d) => ({ ...d, baseUrl: e.target.value }))}
 				className="h-8 font-mono text-xs"
 			/>
+
+			{displayModeRow}
 		</div>
 	);
 }

@@ -1,23 +1,26 @@
 {
+	"navigator": { "hintTargets": "{{count}} keyboard targets" },
 	"labels": {
 		"agent": "Agent",
 		"notes": "Notes",
-		"untitled": "Untitled"
+		"untitled": "Untitled",
+		"remoteArxiv": "Remote arXiv"
 	},
 	"commandPalette": {
 		"title": "Quick open",
-		"placeholder": "Search papers and note contents…",
+		"placeholder": "Search papers, notes, and tables…",
 		"commandsTitle": "Commands",
 		"commandsPlaceholder": "Type a command name…",
 		"commands": "Commands",
 		"commandsEmpty": "Type to filter commands (prefix > also works in Quick open)",
 		"papers": "Papers",
 		"recent": "Recent papers",
+		"aliases": "Aliases",
 		"contents": "In contents",
 		"searching": "Searching…",
 		"noResults": "No matches",
 		"noVault": "Open a vault to search",
-		"empty": "Type to search papers and note contents"
+		"empty": "Type to search papers, notes, and tables"
 	},
 	"commands": {
 		"catApp": "App",
@@ -25,6 +28,9 @@
 		"catVault": "Vault",
 		"catLibrary": "Library",
 		"catTab": "Tab",
+		"catPdf": "PDF",
+		"catEditor": "Editor",
+		"toggleMarkdownSource": "Toggle Markdown source",
 		"settingsOpen": "Open Settings",
 		"settingsClose": "Close Settings",
 		"vaultOpen": "Open Vault…",
@@ -46,6 +52,9 @@
 		"tabSplitPane": "Split Pane Right",
 		"tabNext": "Next Tab",
 		"tabPrev": "Previous Tab",
+		"tabNextInGroup": "Next Tab in Group",
+		"tabPrevInGroup": "Previous Tab in Group",
+		"exportAnnotatedPdf": "Export Annotated PDF",
 		"wandOpen": "Magic Wand (Import by ID)"
 	},
 	"titlebar": {
@@ -53,12 +62,16 @@
 		"hideLeftSidebar": "Hide left sidebar",
 		"showSidebarHint": "Show sidebar ({{shortcut}})",
 		"hideSidebarHint": "Hide sidebar ({{shortcut}})",
-		"agentPanel": "Agent panel",
 		"annotationsPanel": "Annotations",
 		"showRightSidebar": "Show right sidebar",
 		"hideRightSidebar": "Hide right sidebar",
 		"showRightSidebarHint": "Show right sidebar ({{shortcut}})",
 		"hideRightSidebarHint": "Hide right sidebar ({{shortcut}})",
+		"layout": "Layout",
+		"layoutModes": "Window layout",
+		"layoutAgent": "Agent",
+		"layoutNotes": "Notes",
+		"layoutReading": "Reading",
 		"settings": "Settings",
 		"settingsHint": "Settings ({{shortcut}})",
 		"menuSettings": "Settings…",
@@ -73,14 +86,22 @@
 	"diskConflict": {
 		"title": "“{{name}}” changed on disk — kept your unsaved edits",
 		"reload": "Load disk version",
-		"saveBlocked": "“{{name}}” was modified elsewhere — your edit was not saved to avoid losing changes. Load the disk version, then re-apply your edit."
+		"keepDraft": "Keep draft",
+		"saveBlocked": "“{{name}}” was modified elsewhere — your edit was not saved to avoid losing changes. Load the disk version, then re-apply your edit.",
+		"splitTitle": "This note changed on disk",
+		"splitDetail": "Your unsaved draft is still here. Loading the disk version drops the draft. Keeping the draft overwrites the newer version on disk."
 	},
 	"tabs": {
 		"strip": "Open documents",
+		"more": "More tabs",
 		"close": "Close {{title}}",
 		"showHtml": "Show HTML version",
 		"showPdf": "Show PDF version",
-		"closeSplit": "Close split · {{title}}",
+		"openTexPdf": "Open PDF",
+		"texCompiling": "Compiling…",
+		"contextCopyPath": "Copy path",
+		"copiedPath": "Path copied",
+		"copyPathFailed": "Could not copy path",
 		"contextClose": "Close",
 		"contextOpenNotes": "Open Notes",
 		"contextMoveToNewWindow": "Move to New Window",
@@ -102,11 +123,7 @@
 			"blue": "Blue",
 			"indigo": "Indigo",
 			"purple": "Purple"
-		},
-		"splitDropHint": "Drop to open as split",
-		"splitNotAllowed": "This item cannot open in a split pane.",
-		"emptyTitle": "No document open",
-		"emptyHint": "Pick a file or paper from the sidebar to open it in a tab."
+		}
 	},
 	"windows": {
 		"loading": "Loading…",
@@ -121,12 +138,14 @@
 	"errors": {
 		"openVaultDesktopOnly": "Open vault requires the Tauri desktop app (pnpm tauri dev).",
 		"cannotPreview": "Cannot preview this file type: {{name}}",
+		"pdfReadFailed": "Failed to read PDF: {{name}}",
 		"openVaultForLinks": "Open a vault before navigating vault-relative links.",
 		"openVaultForGraph": "Open a vault before navigating graph links.",
 		"openVaultForCreate": "Open a vault before creating wikilink targets.",
 		"wikiLinkAmbiguous": "The internal link target is ambiguous: {{target}}. Choose a more specific path.",
 		"wikiLinkInvalidFragment": "The target exists, but its heading or block is unavailable: {{target}}.",
-		"dropPdfNeedsVault": "Open a vault before importing dropped PDFs."
+		"dropPdfNeedsVault": "Open a vault before importing dropped PDFs.",
+		"remotePaperUnavailable": "This remote paper preview is no longer available."
 	},
 	"vault": {
 		"openDesktopOnly": "Open vault is only available in the Tauri app.",
@@ -147,25 +166,24 @@
 			"repair": "Repair links",
 			"cancel": "Keep links unchanged",
 			"repaired": "Updated links in {{count}} Markdown file(s).",
-			"notRepaired": "The external rename was detected, but links were left unchanged because a safe repair could not be prepared.",
-			"unverified": "The file watcher did not provide a complete rename pair; links were left unchanged.",
 			"vaultChanged": "The active vault changed before the external rename repair could run.",
 			"failed": "Could not repair links after the external rename."
 		},
 		"createDesktopOnly": "Create vault is only available in the Tauri app.",
 		"dialogTitle": "Select Agentero vault folder",
 		"createDialogTitle": "Choose folder for new Agentero vault",
+		"zoteroVaultDialogTitle": "Step 1: Choose a new Agentero vault folder",
 		"createFailed": "Failed to create vault.",
 		"readDesktopOnly": "Reading local files requires the Tauri app.",
 		"writeDesktopOnly": "Writing local files requires the Tauri app.",
 		"noVaultName": "No vault",
 		"noVaultOpenTitle": "No vault open",
-		"noVaultOpenDescription": "Open or create a vault folder to view files and notes.",
 		"recentTitle": "Recent",
 		"recentEmpty": "No recent vaults yet.",
 		"removeRecent": "Remove {{name}} from recent",
 		"recentMissing": "Folder no longer exists: {{path}}",
 		"openPathMissing": "Cannot open vault — folder does not exist: {{path}}",
+		"restoredVaultMissing": "The last vault no longer exists, please reopen it: {{path}}",
 		"switchVault": "Switch vault",
 		"openVaultButton": "Open vault…",
 		"openRemoteVaultButton": "Open remote…",
@@ -182,7 +200,6 @@
 		"remoteBadge": "Remote",
 		"remoteNoFinder": "Reveal in Finder is not available for remote vaults.",
 		"remoteNoTerminal": "Open in Terminal is not available for remote vaults.",
-		"remoteDeleteDirect": "Remote delete removes files on the server (no recycle bin).",
 		"runTauriPrefix": "Run the app with",
 		"runTauriSuffix": "to open a vault.",
 		"skillsSeeded": "Installed {{count}} new skill(s): {{names}}",
@@ -211,35 +228,38 @@
 	},
 	"tasks": {
 		"title": "Background Tasks",
-		"toggle": "Show or hide background tasks",
-		"collapse": "Collapse",
 		"clearFinished": "Clear finished",
 		"cancel": "Cancel",
 		"cancelled": "Cancelled",
+		"failed": "Task failed",
 		"empty": "No tasks",
 		"idle": "Done",
 		"activeCount": "{{count}} running",
 		"downloadPaper": "Download paper assets",
-		"downloadAll": "Download missing assets",
-		"downloadProgress": "{{current}} / {{total}}",
 		"downloadPhasePdf": "PDF",
 		"downloadPhaseTex": "TeX source",
+		"downloadPhaseAssets": "Download",
 		"downloadPhaseParse": "Parsing PDF",
 		"downloadPhaseAsset": "Asset",
 		"downloadPhaseLayoutModel": "Layout model",
 		"layoutModelDownload": "Download layout model",
 		"layoutModelDetail": "ModelScope → HuggingFace · PP-DocLayoutV3",
 		"layoutAnalysis": "Parse figures, tables, and text",
-		"layoutAnalysisDetail": "Detecting figures, tables, and text…",
+		"layoutTranslate": "Translate full text",
+		"layoutTranslateComplete": "Complete translation",
 		"pdfParse": "Parse PDF body",
-		"pdfParseDetail": "Generating readable paper text…",
 		"parseRefs": "Parse references",
+		"openLayoutSettings": "Open analysis settings",
+		"openTranslateSettings": "Open translation settings",
+		"latexCompile": "Compile LaTeX",
+		"jevSmartHighlights": "jEV smart highlights",
 		"downloadBytes": "{{phase}} · {{downloaded}} / {{total}}",
 		"downloadBytesUnknown": "{{phase}} · {{downloaded}}",
 		"batchProgress": "{{phase}} · {{current}} / {{total}}",
-		"downloadRefreshing": "Refreshing library… · {{path}}",
 		"lookupImport": "Add paper",
-		"lookupFetching": "Fetching metadata & assets… · {{id}}",
+		"lookupFetching": "Fetching metadata & assets…",
+		"skillLookup": "Find Skills",
+		"skillLookupFetching": "Finding installable Skills…",
 		"libraryImport": "Import bibliography",
 		"importPdf": "Import PDF",
 		"recognizeMeta": "Match paper metadata",
@@ -256,5 +276,18 @@
 		"connector": "Saving Connector attachment",
 		"connectorComplete": "Connector attachment ready",
 		"connectorFailed": "Connector attachment failed"
+	},
+	"reminders": {
+		"dismiss": "Don't remind me again",
+		"layoutLocalModel": {
+			"title": "Layout analysis runs a local model",
+			"description": "Figures, tables, and formulas are detected on this device with a local model, which uses extra memory and CPU. Low-memory machines may feel slow — switch to a cloud provider in settings if needed.",
+			"openSettings": "Open analysis settings"
+		},
+		"networkProxy": {
+			"title": "Network request failed",
+			"description": "If access is restricted, configure a proxy in settings and try again.",
+			"openSettings": "Open network settings"
+		}
 	}
 }

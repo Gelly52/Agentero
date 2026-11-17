@@ -5,16 +5,24 @@ import type {
 	LayoutAnalysisScope,
 	LayoutTask,
 } from "@embedpdf/plugin-layout-analysis";
+import { events } from "@/lib/core/bindings";
 import { errorText } from "@/lib/core/error";
 
 import { logger } from "@/lib/core/logger";
 import { isTauri } from "@/lib/core/tauri";
-import { findLocalPdfPath, localFileToArrayBuffer } from "@/lib/paper";
+import { findCanonicalPaperPdfPath, localFileToArrayBuffer } from "@/lib/paper";
+import {
+	buildLayoutCompleteness,
+	buildLayoutPageStats,
+} from "@/lib/pdf/layout/completeness";
 import {
 	type LayoutSidecarMode,
+	layoutSidecarNeedsTextLayer,
+	layoutSidecarWasReplaced,
 	readLayoutSidecar,
 	writeLayoutIndexFromRaw,
 	writeLayoutSidecar,
+	writeLayoutTextBackfill,
 } from "@/lib/pdf/layout/io";
 import { mergeCaptionsIntoHosts } from "@/lib/pdf/layout/merge-captions";
 import { ensureLayoutModel } from "@/lib/pdf/layout/model";
@@ -25,8 +33,7 @@ import {
 } from "@/lib/pdf/layout/normalize";
 import {
 	invokeLayoutRemoteAnalyzePdf,
-	LAYOUT_REMOTE_PROGRESS_EVENT,
-	type LayoutRemoteProgressPayload,
+	invokeLayoutRemoteCancel,
 	paddlePageToRegions,
 } from "@/lib/pdf/layout/paddle";
 import {
@@ -179,14 +186,17 @@ function buildResultFromRawRegions(
 function estimatePageSizesFromRegions(
 	regions: readonly PdfLayoutRegion[],
 	scope: LayoutAnalysisScope,
-	isDocumentOpen?: () => boolean,
+	options: RunLayoutAnalysisOptions,
 ): Map<number, { width: number; height: number }> {
 	const pageSizes = new Map<number, { width: number; height: number }>();
 	const pages = new Set(regions.map((r) => r.pageIndex));
+	for (let pageIndex = 0; pageIndex < (options.totalPages ?? 0); pageIndex++) {
+		pages.add(pageIndex);
+	}
 	for (const pageIndex of pages) {
-		assertDocumentOpen(isDocumentOpen);
+		assertDocumentOpen(options.isDocumentOpen);
 		const layout = scope.getPageLayout(pageIndex);
-		const size = layout?.pageSize;
+		const size = options.pageSizeAt?.(pageIndex) ?? layout?.pageSize;
 		if (size && size.width > 0 && size.height > 0) {
 			pageSizes.set(pageIndex, size);
 			continue;
@@ -199,28 +209,46 @@ function estimatePageSizesFromRegions(
 			if (r.bbox.w > 0.02) width = Math.max(width, r.rect.w / r.bbox.w);
 			if (r.bbox.h > 0.02) height = Math.max(height, r.rect.h / r.bbox.h);
 		}
-		if (width > 0 && height > 0) pageSizes.set(pageIndex, { width, height });
+		// Keep unknown pages in the walk so they cannot be marked complete.
+		pageSizes.set(pageIndex, { width, height });
 	}
 	return pageSizes;
 }
 
 /** Pull PDF text layer into caption / body / abstract fields per page. */
-async function enrichRawRegionsWithPageText(
+export async function enrichRawRegionsWithPageText(
 	scope: LayoutAnalysisScope,
 	raw: PdfLayoutRegion[],
 	pageSizes: Map<number, { width: number; height: number }>,
 	isDocumentOpen?: () => boolean,
-): Promise<PdfLayoutRegion[]> {
+): Promise<{
+	regions: PdfLayoutRegion[];
+	complete: boolean;
+	pageCount: number;
+	pageStats: ReturnType<typeof buildLayoutPageStats>;
+}> {
 	let next = raw;
-	const pages = new Set(raw.map((r) => r.pageIndex));
+	let complete = true;
+	const pages = new Set([...pageSizes.keys(), ...raw.map((r) => r.pageIndex)]);
+	const textCharsByPage = new Map<number, number>();
 	for (const pageIndex of pages) {
 		assertDocumentOpen(isDocumentOpen);
 		const pageSize = pageSizes.get(pageIndex);
-		if (!pageSize || pageSize.width <= 0 || pageSize.height <= 0) continue;
+		if (!pageSize || pageSize.width <= 0 || pageSize.height <= 0) {
+			complete = false;
+			continue;
+		}
 		try {
 			const textRuns = await taskToPromise(scope.getPageTextRuns(pageIndex));
 			assertDocumentOpen(isDocumentOpen);
 			const runs = textRuns.runs ?? [];
+			textCharsByPage.set(
+				pageIndex,
+				runs.reduce(
+					(total, run) => total + (run.text?.replace(/\s+/g, "").length ?? 0),
+					0,
+				),
+			);
 			next = enrichCaptionRegionsWithText(next, pageIndex, runs, pageSize);
 		} catch (error) {
 			if (
@@ -229,10 +257,24 @@ async function enrichRawRegionsWithPageText(
 			) {
 				throw new LayoutDocumentClosedError();
 			}
-			// continue without text for this page
+			complete = false;
 		}
 	}
-	return next;
+	const pageCount = Math.max(
+		0,
+		pageSizes.size,
+		...[...pages].map((pageIndex) => pageIndex + 1),
+	);
+	return {
+		regions: next,
+		complete,
+		pageCount,
+		pageStats: buildLayoutPageStats({
+			regions: next,
+			pageCount,
+			textCharsByPage,
+		}),
+	};
 }
 
 /**
@@ -245,10 +287,12 @@ async function buildTextAwareResult(
 	scope: LayoutAnalysisScope,
 	documentId: string,
 	docLayout: DocumentLayout,
+	force: boolean | undefined,
 	isDocumentOpen?: () => boolean,
 ): Promise<{
 	rawRegions: PdfLayoutRegion[];
 	result: PdfLayoutDocumentResult;
+	completeness: ReturnType<typeof buildLayoutCompleteness>;
 }> {
 	assertDocumentOpen(isDocumentOpen);
 	let raw: PdfLayoutRegion[] = regionsFromDocumentLayout(docLayout);
@@ -257,12 +301,19 @@ async function buildTextAwareResult(
 	for (const page of docLayout.pages) {
 		pageSizes.set(page.pageIndex, page.pageSize);
 	}
-	raw = await enrichRawRegionsWithPageText(
+	const extracted = await enrichRawRegionsWithPageText(
 		scope,
 		raw,
 		pageSizes,
 		isDocumentOpen,
 	);
+	raw = extracted.regions;
+	const completeness = buildLayoutCompleteness({
+		pageCount: extracted.pageCount,
+		pageStats: extracted.pageStats,
+		textLayerComplete: extracted.complete,
+		contentRepairAttempted: force === true,
+	});
 	assertDocumentOpen(isDocumentOpen);
 
 	let result = buildResultFromRawRegions(documentId, raw);
@@ -299,7 +350,7 @@ async function buildTextAwareResult(
 		}
 	}
 
-	return { rawRegions: raw, result };
+	return { rawRegions: raw, result, completeness };
 }
 
 /**
@@ -311,8 +362,30 @@ export async function runDocumentLayoutAnalysis(
 	documentId: string,
 	options: RunLayoutAnalysisOptions = {},
 ): Promise<LayoutTaskLike | null> {
+	const started = performance.now();
+	const onDone = options.onDone;
+	options = {
+		...options,
+		onDone: (summary, count) => {
+			logger.info("pdf.layout.complete", {
+				documentId,
+				duration_ms: Math.round(performance.now() - started),
+			});
+			onDone?.(summary, count);
+		},
+	};
+
+	/** Attribute progress to this paper so the open Figures rail can match. */
+	const paperKey = options.paperAbsPath ?? null;
+	const setUi = (
+		ui: Parameters<typeof setLayoutAnalysisUi>[0],
+		withPaper = false,
+	) => {
+		setLayoutAnalysisUi(ui, documentId, withPaper ? paperKey : undefined);
+	};
+
 	const cancelClosedDocument = () => {
-		setLayoutAnalysisUi({ stage: "cancelled" }, documentId);
+		setUi({ stage: "cancelled" });
 		options.onError?.("document closed", true);
 	};
 	if (options.isDocumentOpen && !options.isDocumentOpen()) {
@@ -323,14 +396,6 @@ export async function runDocumentLayoutAnalysis(
 	// Default path: JSON→sidebar re-merge from layout.json (no ONNX).
 	// `force` skips this and re-runs PDF→JSON via PP-DocLayoutV3.
 	if (!options.force && options.paperAbsPath) {
-		setLayoutAnalysisUi(
-			{
-				stage: "running",
-				message: "Rebuilding from cached layout…",
-				progress: null,
-			},
-			documentId,
-		);
 		const cached = await readLayoutSidecar(options.paperAbsPath);
 		if (options.isDocumentOpen && !options.isDocumentOpen()) {
 			cancelClosedDocument();
@@ -338,54 +403,95 @@ export async function runDocumentLayoutAnalysis(
 		}
 		if (cached) {
 			try {
-				// Sidecar may predate body-text extract; re-pull PDF text layer cheaply.
-				const pageSizes = estimatePageSizesFromRegions(
-					cached.regions,
-					scope,
-					options.isDocumentOpen,
-				);
-				const needsText = cached.regions.some(
-					(r) =>
-						(r.kind === "text" ||
-							r.kind === "abstract" ||
-							r.kind === "header" ||
-							r.kind === "figure_title") &&
-						!(r.text?.trim() || r.title?.trim()),
-				);
-				const raw = needsText
+				// No textLayerExtracted flag: walk the text layer once, including
+				// boxes that already have text, then write it back. A flagged
+				// sidecar only merges in memory and does not show analyzing.
+				const needsText = layoutSidecarNeedsTextLayer(cached);
+				if (needsText) {
+					setUi(
+						{
+							stage: "running",
+							message: "Rebuilding from cached layout…",
+							progress: null,
+						},
+						true,
+					);
+				}
+				const extracted = needsText
 					? await enrichRawRegionsWithPageText(
 							scope,
 							cached.regions,
-							pageSizes,
+							estimatePageSizesFromRegions(cached.regions, scope, options),
 							options.isDocumentOpen,
 						)
-					: cached.regions;
+					: null;
+				const raw = extracted?.regions ?? cached.regions;
+				const completeness = extracted
+					? buildLayoutCompleteness({
+							pageCount: extracted.pageCount,
+							pageStats: extracted.pageStats,
+							textLayerComplete: extracted.complete,
+							contentRepairAttempted:
+								cached.source.completeness?.contentRepairAttempted === true,
+						})
+					: cached.source.completeness;
+				if (options.isDocumentOpen && !options.isDocumentOpen()) {
+					cancelClosedDocument();
+					return null;
+				}
+				// A force re-run can replace layout.json while this merge is
+				// still on the previous parse. Publishing that parse would put
+				// the stale regions back into the open viewer's store.
+				const latest = await readLayoutSidecar(options.paperAbsPath);
+				if (
+					layoutSidecarWasReplaced(
+						cached.source.generatedAt,
+						latest?.source.generatedAt,
+					)
+				) {
+					return null;
+				}
 				if (options.isDocumentOpen && !options.isDocumentOpen()) {
 					cancelClosedDocument();
 					return null;
 				}
 				// Always re-run merge/filter so algorithm tweaks apply without ONNX.
 				const result = buildResultFromRawRegions(documentId, raw);
+				// A finished text walk is written back onto this same parse. A newer
+				// sidecar (mode, generatedAt, or box geometry) is left untouched.
+				if (needsText && extracted?.complete) {
+					try {
+						const wrote = await writeLayoutTextBackfill(
+							options.paperAbsPath,
+							cached,
+							raw,
+							completeness,
+						);
+						if (!wrote) {
+							logger.warn(
+								"layout text backfill skipped; sidecar parse changed",
+							);
+						}
+					} catch (error) {
+						logger.warn("layout text backfill failed", {
+							error: errorText(error),
+						});
+					}
+				}
 				setLayoutDocumentResult(result);
 				const summary = summarizeLayoutResult(result);
-				setLayoutAnalysisUi(
-					{
-						stage: "done",
-						message: summary,
-						total: result.regions.length,
-					},
-					documentId,
-				);
+				setUi({
+					stage: "done",
+					message: summary,
+					total: result.regions.length,
+				});
 				console.info("[layout-analysis]", {
 					documentId,
 					summary,
 					cache: true,
 					regions: result.regions,
 				});
-				// Cache hit stays read-only: text is enriched in memory above, but the
-				// viewer never rewrites layout.json (that is the headless writer's job;
-				// writing here raced it — §8.2). The index write is a no-op when the
-				// content is unchanged.
+				// The index write is a no-op when the content is unchanged.
 				void writeLayoutIndexFromRaw(options.paperAbsPath, raw).catch(
 					() => undefined,
 				);
@@ -406,13 +512,13 @@ export async function runDocumentLayoutAnalysis(
 
 	const analyzingMessage = options.paperLabel?.trim() || "Analyzing layout…";
 
-	setLayoutAnalysisUi(
+	setUi(
 		{
 			stage: "running",
 			message: analyzingMessage,
 			progress: null,
 		},
-		documentId,
+		true,
 	);
 
 	// Remote layout backend (Settings → Layout): whole-PDF async job.
@@ -441,7 +547,7 @@ export async function runDocumentLayoutAnalysis(
 	} catch (e) {
 		const message = errorText(e);
 		logger.warn("layout model ensure failed", { error: message });
-		setLayoutAnalysisUi({ stage: "error", message }, documentId);
+		setUi({ stage: "error", message });
 		options.onError?.(message, false);
 		// Return a no-op style task: rethrow by starting nothing — callers need a task.
 		// Fall through only if we still want plugin fallback; fail closed here.
@@ -454,7 +560,7 @@ export async function runDocumentLayoutAnalysis(
 			: null;
 	let completedPages = 0;
 
-	setLayoutAnalysisUi(
+	setUi(
 		{
 			stage: "running",
 			message: analyzingMessage,
@@ -462,7 +568,7 @@ export async function runDocumentLayoutAnalysis(
 			completed: 0,
 			total: knownTotal ?? undefined,
 		},
-		documentId,
+		true,
 	);
 
 	let task: LayoutTask<DocumentLayout, DocumentAnalysisProgress>;
@@ -532,17 +638,14 @@ export async function runDocumentLayoutAnalysis(
 				break;
 		}
 
-		setLayoutAnalysisUi(
-			{
-				stage: "running",
-				message,
-				progress,
-				page,
-				completed: completedPages,
-				total: knownTotal ?? undefined,
-			},
-			documentId,
-		);
+		setUi({
+			stage: "running",
+			message,
+			progress,
+			page,
+			completed: completedPages,
+			total: knownTotal ?? undefined,
+		});
 	});
 
 	task.wait(
@@ -551,30 +654,33 @@ export async function runDocumentLayoutAnalysis(
 				cancelClosedDocument();
 				return;
 			}
-			setLayoutAnalysisUi(
-				{
-					stage: "running",
-					message: "Merging figures & captions…",
-					progress: 99,
-					page: knownTotal ?? completedPages,
-					completed: knownTotal ?? completedPages,
-					total: knownTotal ?? undefined,
-				},
-				documentId,
-			);
+			setUi({
+				stage: "running",
+				message: "Merging figures & captions…",
+				progress: 99,
+				page: knownTotal ?? completedPages,
+				completed: knownTotal ?? completedPages,
+				total: knownTotal ?? undefined,
+			});
 			void buildTextAwareResult(
 				scope,
 				documentId,
 				docLayout,
+				options.force,
 				options.isDocumentOpen,
 			)
-				.then(async ({ rawRegions, result }) => {
+				.then(async ({ rawRegions, result, completeness }) => {
 					if (options.isDocumentOpen && !options.isDocumentOpen()) {
 						cancelClosedDocument();
 						return;
 					}
 					try {
-						await writeLayoutSidecar(options.paperAbsPath, rawRegions);
+						await writeLayoutSidecar(
+							options.paperAbsPath,
+							rawRegions,
+							"embedpdf-layout",
+							{ completeness },
+						);
 					} catch (e) {
 						const message = errorText(e);
 						logger.warn("layout sidecar write failed", { error: message });
@@ -587,14 +693,11 @@ export async function runDocumentLayoutAnalysis(
 					}
 					setLayoutDocumentResult(result);
 					const summary = summarizeLayoutResult(result);
-					setLayoutAnalysisUi(
-						{
-							stage: "done",
-							message: summary,
-							total: result.regions.length,
-						},
-						documentId,
-					);
+					setUi({
+						stage: "done",
+						message: summary,
+						total: result.regions.length,
+					});
 					console.info("[layout-analysis]", {
 						documentId,
 						summary,
@@ -611,7 +714,7 @@ export async function runDocumentLayoutAnalysis(
 						return;
 					}
 					const message = errorText(err);
-					setLayoutAnalysisUi({ stage: "error", message }, documentId);
+					setUi({ stage: "error", message });
 					options.onError?.(message, false);
 				});
 		},
@@ -622,7 +725,7 @@ export async function runDocumentLayoutAnalysis(
 				isPdfDocumentCloseRaceError(error) ||
 				(options.isDocumentOpen && !options.isDocumentOpen())
 			) {
-				setLayoutAnalysisUi({ stage: "cancelled" }, documentId);
+				setUi({ stage: "cancelled" });
 				options.onError?.("cancelled", true);
 				return;
 			}
@@ -634,7 +737,7 @@ export async function runDocumentLayoutAnalysis(
 				typeof reason.message === "string"
 					? reason.message
 					: "Layout analysis failed";
-			setLayoutAnalysisUi({ stage: "error", message }, documentId);
+			setUi({ stage: "error", message });
 			options.onError?.(message, false);
 		},
 	);
@@ -647,6 +750,7 @@ class RemoteLayoutTask implements LayoutTaskLike {
 	private progressListeners: Array<(p: DocumentAnalysisProgress) => void> = [];
 	private settled = false;
 	private aborted = false;
+	constructor(private readonly requestId: string) {}
 
 	onProgress(listener: (p: DocumentAnalysisProgress) => void): void {
 		this.progressListeners.push(listener);
@@ -670,6 +774,12 @@ class RemoteLayoutTask implements LayoutTaskLike {
 	abort(reason: LayoutAnalysisErrorReason): void {
 		if (this.settled) return;
 		this.aborted = true;
+		void invokeLayoutRemoteCancel(this.requestId).catch((error) => {
+			logger.warn("layout remote cancel failed", {
+				requestId: this.requestId,
+				error: errorText(error),
+			});
+		});
 		this.settle({ type: "abort", reason });
 	}
 
@@ -719,14 +829,22 @@ async function finalizeRemoteLayoutRegions(args: {
 			total: totalPages,
 		},
 		documentId,
+		options.paperAbsPath,
 	);
 
-	let enriched = await enrichRawRegionsWithPageText(
+	const extracted = await enrichRawRegionsWithPageText(
 		scope,
 		args.raw,
 		pageSizes,
 		options.isDocumentOpen,
 	);
+	let enriched = extracted.regions;
+	const completeness = buildLayoutCompleteness({
+		pageCount: totalPages,
+		pageStats: extracted.pageStats,
+		textLayerComplete: extracted.complete,
+		contentRepairAttempted: options.force === true,
+	});
 	assertDocumentOpen(options.isDocumentOpen);
 
 	let result = buildResultFromRawRegions(documentId, enriched);
@@ -762,7 +880,9 @@ async function finalizeRemoteLayoutRegions(args: {
 	enriched = result.rawRegions;
 
 	try {
-		await writeLayoutSidecar(options.paperAbsPath, enriched, args.sidecarMode);
+		await writeLayoutSidecar(options.paperAbsPath, enriched, args.sidecarMode, {
+			completeness,
+		});
 	} catch (e) {
 		const message = errorText(e);
 		logger.warn("layout sidecar write failed", { error: message });
@@ -816,6 +936,16 @@ function arrayBufferToBase64(buffer: ArrayBuffer): string {
 	return btoa(binary);
 }
 
+export function validateRemoteLayoutPageCount(
+	returnedPages: number,
+	totalPages: number,
+): void {
+	if (returnedPages === totalPages) return;
+	throw new Error(
+		`Layout provider returned ${returnedPages}/${totalPages} pages`,
+	);
+}
+
 /**
  * Remote provider run: upload the whole PDF once as an async job; the Host
  * polls and streams progress events, then per-page boxes come back in one
@@ -828,53 +958,50 @@ function startRemoteLayoutAnalysis(
 	options: RunLayoutAnalysisOptions,
 	deps: RemoteRunDeps,
 ): RemoteLayoutTask {
-	const task = new RemoteLayoutTask();
 	const { paperAbsPath, totalPages, analyzingMessage } = deps;
+	const requestId = `layout-remote-${documentId}-${crypto.randomUUID()}`;
+	const task = new RemoteLayoutTask(requestId);
 
 	void (async () => {
 		let unlisten: (() => void) | null = null;
 		try {
 			assertDocumentOpen(options.isDocumentOpen);
-			const pdfPath = await findLocalPdfPath(paperAbsPath);
+			const pdfPath = await findCanonicalPaperPdfPath(paperAbsPath);
 			if (!pdfPath) throw new Error("No local PDF for layout analysis");
 			const buffer = await localFileToArrayBuffer(pdfPath);
 			if (!buffer) throw new Error("Failed to read paper PDF");
 			assertDocumentOpen(options.isDocumentOpen);
 
-			const requestId = `layout-remote-${documentId}`;
 			// Host emits job progress (upload → pending/running → download).
 			if (isTauri()) {
-				const { listen } = await import("@tauri-apps/api/event");
-				unlisten = await listen<LayoutRemoteProgressPayload>(
-					LAYOUT_REMOTE_PROGRESS_EVENT,
-					(event) => {
-						const p = event.payload;
-						if (p.requestId && p.requestId !== requestId) return;
-						const known =
-							typeof p.totalPages === "number" && p.totalPages > 0
-								? p.totalPages
-								: totalPages;
-						const done =
-							typeof p.extractedPages === "number" ? p.extractedPages : 0;
-						const progress =
-							p.phase === "uploading"
-								? 3
-								: p.phase === "downloading" || p.phase === "done"
-									? 96
-									: clampProgress(6 + (done / known) * 88);
-						setLayoutAnalysisUi(
-							{
-								stage: "running",
-								message: analyzingMessage,
-								progress,
-								page: Math.min(done + 1, known),
-								completed: done,
-								total: known,
-							},
-							documentId,
-						);
-					},
-				);
+				unlisten = await events.layoutRemoteProgress.listen((event) => {
+					const p = event.payload;
+					if (task.isAborted || p.requestId !== requestId) return;
+					const known =
+						typeof p.totalPages === "number" && p.totalPages > 0
+							? p.totalPages
+							: totalPages;
+					const done =
+						typeof p.extractedPages === "number" ? p.extractedPages : 0;
+					const progress =
+						p.phase === "uploading"
+							? 3
+							: p.phase === "downloading" || p.phase === "done"
+								? 96
+								: clampProgress(6 + (done / known) * 88);
+					setLayoutAnalysisUi(
+						{
+							stage: "running",
+							message: analyzingMessage,
+							progress,
+							page: Math.min(done + 1, known),
+							completed: done,
+							total: known,
+						},
+						documentId,
+						paperAbsPath,
+					);
+				});
 			}
 
 			setLayoutAnalysisUi(
@@ -886,7 +1013,9 @@ function startRemoteLayoutAnalysis(
 					total: totalPages,
 				},
 				documentId,
+				paperAbsPath,
 			);
+			if (task.isAborted) return;
 			const res = await invokeLayoutRemoteAnalyzePdf({
 				provider: provider.id,
 				pdfBase64: arrayBufferToBase64(buffer),
@@ -897,6 +1026,7 @@ function startRemoteLayoutAnalysis(
 			unlisten = null;
 			assertDocumentOpen(options.isDocumentOpen);
 			if (task.isAborted) return;
+			validateRemoteLayoutPageCount(res.pages.length, totalPages);
 
 			const raw: PdfLayoutRegion[] = [];
 			const pageSizes = new Map<number, { width: number; height: number }>();
@@ -936,6 +1066,7 @@ function startRemoteLayoutAnalysis(
 				cancelClosedDocument: deps.cancelClosedDocument,
 			});
 		} catch (error) {
+			if (task.isAborted) return;
 			if (
 				isLayoutDocumentClosedError(error) ||
 				(options.isDocumentOpen && !options.isDocumentOpen())

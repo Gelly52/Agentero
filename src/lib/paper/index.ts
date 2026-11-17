@@ -14,6 +14,14 @@ export {
 	paperHasVisibleAttachments,
 } from "@/lib/paper/attachments";
 export {
+	isPaperChildDocName,
+	isPaperChildDocPath,
+	paperHasVisibleChildren,
+	paperRootDocChildren,
+	paperSurfacesChildPath,
+	paperVisibleChildren,
+} from "@/lib/paper/children";
+export {
 	collectPaperFoldersFromTree,
 	detectPaperDirectory,
 	directoryHasPaperMarkers,
@@ -29,6 +37,8 @@ export {
 } from "@/lib/paper/load-meta";
 export {
 	canAttemptPdfDownload,
+	canonicalPaperPdfPath,
+	findCanonicalPaperPdfPath,
 	findLocalPdfPath,
 	isPdfViewerSource,
 	localFileToArrayBuffer,
@@ -37,7 +47,6 @@ export {
 	revokePdfViewerSource,
 } from "@/lib/paper/media";
 export {
-	attachmentsPathForPaper,
 	isPaperAssetPath,
 	isPaperAttachmentsDirName,
 	isPaperInternalDirName,
@@ -48,6 +57,29 @@ export {
 	PAPER_INTERNAL_DIR_NAMES,
 } from "@/lib/paper/paths";
 export {
+	formatPublicationDate,
+	isPublicationDateInput,
+	type PublicationDate,
+	parsePublicationDate,
+	publicationDateSortKey,
+	publicationDateText,
+} from "@/lib/paper/publication-date";
+export {
+	getRemoteArxivPaper,
+	getRemoteArxivPaperByPath,
+	isRemoteArxivPath,
+	REMOTE_ARXIV_PREFIX,
+	type RemotePaperItem,
+	remoteArxivIdFromPath,
+	remoteArxivPath,
+	stageRemoteArxivPaper,
+} from "@/lib/paper/remote-paper";
+export {
+	hasTitleMath,
+	parseTitleMath,
+	type TitleMathSegment,
+} from "@/lib/paper/title-math";
+export {
 	formatAuthorsShort,
 	formatPaperTreeLabel,
 	PAPER_TREE_LABEL_MODES,
@@ -56,4 +88,8 @@ export {
 	type PaperTreeSortMode,
 	sortFileTreeNodes,
 } from "@/lib/paper/tree-label";
-export type { PaperMetadata, PaperTag } from "@/lib/paper/types";
+export type {
+	PaperLibraryRow,
+	PaperMetadata,
+	PaperTag,
+} from "@/lib/paper/types";

@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
-
+import { isSecretMask, maskSecret } from "@/lib/core/secret-mask";
 import {
+	buildTranslateMessages,
 	buildTranslatePrompt,
 	COMMERCIAL_MT_PROVIDER_IDS,
 	FREE_MT_PROVIDER_IDS,
@@ -8,17 +9,21 @@ import {
 	isCommercialProviderConfigured,
 	isCommercialTranslateProvider,
 	isFreeMtProvider,
-	isTranslateApiKeyMask,
+	isShortColloquialPrompt,
 	isTranslateProviderId,
+	isTranslateTransportError,
 	langsFromSettings,
 	listSelectableProviders,
-	maskTranslateApiKey,
 	resolveTargetLangCode,
 	resolveTargetLangName,
 	resolveTranslateAgent,
 	targetLangDisplayName,
+	translateSystemTemplateIssue,
+	translateUserTemplateIssue,
+	unknownTranslatePlaceholders,
 } from "@/lib/translate";
 import { DEFAULT_TRANSLATE_SETTINGS } from "@/lib/translate/defaults";
+import { isDictionaryLookup } from "@/lib/translate/dictionary";
 
 describe("translate lang", () => {
 	it("resolves ui target from interface language", () => {
@@ -48,6 +53,28 @@ describe("translate lang", () => {
 	});
 });
 
+describe("isTranslateTransportError", () => {
+	it("flags endpoint-level failures that retrying cannot fix", () => {
+		expect(
+			isTranslateTransportError(
+				"Tencent Transmart request failed: error sending request for url (https://transmart.qq.com/api/imt)",
+			),
+		).toBe(true);
+		expect(
+			isTranslateTransportError("translate read body: operation timed out"),
+		).toBe(true);
+		expect(isTranslateTransportError("error: dns error")).toBe(true);
+	});
+
+	it("leaves provider answers and payload problems retryable", () => {
+		expect(
+			isTranslateTransportError("Tencent Transmart failed (HTTP 500): oops"),
+		).toBe(false);
+		expect(isTranslateTransportError("Empty translation result")).toBe(false);
+		expect(isTranslateTransportError(undefined)).toBe(false);
+	});
+});
+
 describe("translate services registry", () => {
 	it("registers free web engines, commercial BYOK engines, and agent", () => {
 		for (const id of FREE_MT_PROVIDER_IDS) {
@@ -62,17 +89,19 @@ describe("translate services registry", () => {
 		expect(getTranslateService("agent")?.requireExternalConfig).toBe(true);
 		expect(isTranslateProviderId("deepl")).toBe(true);
 		expect(isCommercialTranslateProvider("deepl")).toBe(true);
-		expect(isFreeMtProvider("deeplx")).toBe(true);
+		expect(isFreeMtProvider("tencenttransmart")).toBe(true);
+		expect(isFreeMtProvider("cnki")).toBe(true);
 		expect(isFreeMtProvider("agent")).toBe(false);
 		expect(isFreeMtProvider("deepl")).toBe(false);
+		expect(isFreeMtProvider("deeplx")).toBe(false);
+		expect(isFreeMtProvider("googleapi")).toBe(false);
 	});
 
 	it("settings list includes free engines, commercial BYOK engines, and agent", () => {
 		const ids = listSelectableProviders().map((s) => s.id);
-		expect(ids).toContain("googleapi");
 		expect(ids).toContain("tencenttransmart");
 		expect(ids).toContain("huoshanweb");
-		expect(ids).toContain("deeplx");
+		expect(ids).toContain("cnki");
 		expect(ids).toContain("deepl");
 		expect(ids).toContain("azure");
 		expect(ids).toContain("googleCloud");
@@ -96,10 +125,10 @@ describe("translate services registry", () => {
 	});
 
 	it("treats same-length host API key mask as configured", () => {
-		const masked = maskTranslateApiKey("sk-secret-key");
+		const masked = maskSecret("sk-secret-key");
 		expect(masked).toBe("*************");
-		expect(isTranslateApiKeyMask(masked)).toBe(true);
-		expect(isTranslateApiKeyMask("sk-secret")).toBe(false);
+		expect(isSecretMask(masked)).toBe(true);
+		expect(isSecretMask("sk-secret")).toBe(false);
 		expect(
 			isCommercialProviderConfigured("deepl", {
 				apiKey: masked,
@@ -190,24 +219,168 @@ describe("resolveTranslateAgent", () => {
 });
 
 describe("translate prompts", () => {
-	it("builds a generic agent prompt", () => {
-		const p = buildTranslatePrompt({
-			text: "Hello world",
+	it("splits a generic prompt into engine rules and quoted source", () => {
+		const text =
+			"The ablation study confirms the gain comes from the attention module.";
+		const { system, user } = buildTranslateMessages({
+			text,
 			targetLangName: "Chinese",
 		});
-		expect(p).toContain("Chinese");
-		expect(p).toContain("Hello world");
-		expect(p).toContain("only the translation");
+		expect(system).toContain("focusing solely on translating");
+		expect(system).toContain("Only return the translated text");
+		expect(system).toContain("Chinese");
+		expect(system).toContain("the source language");
+		expect(system).toContain("OUTPUT ONLY THE TRANSLATION.");
+		expect(system).toContain("Transformer 架构");
+		expect(system).not.toContain("compact dictionary gloss");
+		expect(system).not.toContain(text);
+		expect(system).not.toContain("{{targetLang}}");
+		expect(user).toBe(`"""${text}"""`);
+		expect(isDictionaryLookup(text)).toBe(false);
 	});
 
-	it("pdf selection surface includes page context", () => {
-		const p = buildTranslatePrompt({
+	it("forbids a clarifying question on a word or short phrase", () => {
+		expect(isDictionaryLookup("attention")).toBe(true);
+		expect(isDictionaryLookup("multi-head attention")).toBe(true);
+		expect(isDictionaryLookup("注意力")).toBe(true);
+		expect(
+			isDictionaryLookup(
+				"We propose a transformer architecture for sequence transduction.",
+			),
+		).toBe(false);
+
+		for (const text of ["attention", "multi-head attention", "注意力"]) {
+			const { system, user } = buildTranslateMessages({
+				text,
+				targetLangName: "Chinese",
+			});
+			expect(system).toContain("research dictionary");
+			expect(system).toContain("Do not ask questions");
+			expect(system).not.toMatch(/你想翻译还是解释/);
+			expect(user).toBe(`"""${text}"""`);
+		}
+
+		const sentence = buildTranslateMessages({
+			text: "We propose a transformer architecture for sequence transduction.",
+			targetLangName: "Chinese",
+		});
+		expect(sentence.system).not.toContain("compact dictionary gloss");
+	});
+
+	it("puts system rules first in the agent string", () => {
+		const prompt = buildTranslatePrompt({
 			text: "attention",
 			targetLangName: "Chinese",
 			page: 3,
 			surface: "pdf-selection",
 		});
-		expect(p).toContain("page 3");
-		expect(p).toContain("attention");
+		expect(prompt.startsWith("OUTPUT ONLY THE DICTIONARY ENTRY.")).toBe(true);
+		expect(prompt.indexOf("SYSTEM:")).toBeLessThan(
+			prompt.indexOf("USER TEXT:"),
+		);
+		expect(prompt).toContain("page 3");
+		expect(prompt.endsWith('"""attention"""')).toBe(true);
+		expect(prompt).not.toContain("User request:");
+	});
+
+	it("keeps a one-line custom prompt as a preference", () => {
+		expect(isShortColloquialPrompt("Be terse.")).toBe(true);
+		expect(isShortColloquialPrompt("翻译得自然一点")).toBe(true);
+		const { system, user } = buildTranslateMessages({
+			text: "Hello world",
+			dictionary: false,
+			targetLangName: "Chinese",
+			customPrompt: "Be terse.",
+		});
+		expect(system).toContain("OUTPUT ONLY THE TRANSLATION.");
+		expect(system).toContain("Transformer 架构");
+		expect(system).toContain("Additional preference");
+		expect(system).toContain("Be terse.");
+		expect(system.indexOf("Be terse.")).toBeLessThan(
+			system.indexOf("Final rule:"),
+		);
+		expect(user).toBe('"""Hello world"""');
+	});
+
+	it("lets a substantial custom system replace style only", () => {
+		const { system, user } = buildTranslateMessages({
+			text: "[[1]] alpha\n\n[[2]] beta",
+			targetLangName: "Chinese",
+			page: 7,
+			surface: "pdf-selection",
+			customPrompt:
+				"Terse literary translator. {{targetLang}} from {{sourceLang}}.\nKeep formulas.",
+		});
+		expect(system).toContain(
+			"Terse literary translator. Chinese from the source language.",
+		);
+		expect(system).toContain("not a chat assistant");
+		expect(system).toContain("OUTPUT ONLY THE TRANSLATION.");
+		expect(system).not.toContain("Transformer 架构");
+		expect(system).toContain("page 7");
+		expect(system).toContain("[[n]] marker");
+		expect(system).toContain("do not merge markers");
+		expect(system).not.toContain("compact dictionary gloss");
+		expect(user).toBe('"""[[1]] alpha\n\n[[2]] beta"""');
+	});
+
+	it("empty custom prompt matches the built-in prompt", () => {
+		const base = {
+			text: "Hello world",
+			dictionary: false,
+			targetLangName: "Chinese",
+			page: 2,
+			surface: "pdf-selection" as const,
+		};
+		expect(buildTranslatePrompt({ ...base, customPrompt: "" })).toBe(
+			buildTranslatePrompt(base),
+		);
+		const rendered = buildTranslatePrompt(base);
+		expect(rendered).toContain("into Chinese");
+		expect(rendered).not.toContain("{{targetLang}}");
+		expect(rendered).not.toContain("{{sourceLang}}");
+	});
+
+	it("rejects unknown placeholders and keeps the three known ones", () => {
+		expect(unknownTranslatePlaceholders("{{targetLang}} {{text}}")).toEqual([]);
+		expect(
+			unknownTranslatePlaceholders("See {{tone}} and {{ targetLang }}."),
+		).toEqual(["tone"]);
+		expect(translateSystemTemplateIssue("{{tone}}")).toEqual({
+			kind: "unknown",
+			names: ["tone"],
+		});
+		expect(translateSystemTemplateIssue("")).toBeNull();
+		expect(translateUserTemplateIssue("")).toBeNull();
+		expect(translateUserTemplateIssue("just say it")).toEqual({
+			kind: "missingText",
+		});
+		expect(translateUserTemplateIssue("{{text}} {{mood}}")).toEqual({
+			kind: "unknown",
+			names: ["mood"],
+		});
+		expect(translateUserTemplateIssue("<<{{ text }}>>")).toBeNull();
+	});
+
+	it("prefers customSystem and inserts the source through customUser", () => {
+		const { system, user } = buildTranslateMessages({
+			text: "attention",
+			targetLangName: "Chinese",
+			customPrompt: "legacy preference",
+			customSystem: "Be terse.",
+			customUser: "SRC:\n{{ text }}",
+			dictionary: false,
+		});
+		expect(system).toContain("Be terse.");
+		expect(system).not.toContain("legacy preference");
+		expect(system).toContain("OUTPUT ONLY THE TRANSLATION.");
+		expect(user).toBe("SRC:\nattention");
+		expect(user).not.toContain('"""');
+	});
+
+	it("default translate settings ship empty custom prompts", () => {
+		expect(DEFAULT_TRANSLATE_SETTINGS.customPrompt).toBe("");
+		expect(DEFAULT_TRANSLATE_SETTINGS.customSystem).toBe("");
+		expect(DEFAULT_TRANSLATE_SETTINGS.customUser).toBe("");
 	});
 });

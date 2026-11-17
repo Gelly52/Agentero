@@ -8,7 +8,13 @@ import {
 import { useTranslation } from "react-i18next";
 
 import { PaneHeader } from "@/components/shell/pane-header";
-import { Button } from "@/components/ui/button";
+import { QuietIconButton } from "@/components/ui/quiet-icon-button";
+import {
+	PanelCard,
+	PanelCardActions,
+	PanelCardButton,
+	PanelEmptyState,
+} from "@/components/viewer/panels/panel-primitives";
 import { copyTextToClipboard } from "@/lib/core/clipboard";
 import { cn } from "@/lib/core/utils";
 import type { PdfVisualTraceThumbnail } from "@/lib/pdf/agent-trace/thumbnail";
@@ -88,20 +94,16 @@ export function AnnotationsPanel({
 			</PaneHeader>
 
 			{total === 0 ? (
-				<div className="flex min-h-0 flex-1 flex-col items-center justify-center gap-3 px-8 text-center">
-					<div className="flex size-12 items-center justify-center rounded-2xl bg-muted/70 text-muted-foreground">
-						<MessageSquareText className="size-5" aria-hidden />
-					</div>
-					<p className="max-w-[15rem] text-muted-foreground text-xs leading-relaxed">
-						{t("annotations.empty")}
-					</p>
-				</div>
+				<PanelEmptyState
+					icon={<MessageSquareText className="size-5" aria-hidden />}
+					text={t("annotations.empty")}
+				/>
 			) : (
 				<div className="agentero-scroll min-h-0 flex-1 space-y-4 overflow-y-auto p-2">
 					{asks.length > 0 ? (
 						<section aria-label={t("annotations.sectionAsks")}>
 							{multiSection ? (
-								<h3 className="mb-1.5 px-1 font-medium text-[10px] text-muted-foreground uppercase tracking-wider">
+								<h3 className="mb-1.5 px-1 font-medium text-xs text-muted-foreground uppercase tracking-wider">
 									{t("annotations.sectionAsks")}
 								</h3>
 							) : null}
@@ -122,7 +124,7 @@ export function AnnotationsPanel({
 					{visualTraces.length > 0 ? (
 						<section aria-label={t("annotations.sectionVisual")}>
 							{multiSection ? (
-								<h3 className="mb-1.5 px-1 font-medium text-[10px] text-muted-foreground uppercase tracking-wider">
+								<h3 className="mb-1.5 px-1 font-medium text-xs text-muted-foreground uppercase tracking-wider">
 									{t("annotations.sectionVisual")}
 								</h3>
 							) : null}
@@ -158,53 +160,38 @@ function AskCard({
 	const { t } = useTranslation("viewer");
 
 	return (
-		<div className="group relative rounded-lg border border-transparent px-3 py-2.5 transition-colors hover:border-border/60 hover:bg-muted/40">
-			{/* biome-ignore lint/a11y/useSemanticElements: role=button wrapper for card jump */}
-			<div
-				role="button"
-				tabIndex={0}
-				className="block w-full cursor-pointer rounded-md text-left outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
-				onClick={() => onJump?.(ask.id)}
-				onKeyDown={(e) => {
-					if (e.key === "Enter" || e.key === " ") {
-						e.preventDefault();
-						onJump?.(ask.id);
-					}
-				}}
-			>
+		<PanelCard>
+			<PanelCardButton onActivate={() => onJump?.(ask.id)}>
 				<div className="flex items-center gap-1.5">
 					<MessageCircle
 						className="size-3 shrink-0 text-muted-foreground"
 						aria-hidden
 					/>
-					<span className="font-medium text-[10px] text-muted-foreground uppercase tracking-wider tabular-nums">
+					<span className="font-medium text-xs text-muted-foreground uppercase tracking-wider tabular-nums">
 						{t("annotations.pageLabel", { page: ask.page })}
 					</span>
 					{ask.messageCount > 0 ? (
-						<span className="text-[10px] text-muted-foreground/80 tabular-nums">
+						<span className="text-caption text-muted-foreground/80 tabular-nums">
 							{t("annotations.askTurns", { count: ask.messageCount })}
 						</span>
 					) : null}
 				</div>
-				<p className="mt-1.5 line-clamp-2 text-[13px] text-foreground leading-relaxed">
+				<p className="mt-1.5 line-clamp-2 text-sm text-foreground leading-relaxed">
 					{ask.preview}
 				</p>
-			</div>
+			</PanelCardButton>
 			{onDelete ? (
-				<div className="absolute top-2 right-2 flex items-center gap-0.5 rounded-lg bg-background/80 p-0.5 opacity-0 shadow-sm ring-1 ring-border/60 backdrop-blur-sm transition-opacity duration-150 group-hover:opacity-100 group-focus-within:opacity-100">
-					<Button
-						type="button"
-						variant="ghost"
-						size="icon-xs"
-						className="size-6 text-muted-foreground hover:text-destructive"
+				<PanelCardActions>
+					<QuietIconButton
+						tone="destructive"
 						aria-label={t("annotations.deleteAsk")}
 						onClick={() => onDelete(ask.id)}
 					>
 						<Trash2 className="size-3.5" />
-					</Button>
-				</div>
+					</QuietIconButton>
+				</PanelCardActions>
 			) : null}
-		</div>
+		</PanelCard>
 	);
 }
 
@@ -229,30 +216,18 @@ function VisualTraceListCard({
 		: null;
 
 	return (
-		<div className="group relative rounded-lg border border-transparent px-3 py-2.5 transition-colors hover:border-border/60 hover:bg-muted/40">
-			{/* biome-ignore lint/a11y/useSemanticElements: role=button wrapper for card jump */}
-			<div
-				role="button"
-				tabIndex={0}
-				className="block w-full cursor-pointer rounded-md text-left outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
-				onClick={() => onJump?.(trace.id)}
-				onKeyDown={(e) => {
-					if (e.key === "Enter" || e.key === " ") {
-						e.preventDefault();
-						onJump?.(trace.id);
-					}
-				}}
-			>
+		<PanelCard>
+			<PanelCardButton onActivate={() => onJump?.(trace.id)}>
 				<div className="flex items-center gap-1.5">
 					<ScanSearch
 						className="size-3 shrink-0 text-violet-600 dark:text-violet-400"
 						aria-hidden
 					/>
-					<span className="font-medium text-[10px] text-muted-foreground uppercase tracking-wider tabular-nums">
+					<span className="font-medium text-xs text-muted-foreground uppercase tracking-wider tabular-nums">
 						{t("annotations.pageLabel", { page: trace.page })}
 					</span>
 				</div>
-				<p className="mt-1.5 line-clamp-2 text-[13px] text-foreground leading-relaxed">
+				<p className="mt-1.5 line-clamp-2 text-sm text-foreground leading-relaxed">
 					{trace.preview}
 				</p>
 				{trace.thumbnail?.data ? (
@@ -263,16 +238,12 @@ function VisualTraceListCard({
 						loading="lazy"
 					/>
 				) : null}
-			</div>
+			</PanelCardButton>
 			{onDelete || wikiTarget ? (
-				<div className="absolute top-2 right-2 flex items-center gap-0.5 rounded-lg bg-background/80 p-0.5 opacity-0 shadow-sm ring-1 ring-border/60 backdrop-blur-sm transition-opacity duration-150 group-hover:opacity-100 group-focus-within:opacity-100">
+				<PanelCardActions>
 					{linkOpts ? (
 						<>
-							<Button
-								type="button"
-								variant="ghost"
-								size="icon-xs"
-								className="size-6 text-muted-foreground hover:text-foreground"
+							<QuietIconButton
 								aria-label={t("annotations.copyLink")}
 								title={t("annotations.copyLink")}
 								onClick={() =>
@@ -283,12 +254,8 @@ function VisualTraceListCard({
 								}
 							>
 								<Link2 className="size-3.5" />
-							</Button>
-							<Button
-								type="button"
-								variant="ghost"
-								size="icon-xs"
-								className="size-6 text-muted-foreground hover:text-foreground"
+							</QuietIconButton>
+							<QuietIconButton
 								aria-label={t("annotations.copyEmbed")}
 								title={t("annotations.copyEmbed")}
 								onClick={() =>
@@ -301,24 +268,21 @@ function VisualTraceListCard({
 									)
 								}
 							>
-								<span className="font-mono text-[10px] leading-none">![[</span>
-							</Button>
+								<span className="font-mono text-caption leading-none">![[</span>
+							</QuietIconButton>
 						</>
 					) : null}
 					{onDelete ? (
-						<Button
-							type="button"
-							variant="ghost"
-							size="icon-xs"
-							className="size-6 text-muted-foreground hover:text-destructive"
+						<QuietIconButton
+							tone="destructive"
 							aria-label={t("annotations.deleteVisual")}
 							onClick={() => onDelete(trace.id)}
 						>
 							<Trash2 className="size-3.5" />
-						</Button>
+						</QuietIconButton>
 					) : null}
-				</div>
+				</PanelCardActions>
 			) : null}
-		</div>
+		</PanelCard>
 	);
 }

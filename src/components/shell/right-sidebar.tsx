@@ -12,11 +12,10 @@ import {
 	useVaultStore,
 	useWorkspaceStore,
 } from "@/hooks/use-app-stores";
-import { normalizeAgentSourcePath } from "@/lib/agent/sources";
 import { cn } from "@/lib/core/utils";
 import { openSettingsWindow } from "@/lib/shell/settings-window";
 import { setRightSidebarTab } from "@/lib/shell/ui-store";
-import { openGraphPath } from "@/lib/workspace/actions";
+import { openCitation } from "@/lib/workspace/actions";
 
 // The Agent panel is lazy-loaded: it isn't mounted until the agent sidebar is
 // opened, so its (large) bundle stays out of the initial chunk.
@@ -31,17 +30,7 @@ function onOpenAgentSettings(): void {
 }
 
 function handleAgentOpenSource(source: string): void {
-	const trimmed = normalizeAgentSourcePath(source);
-	if (!trimmed) return;
-	if (/^https?:\/\//i.test(trimmed)) {
-		void import("@tauri-apps/plugin-opener")
-			.then(({ openUrl }) => openUrl(trimmed))
-			.catch(() => {
-				window.open(trimmed, "_blank", "noopener,noreferrer");
-			});
-		return;
-	}
-	openGraphPath(trimmed);
+	openCitation(source);
 }
 
 export function RightSidebar() {
@@ -56,13 +45,15 @@ export function RightSidebar() {
 	const vaultPaperPaths = useVaultStore((s) => s.vaultPaperPaths);
 	const paperMetaByRelPath = useLibraryStore((s) => s.paperMetaByRelPath);
 	const paperTreeLabelMode = useSettings((s) => s.paperTreeLabelMode);
-	const selectedPath = useWorkspaceStore(
+	const workspacePath = useWorkspaceStore(
 		(s) => s.tabs.find((tab) => tab.id === s.activeTabId)?.path ?? null,
 	);
-	const selectedPaperTitle = useWorkspaceStore(
+	const workspaceTitle = useWorkspaceStore(
 		(s) =>
 			s.tabs.find((tab) => tab.id === s.activeTabId)?.paperMeta?.title ?? null,
 	);
+	const selectedPath = workspacePath;
+	const selectedPaperTitle = workspaceTitle;
 
 	// Annotations tab was removed; migrate any persisted "annotations" state to
 	// "agent" so the right rail does not open empty.

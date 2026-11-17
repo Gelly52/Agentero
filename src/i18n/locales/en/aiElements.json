@@ -1,13 +1,14 @@
 {
+	"sources": {
+		"count_one": "{{count}} source",
+		"count_other": "{{count}} sources",
+		"link": "Link"
+	},
 	"context": {
-		"totalCost": "Total cost",
-		"input": "Input",
-		"output": "Output",
-		"reasoning": "Reasoning",
-		"cache": "Cache",
 		"iconLabel": "Model context usage"
 	},
 	"tool": {
+		"exitCode": "Exit {{code}}",
 		"status": {
 			"awaitingApproval": "Awaiting Approval",
 			"responded": "Responded",
@@ -25,36 +26,21 @@
 		"thinking": "Thinking...",
 		"thought": "Thought process"
 	},
-	"sources": {
-		"used_one": "Used {{count}} source",
-		"used_other": "Used {{count}} sources"
-	},
 	"conversation": {
+		"messages": "Messages",
+		"scrollToEnd": "Scroll to latest message",
 		"empty": {
 			"title": "No messages yet",
 			"description": "Start a conversation to see messages here"
 		}
 	},
-	"message": {
-		"previousBranch": "Previous branch",
-		"nextBranch": "Next branch",
-		"branchIndicator": "{{current}} of {{total}}"
-	},
-	"inlineCitation": {
-		"previous": "Previous",
-		"next": "Next",
-		"unknown": "unknown"
-	},
-	"attachments": {
-		"source": "Source",
-		"image": "Image",
-		"attachment": "Attachment",
-		"remove": "Remove",
-		"empty": "No attachments"
-	},
 	"modelSelector": {
-		"label": "Model Selector",
-		"providerLogo": "{{provider}} logo"
+		"label": "Model Selector"
+	},
+	"formula": {
+		"copyLatex": "Copy LaTeX",
+		"copied": "LaTeX copied",
+		"copyFailed": "Could not copy LaTeX."
 	},
 	"plan": {
 		"toggle": "Toggle plan",
@@ -66,6 +52,34 @@
 	},
 	"chainOfThought": {
 		"title": "Chain of Thought"
+	},
+	"table": {
+		"copy": "Copy table",
+		"copyAsCsv": "Copy as CSV",
+		"copyAsMarkdown": "Copy as Markdown",
+		"copyAsTsv": "Copy as TSV",
+		"download": "Download table",
+		"downloadAsCsv": "Download as CSV",
+		"downloadAsMarkdown": "Download as Markdown",
+		"viewFullscreen": "View fullscreen",
+		"exitFullscreen": "Exit fullscreen"
+	},
+	"code": {
+		"copy": "Copy code",
+		"download": "Download code"
+	},
+	"mermaid": {
+		"label": "Mermaid diagram",
+		"viewSource": "View source",
+		"viewDiagram": "View diagram",
+		"copySource": "Copy Mermaid source",
+		"zoomIn": "Zoom in",
+		"zoomOut": "Zoom out",
+		"resetZoom": "Reset to 100%",
+		"fitToView": "Fit diagram",
+		"viewFullscreen": "View fullscreen",
+		"exitFullscreen": "Exit fullscreen",
+		"error": "This Mermaid diagram could not be rendered."
 	},
 	"promptInput": {
 		"placeholder": "What would you like to know?",

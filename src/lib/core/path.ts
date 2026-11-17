@@ -3,6 +3,20 @@ export function normalizeSlashes(path: string): string {
 	return path.replace(/\\/g, "/");
 }
 
+/** Normalize Windows absolute paths for filesystem IO, preserving extended prefixes. */
+export function normalizeLocalPath(path: string): string {
+	return /^(?:[a-z]:[\\/]|\\\\|\/\/\?\/)/i.test(path)
+		? path.replace(/\//g, "\\")
+		: path;
+}
+
+/** User-facing local path; keep extended paths unchanged for filesystem IO. */
+export function displayPath(path: string): string {
+	return path
+		.replace(/^\\\\\?\\UNC\\/i, "\\\\")
+		.replace(/^\\\\\?\\(?=[a-z]:\\)/i, "");
+}
+
 /** Forward slashes, no trailing slashes. */
 export function normalizePath(path: string): string {
 	return normalizeSlashes(path).replace(/\/+$/, "");
@@ -11,6 +25,25 @@ export function normalizePath(path: string): string {
 /** Forward slashes, no leading `./` or `/`, no trailing slashes. */
 export function normalizeRelPath(path: string): string {
 	return normalizePath(path).replace(/^\.?\//, "");
+}
+
+/**
+ * Vault-relative paper path comparison key: forward slashes, no leading or
+ * trailing slash runs. Unlike {@link normalizeRelPath} a `./` prefix is kept
+ * and every leading slash is stripped; used to match background-task paper
+ * rows against the currently open paper.
+ */
+export function normalizeRelPaperPath(path: string): string {
+	return normalizeSlashes(path).replace(/^\/+|\/+$/g, "");
+}
+
+/** Whether two vault-relative paper paths refer to the same paper folder. */
+export function sameRelPaperPath(
+	a: string | null | undefined,
+	b: string | null | undefined,
+): boolean {
+	if (!a || !b) return false;
+	return normalizeRelPaperPath(a) === normalizeRelPaperPath(b);
 }
 
 /** Last path segment, or the original string for a single segment. */
@@ -35,6 +68,7 @@ export function dirnameOf(path: string): string {
  */
 export function joinPath(parent: string, name: string): string {
 	if (!parent) return name;
+	parent = normalizeLocalPath(parent);
 	// Prefer backslash when the parent already looks Windows-native.
 	const useBackslash = parent.includes("\\");
 	const sep = useBackslash ? "\\" : "/";
@@ -59,4 +93,24 @@ export function toVaultRelative(
 	if (n === root) return "";
 	if (n.startsWith(`${root}/`)) return n.slice(root.length + 1);
 	return n;
+}
+
+/** Case-insensitive file/directory moves, applied in order without chaining. */
+export function createPathRemapper(
+	moves: readonly { from: string; to: string }[],
+): (path: string) => string {
+	return (path: string): string => {
+		const current = normalizePath(path);
+		const currentKey = current.toLowerCase();
+		for (const move of moves) {
+			const from = normalizePath(move.from);
+			const to = normalizePath(move.to);
+			const fromKey = from.toLowerCase();
+			if (currentKey === fromKey) return to;
+			if (currentKey.startsWith(`${fromKey}/`)) {
+				return `${to}${current.slice(from.length)}`;
+			}
+		}
+		return path;
+	};
 }

@@ -16,7 +16,9 @@ import type { PdfAskNormalizedRect } from "@/lib/pdf/ask";
 import {
 	highlightColorOf,
 	highlightQuoteOf,
-	isHighlightObject,
+	isLiveAnnotation,
+	isTextMarkupObject,
+	textMarkupKindOf,
 } from "@/lib/pdf/highlight/annotation-store";
 
 type AnnotationCapabilityProvides = ReturnType<
@@ -72,14 +74,25 @@ export function usePdfNoteEditor({
 		setRailEdit((current) => (current?.id === state.id ? current : state));
 	}, []);
 
-	const closeRailEdit = useCallback(() => setRailEdit(null), []);
+	const closeRailEdit = useCallback(() => {
+		setRailEdit((current) => {
+			if (current?.isNew) {
+				if (current.kind === "visual") {
+					deleteVisualTraceById(current.id);
+				} else {
+					deleteHighlightAnnotation(current.pageIndex, current.id);
+				}
+			}
+			return null;
+		});
+	}, [deleteHighlightAnnotation, deleteVisualTraceById]);
 
 	const openEditorForAnnotation = useCallback(
 		(id: string) => {
-			const obj = annotationCap
-				?.forDocument(docId)
-				.getAnnotationById(id)?.object;
-			if (!obj || !isHighlightObject(obj)) return;
+			const tracked = annotationCap?.forDocument(docId).getAnnotationById(id);
+			if (!tracked || !isLiveAnnotation(tracked)) return;
+			const obj = tracked.object;
+			if (!isTextMarkupObject(obj)) return;
 			beginRailEdit({
 				id,
 				pageIndex: obj.pageIndex,
@@ -87,6 +100,7 @@ export function usePdfNoteEditor({
 				comment: obj.contents?.trim() ?? "",
 				quote: highlightQuoteOf(obj),
 				color: highlightColorOf(obj),
+				shape: textMarkupKindOf(obj),
 				anchorY: anchorYForHighlight(id),
 				rects: rectsForHighlight(id),
 			});
@@ -102,14 +116,28 @@ export function usePdfNoteEditor({
 
 	const saveRailEdit = useCallback(
 		(comment: PageAnnotationComment, text: string) => {
-			if (comment.kind === "visual") {
-				updateVisualComment(comment.id, text);
+			const trimmed = text.trim();
+			if (comment.isNew && !trimmed) {
+				if (comment.kind === "visual") {
+					deleteVisualTraceById(comment.id);
+				} else {
+					deleteHighlightAnnotation(comment.pageIndex, comment.id);
+				}
 			} else {
-				updateHighlightComment(comment.pageIndex, comment.id, text);
+				if (comment.kind === "visual") {
+					updateVisualComment(comment.id, trimmed);
+				} else {
+					updateHighlightComment(comment.pageIndex, comment.id, trimmed);
+				}
 			}
 			setRailEdit((current) => (current?.id === comment.id ? null : current));
 		},
-		[updateHighlightComment, updateVisualComment],
+		[
+			updateHighlightComment,
+			updateVisualComment,
+			deleteHighlightAnnotation,
+			deleteVisualTraceById,
+		],
 	);
 
 	const deleteRailComment = useCallback(
@@ -144,7 +172,9 @@ export function railEditFromComment(
 		comment: comment.comment,
 		quote: comment.quote,
 		color: comment.color,
+		shape: comment.shape,
 		anchorY: comment.anchorY,
 		rects: comment.rects,
+		isNew: comment.isNew,
 	};
 }

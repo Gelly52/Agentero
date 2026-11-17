@@ -3,11 +3,11 @@
 //! Deliberately free-MT only: the CLI config (`~/.config/agentero/config.toml`)
 //! is isolated from GUI settings, so commercial BYOK keys are not available here.
 //!
-//! @see docs/development/mark-cli-roadmap.md §6.3
+//! @see docs/backend/cli.md
 
 use crate::error::CliError;
 use crate::resolve::GlobalOpts;
-use agentero_lib::features::translate::{
+use agentero_core::features::translate::{
     free_mt_to_zh, translate_text, TranslateTextArgs, FREE_PROVIDERS,
 };
 use serde_json::{json, Value};
@@ -44,6 +44,10 @@ pub async fn run_raw(
             .ok_or_else(|| CliError::message("all free translation engines failed")),
         (chosen, _) => {
             let result = translate_text(TranslateTextArgs {
+                glossary: None,
+                dictionary: false,
+                dictionary_surrounding: None,
+                dictionary_reference: None,
                 text: text.to_string(),
                 source_lang: source.to_string(),
                 target_lang: target.to_string(),
@@ -52,6 +56,10 @@ pub async fn run_raw(
                 base_url: None,
                 region: None,
                 model: None,
+                extra_request_body: None,
+                custom_prompt: None,
+                custom_system: None,
+                custom_user: None,
                 timeout_ms: None,
             })
             .await

@@ -6,23 +6,21 @@
  * undefined so tab right-click silently does nothing.
  */
 import "dockview";
+
 import {
 	type DockviewApi,
 	type DockviewDefaultTab,
 	type DockviewDidDropEvent,
 	type DockviewDndOverlayEvent,
-	type DockviewPanelRenderer,
 	DockviewReact,
 	type DockviewReadyEvent,
 	type DockviewTabGroupColorEntry,
 	type DockviewWillDropEvent,
-	type DropOverlayModelParams,
 	type GetTabContextMenuItemsParams,
 	type GetTabGroupChipContextMenuItemsParams,
-	type IDockviewPanel,
 	type IDockviewPanelProps,
 } from "dockview-react";
-import { FileCode2, X } from "lucide-react";
+import { FileCode2 } from "lucide-react";
 import {
 	type ComponentProps,
 	createContext,
@@ -37,35 +35,133 @@ import {
 	useState,
 } from "react";
 import { useTranslation } from "react-i18next";
+import { PaperTitle } from "@/components/paper/paper-title";
+import { MathText } from "@/components/ui/math-text";
 import {
 	Tooltip,
 	TooltipContent,
 	TooltipTrigger,
 } from "@/components/ui/tooltip";
+import { TexLiveStatusDot } from "@/components/viewer/texlive/tex-live-status";
 import { DocView, type DocViewProps } from "@/components/workspace/doc-view";
+import { DocumentTab } from "@/components/workspace/document-tab";
+import { PaperPathBar } from "@/components/workspace/paper-path-bar";
 import { AgenteroTabGroupChip } from "@/components/workspace/tab-group-chip";
+import { copyTextToClipboard } from "@/lib/core/clipboard";
+import { errorText } from "@/lib/core/error";
+import { notifyError } from "@/lib/core/notify";
+import { displayPath } from "@/lib/core/path";
 import { cn } from "@/lib/core/utils";
 import { isLibraryVirtualPath, isTrashVirtualPath } from "@/lib/paper/api";
+import { isPlazaVirtualPath } from "@/lib/plaza/sources";
 import { moveDocToWindow } from "@/lib/shell/leaf";
+import { formatShortcutById } from "@/lib/shell/shortcuts";
+import { setLayoutMode, uiStore } from "@/lib/shell/ui-store";
 import { TAG_COLOR_IDS, tagSwatchStyle } from "@/lib/ui/tag-colors";
+import { openTexPdf } from "@/lib/workspace/actions";
+import type { DockHandle } from "@/lib/workspace/dock-registry";
+import { installDockviewDragSelectionGuard } from "@/lib/workspace/dockview-drag-selection";
 import { installDockviewSashFrameLoop } from "@/lib/workspace/dockview-sash";
 import { agenteroDockTheme } from "@/lib/workspace/dockview-theme";
 import {
-	isSplitDragPayload,
-	readDraggedVaultPaths,
-} from "@/lib/workspace/tab-dnd";
+	ensureLibraryTabFirst,
+	isLibraryPanel,
+} from "@/lib/workspace/library-tab-position";
+import { createMarkdownResizeFreeze } from "@/lib/workspace/markdown-resize-freeze";
+import {
+	rememberNotesSplitWidth,
+	restoreNotesSplitWidth,
+} from "@/lib/workspace/notes-split-width";
+import { installResizeGesture } from "@/lib/workspace/resize-gesture";
+import { useSelectionOverlayActive } from "@/lib/workspace/selection-overlay";
+import { readDraggedVaultPaths } from "@/lib/workspace/tab-dnd";
 import {
 	type DocTab,
-	type OpenPlacement,
-	panelPersistParams,
+	type ReadingColumns,
 	type SplitDirection,
 	tabIdForPath,
+	tabIsPaperNotes,
 	tabNotesEligible,
 } from "@/lib/workspace/tabs";
-import type { CenterViewMode } from "@/lib/workspace/viewer";
+import { isTexPath } from "@/lib/workspace/viewer";
+import { pdfHandleFor } from "@/lib/workspace/viewer/pdf-viewer-registry";
+
+import {
+	addPanelWithPlacement,
+	applyTabPanelMeta,
+	isExternalPathDrag,
+	isInternalDockDrag,
+	readingColumnAnchors,
+	reconcileAfterLayoutRestore,
+	reconcilePanelMembership,
+	resolveDropOverlayModel,
+	toSplitDirection,
+	visiblePanelIds,
+} from "./dock-layout";
 
 /** Grey + paper tag palette (same swatches as library tags). */
 const TAB_GROUP_COLORS = ["grey", ...TAG_COLOR_IDS] as const;
+
+/**
+ * Dockview's built-in menu items only support a plain `label` string.
+ * Build a custom row so we can show a right-aligned shortcut hint (file-tree style).
+ */
+function buildTabContextMenuItem(opts: {
+	label: string;
+	shortcut?: string;
+	action: () => void;
+	disabled?: boolean;
+}): { element: HTMLElement } {
+	const el = document.createElement("div");
+	el.className = "dv-context-menu-item";
+	el.setAttribute("role", "menuitem");
+	if (opts.disabled) {
+		el.classList.add("dv-context-menu-item--disabled");
+		el.setAttribute("aria-disabled", "true");
+	}
+	if (opts.shortcut) {
+		el.classList.add("agentero-dv-context-menu-item--with-shortcut");
+		const labelEl = document.createElement("span");
+		labelEl.textContent = opts.label;
+		const shortcutEl = document.createElement("span");
+		shortcutEl.className = "agentero-dv-context-menu-shortcut";
+		shortcutEl.textContent = opts.shortcut;
+		el.append(labelEl, shortcutEl);
+	} else {
+		el.textContent = opts.label;
+	}
+	if (!opts.disabled) {
+		el.addEventListener("click", () => {
+			opts.action();
+			// Custom `element` items skip dockview's built-in close(); drop the
+			// popover wrapper. PopupService clears leftover listeners on next open.
+			el.closest(".dv-context-menu")?.parentElement?.remove();
+		});
+	}
+	return { element: el };
+}
+
+/** Virtual rows and `agentero:` paths have no filesystem location to copy. */
+function tabPathCopyable(tab: DocTab | null): tab is DocTab {
+	if (!tab?.path) return false;
+	if (
+		tab.kind === "library" ||
+		tab.kind === "trash" ||
+		tab.kind === "plaza" ||
+		tab.kind === "zen"
+	) {
+		return false;
+	}
+	if (tab.path.startsWith("agentero:")) return false;
+	if (
+		isLibraryVirtualPath(tab.path) ||
+		isTrashVirtualPath(tab.path) ||
+		isPlazaVirtualPath(tab.path)
+	) {
+		return false;
+	}
+	return true;
+}
 
 export type WorkspaceExternalDrop = {
 	paths: string[];
@@ -74,18 +170,7 @@ export type WorkspaceExternalDrop = {
 };
 
 /** Imperative API for App: open with placement, cycle focus (visual dockview order). */
-export type DockWorkspaceHandle = {
-	/** Add (or activate) a panel with optional split placement. */
-	openPanel: (tab: DocTab, placement?: OpenPlacement) => void;
-	/** Add a panel as a right split and rebalance visible grid columns. */
-	splitPanelRight: (tab: DocTab, referencePanelId: string | null) => void;
-	/** Replace a panel id after a filesystem move while preserving its group. */
-	remapPanel: (previousPanelId: string, tab: DocTab) => void;
-	/** Cycle active panel by dockview `api.panels` order (wraps). */
-	cycleActive: (delta: number) => void;
-	/** Activate an existing panel by id. */
-	activatePanel: (panelId: string) => void;
-};
+export type DockWorkspaceHandle = DockHandle;
 
 type WorkspaceCtx = {
 	tabsById: Map<string, DocTab>;
@@ -93,6 +178,7 @@ type WorkspaceCtx = {
 	centerProps: Omit<DocViewProps, "tab" | "active" | "keepMounted">;
 	keepMountedIds: Set<string>;
 	onToggleHtmlMode: (panelId: string) => void;
+	onClosePanel: (panelId: string) => void;
 };
 
 const WorkspaceContext = createContext<WorkspaceCtx | null>(null);
@@ -115,9 +201,11 @@ function WorkspacePane(props: IDockviewPanelProps<{ panelId: string }>) {
 		tab.mode === "html" &&
 		tab.notesPath != null &&
 		activePanelId === tabIdForPath(tab.notesPath);
-	const active = activePanelId === panelId || notesActive;
+	const focused = activePanelId === panelId;
+	const active = focused || notesActive;
 	return (
 		<div className="flex h-full min-h-0 min-w-0 flex-col overflow-hidden bg-background">
+			<PaperPathBar tab={tab} vaultPath={centerProps.vaultPath} />
 			<DocView
 				{...centerProps}
 				tab={tab}
@@ -130,6 +218,13 @@ function WorkspacePane(props: IDockviewPanelProps<{ panelId: string }>) {
 
 const components = { pane: WorkspacePane };
 
+/** Restore headers hidden by older single-preview layouts. */
+function syncProjectPreviewHeaders(api: DockviewApi) {
+	for (const group of api.groups) {
+		if (group.model.header.hidden) group.model.header.hidden = false;
+	}
+}
+
 function WorkspaceTab({
 	api,
 	containerApi: _containerApi,
@@ -141,10 +236,12 @@ function WorkspaceTab({
 	...rest
 }: ComponentProps<typeof DockviewDefaultTab>) {
 	const { t } = useTranslation("app");
-	const { tabsById, onToggleHtmlMode } = useWorkspace();
+	const { tabsById, onToggleHtmlMode, onClosePanel } = useWorkspace();
 	const [title, setTitle] = useState(api.title);
 	const middleClickRef = useRef(false);
 	const tab = tabsById.get(api.id) ?? null;
+	// Library is the resident tab — no close affordance.
+	const isLibrary = Boolean(tab && isLibraryVirtualPath(tab.path));
 	const canToggleHtml =
 		tab?.paperMeta?.type !== "html" &&
 		Boolean(tab?.htmlUrl) &&
@@ -155,7 +252,7 @@ function WorkspaceTab({
 		return () => disposable.dispose();
 	}, [api]);
 
-	const close = useCallback(() => api.close(), [api]);
+	const close = useCallback(() => onClosePanel(api.id), [api.id, onClosePanel]);
 	const toggleHtml = useCallback(
 		(event: React.MouseEvent) => {
 			event.preventDefault();
@@ -166,15 +263,57 @@ function WorkspaceTab({
 	);
 
 	return (
-		<div
+		<DocumentTab
 			{...rest}
-			className="dv-default-tab"
+			title={
+				tab?.paperMeta ? (
+					<PaperTitle text={title ?? ""} />
+				) : (
+					<MathText text={title ?? ""} />
+				)
+			}
+			closeLabel={t("tabs.close", { title })}
+			onClose={isLibrary ? undefined : close}
+			trailing={
+				<>
+					{tab?.texLive ? (
+						<TexLiveStatusDot
+							rootPath={tab.texRoot ?? tab.path.replace(/\.pdf$/i, ".tex")}
+						/>
+					) : null}
+					{canToggleHtml ? (
+						<Tooltip>
+							<TooltipTrigger asChild>
+								<button
+									type="button"
+									className="dv-default-tab-action"
+									aria-label={
+										tab?.mode === "pdf" ? t("tabs.showHtml") : t("tabs.showPdf")
+									}
+									onPointerDown={(event) => {
+										event.preventDefault();
+										event.stopPropagation();
+									}}
+									onClick={toggleHtml}
+								>
+									<FileCode2 className="size-3.5" />
+								</button>
+							</TooltipTrigger>
+							<TooltipContent side="bottom">
+								{tab?.mode === "pdf" ? t("tabs.showHtml") : t("tabs.showPdf")}
+							</TooltipContent>
+						</Tooltip>
+					) : null}
+				</>
+			}
 			onPointerDown={(event) => {
 				middleClickRef.current = event.button === 1;
 				onPointerDown?.(event);
 			}}
 			onPointerUp={(event) => {
-				if (middleClickRef.current && event.button === 1) close();
+				if (middleClickRef.current && event.button === 1 && !isLibrary) {
+					close();
+				}
 				middleClickRef.current = false;
 				onPointerUp?.(event);
 			}}
@@ -182,239 +321,12 @@ function WorkspaceTab({
 				middleClickRef.current = false;
 				onPointerLeave?.(event);
 			}}
-		>
-			<span className="dv-default-tab-content">{title}</span>
-			{canToggleHtml ? (
-				<Tooltip>
-					<TooltipTrigger asChild>
-						<button
-							type="button"
-							className="dv-default-tab-action"
-							aria-label={
-								tab?.mode === "pdf" ? t("tabs.showHtml") : t("tabs.showPdf")
-							}
-							onPointerDown={(event) => {
-								event.preventDefault();
-								event.stopPropagation();
-							}}
-							onClick={toggleHtml}
-						>
-							<FileCode2 className="size-3.5" />
-						</button>
-					</TooltipTrigger>
-					<TooltipContent side="bottom">
-						{tab?.mode === "pdf" ? t("tabs.showHtml") : t("tabs.showPdf")}
-					</TooltipContent>
-				</Tooltip>
-			) : null}
-			<button
-				type="button"
-				className="dv-default-tab-action"
-				aria-label={t("tabs.close", { title })}
-				onPointerDown={(event) => event.preventDefault()}
-				onClick={() => close()}
-			>
-				<X className="size-3.5" />
-			</button>
-		</div>
+		/>
 	);
 }
 
 /** Alias preserves layout snapshots that stored tabComponent:"default". */
 const tabComponents = { default: WorkspaceTab };
-
-/**
- * Map dockview drop Position → addPanel Direction.
- * dockview uses top/bottom; addPanel uses above/below.
- * center → within (same group as a sibling tab).
- */
-function toSplitDirection(
-	position: DockviewDidDropEvent["position"],
-): SplitDirection {
-	if (position === "left") return "left";
-	if (position === "top") return "above";
-	if (position === "bottom") return "below";
-	if (position === "center") return "within";
-	return "right";
-}
-
-function isExternalPathDrag(native: DragEvent | PointerEvent): boolean {
-	if (!(native instanceof DragEvent) || !native.dataTransfer) return false;
-	return isSplitDragPayload(native.dataTransfer);
-}
-
-/**
- * True when the drag is a dockview-internal panel/group move (PanelTransfer
- * present). Group drags may have `panelId: null` — still internal. External
- * file-tree path drops return undefined from getData().
- */
-function isInternalDockDrag(getData: () => unknown): boolean {
-	return getData() != null;
-}
-
-/**
- * Per-target overlay geometry. Content gets a slightly larger edge activation
- * than dockview's 20% default so left/right/above/below splits are easier in
- * wide panels; header void stays generous for "merge as sibling tab".
- */
-function resolveDropOverlayModel({ location }: DropOverlayModelParams):
-	| {
-			size?: { value: number; type: "percentage" };
-			activationSize?: { value: number; type: "percentage" };
-	  }
-	| undefined {
-	if (location === "content") {
-		return {
-			activationSize: { value: 25, type: "percentage" },
-			size: { value: 50, type: "percentage" },
-		};
-	}
-	if (location === "header_space") {
-		return {
-			activationSize: { value: 50, type: "percentage" },
-		};
-	}
-	// tab / edge: keep dockview defaults (edge shaped by dndEdges).
-	return undefined;
-}
-
-function resolveReferencePanel(
-	api: DockviewApi,
-	placement: OpenPlacement,
-): string | undefined {
-	if (placement?.referencePanelId && api.getPanel(placement.referencePanelId)) {
-		return placement.referencePanelId;
-	}
-	if (api.activePanel?.id) return api.activePanel.id;
-	return api.panels[0]?.id;
-}
-
-/**
- * PDF and Markdown panels use dockview `renderer: 'always'` so inactive
- * sibling tabs keep their React shell mounted (enables App-level PDF /
- * editor LRU keep-alive). Other modes stay `onlyWhenVisible` to free DOM
- * when not shown.
- */
-function rendererForMode(mode: CenterViewMode): DockviewPanelRenderer {
-	return mode === "pdf" || mode === "markdown" ? "always" : "onlyWhenVisible";
-}
-
-function applyPanelRenderer(panel: IDockviewPanel, mode: CenterViewMode): void {
-	const want = rendererForMode(mode);
-	if (panel.api.renderer !== want) {
-		panel.api.setRenderer(want);
-	}
-}
-
-function addPanelWithPlacement(
-	api: DockviewApi,
-	tab: DocTab,
-	placement: OpenPlacement,
-): IDockviewPanel {
-	const referencePanel = resolveReferencePanel(api, placement);
-	const direction = placement?.direction ?? "within";
-	return api.addPanel({
-		id: tab.id,
-		component: "pane",
-		// Omit tabComponent so dockview uses its built-in default tab.
-		// A string like "default" looks up tabComponents["default"] and throws
-		// if not registered (undefined is not a React component).
-		title: tab.title,
-		params: panelPersistParams(tab),
-		renderer: rendererForMode(tab.mode),
-		...(referencePanel
-			? {
-					position: {
-						direction: direction === "within" ? "within" : direction,
-						referencePanel,
-					},
-				}
-			: {}),
-	});
-}
-
-function rebalanceGridGroupWidths(api: DockviewApi): void {
-	const groups = api.groups.filter(
-		(group) => group.api.location.type === "grid",
-	);
-	if (groups.length < 2 || api.width <= 0) return;
-	const width = Math.max(1, Math.floor(api.width / groups.length));
-	for (const group of groups) {
-		group.api.setSize({ width });
-	}
-}
-
-/** Remove grid groups that ended up with no panels (e.g. persisted empty split). */
-function compactEmptyGroups(api: DockviewApi): void {
-	const gridGroups = api.groups.filter(
-		(group) => group.api.location.type === "grid",
-	);
-	if (gridGroups.length < 2) return;
-	if (!gridGroups.some((group) => group.panels.length > 0)) return;
-
-	let changed = false;
-	for (const group of gridGroups) {
-		if (group.panels.length === 0) {
-			try {
-				api.removeGroup(group);
-				changed = true;
-			} catch {
-				// ignore: dockview may refuse to remove a locked group
-			}
-		}
-	}
-	if (changed) {
-		rebalanceGridGroupWidths(api);
-	}
-}
-
-/** Push React tab title / persist params / renderer onto an existing dockview panel. */
-function applyTabPanelMeta(panel: IDockviewPanel, tab: DocTab): void {
-	if (panel.title !== tab.title) {
-		panel.api.setTitle(tab.title);
-	}
-	panel.api.updateParameters(panelPersistParams(tab));
-	applyPanelRenderer(panel, tab.mode);
-}
-
-/**
- * Align dockview panel membership with React `tabs[]`:
- * drop stale panels, add missing ones (default placement).
- */
-function reconcilePanelMembership(api: DockviewApi, list: DocTab[]): void {
-	const wantIds = new Set(list.map((t) => t.id));
-	for (const panel of [...api.panels]) {
-		if (!wantIds.has(panel.id)) {
-			api.removePanel(panel);
-		}
-	}
-	for (const tab of list) {
-		if (api.getPanel(tab.id)) continue;
-		addPanelWithPlacement(api, tab, null);
-	}
-	compactEmptyGroups(api);
-}
-
-/**
- * After fromJSON restore: refresh meta for surviving panels, then membership.
- */
-function reconcileAfterLayoutRestore(api: DockviewApi, list: DocTab[]): void {
-	for (const tab of list) {
-		const panel = api.getPanel(tab.id);
-		if (!panel) continue;
-		// Always re-apply: fromJSON may restore older title/params/renderer.
-		panel.api.setTitle(tab.title);
-		panel.api.updateParameters(panelPersistParams(tab));
-		applyPanelRenderer(panel, tab.mode);
-	}
-	reconcilePanelMembership(api, list);
-}
-
-function visiblePanelIds(api: DockviewApi): string[] {
-	return api.groups.flatMap((group) =>
-		group.activePanel ? [group.activePanel.id] : [],
-	);
-}
 
 type DockWorkspaceProps = {
 	tabs: DocTab[];
@@ -465,9 +377,13 @@ export const DockWorkspace = memo(
 		},
 		ref,
 	) {
-		const { t } = useTranslation("app");
+		const { t } = useTranslation(["app", "viewer"]);
 		const apiRef = useRef<DockviewApi | null>(null);
 		const workspaceRootRef = useRef<HTMLDivElement>(null);
+		// Suspend dockview DnD while a floating selection overlay (toolbar or
+		// ask card) is open — they can sit against the tab strip and a stray
+		// drag would split the layout (#608).
+		const selectionOverlayActive = useSelectionOverlayActive();
 		const syncingRef = useRef(false);
 		const layoutTimerRef = useRef<number | null>(null);
 		const disposablesRef = useRef<{ dispose: () => void }[]>([]);
@@ -489,11 +405,29 @@ export const DockWorkspace = memo(
 		onOpenNotesRef.current = onOpenNotesPanel;
 		const onDropRef = useRef(onExternalDrop);
 		onDropRef.current = onExternalDrop;
+		const activePanelIdRef = useRef(activePanelId);
+		activePanelIdRef.current = activePanelId;
+		const cachedReadingColumnsRef = useRef<ReadingColumns | null>(null);
 
 		useEffect(() => {
 			const root = workspaceRootRef.current;
 			if (!root) return;
-			return installDockviewSashFrameLoop(root);
+			// One gesture signal for every pane resize source: the sash hook below
+			// reports divider drags, and the gesture's own root observer covers
+			// shell rail drags and native window resizes (see resize-gesture.ts).
+			const gesture = installResizeGesture(root);
+			// A dragged divider re-runs the editor's container query every frame;
+			// pin the query containers for the gesture so only the pane edges move.
+			const freeze = createMarkdownResizeFreeze(root, gesture);
+			const disposeSashLoop = installDockviewSashFrameLoop(root, {
+				onSashDragBegin: gesture.begin,
+				onSashDragEnd: gesture.end,
+			});
+			return () => {
+				disposeSashLoop();
+				freeze.dispose();
+				gesture.dispose();
+			};
 		}, []);
 
 		const tabGroupColors = useMemo<DockviewTabGroupColorEntry[]>(
@@ -538,6 +472,25 @@ export const DockWorkspace = memo(
 			(api: DockviewApi) => {
 				requestAnimationFrame(() => {
 					syncingRef.current = false;
+					if (uiStore.getState().layoutMode === "reading") {
+						if (!api.hasMaximizedGroup()) {
+							const activeId = activePanelIdRef.current ?? api.activePanel?.id;
+							const target =
+								(activeId && api.getPanel(activeId)) ??
+								api.panels.find((p) => {
+									const t = tabsRef.current.find((tab) => tab.id === p.id);
+									return t && !tabIsPaperNotes(t);
+								}) ??
+								api.activePanel;
+							if (target) {
+								api.maximizeGroup(target);
+							}
+						}
+					} else if (api.hasMaximizedGroup()) {
+						// Older layouts saved while a writing project auto-maximized
+						// its group must not restore into hidden tab strips.
+						api.exitMaximizedGroup();
+					}
 					onActiveRef.current(api.activePanel?.id ?? null);
 					publishVisiblePanels(api);
 					scheduleLayoutSave(api);
@@ -561,6 +514,7 @@ export const DockWorkspace = memo(
 				centerProps,
 				keepMountedIds: keepSet,
 				onToggleHtmlMode: (panelId) => onToggleHtmlRef.current(panelId),
+				onClosePanel: (panelId) => onCloseRef.current(panelId),
 			}),
 			[tabsById, activePanelId, centerProps, keepSet],
 		);
@@ -591,7 +545,13 @@ export const DockWorkspace = memo(
 					}
 					syncingRef.current = true;
 					try {
-						addPanelWithPlacement(api, tab, placement);
+						const isBackgroundNote =
+							api.hasMaximizedGroup() &&
+							tabIsPaperNotes(tab) &&
+							Boolean(placement && placement.direction === "within");
+						addPanelWithPlacement(api, tab, placement, {
+							inactive: isBackgroundNote,
+						});
 					} finally {
 						endSync(api);
 					}
@@ -602,16 +562,16 @@ export const DockWorkspace = memo(
 					const existing = api.getPanel(tab.id);
 					if (existing) {
 						existing.api.setActive();
-						rebalanceGridGroupWidths(api);
 						return;
 					}
 					syncingRef.current = true;
 					try {
+						// Only split the reference group; leave every other column's
+						// user-adjusted width untouched.
 						addPanelWithPlacement(api, tab, {
 							direction: "right",
 							referencePanelId,
 						});
-						rebalanceGridGroupWidths(api);
 					} finally {
 						endSync(api);
 					}
@@ -649,8 +609,81 @@ export const DockWorkspace = memo(
 					const nextIdx = (base + delta + panels.length) % panels.length;
 					panels[nextIdx]?.api.setActive();
 				},
-				activatePanel(panelId) {
-					apiRef.current?.getPanel(panelId)?.api.setActive();
+				cycleGroupTab(delta) {
+					const api = apiRef.current;
+					const group = api?.activeGroup;
+					if (!api || !group) return;
+					// Only this group's tab bar: ⌥⌘→/← still walks the whole dock.
+					const panels = group.panels;
+					if (panels.length < 2) return;
+					const cur = group.activePanel?.id;
+					const idx = panels.findIndex((panel) => panel.id === cur);
+					const base = idx < 0 ? 0 : idx;
+					const next = panels[(base + delta + panels.length) % panels.length];
+					next?.api.setActive();
+				},
+				visiblePanelIds() {
+					const api = apiRef.current;
+					return api ? visiblePanelIds(api) : [];
+				},
+				activatePanel(panelId, options) {
+					const api = apiRef.current;
+					const panel = api?.getPanel(panelId);
+					if (!panel) return;
+					if (
+						options?.skipSetGroupActive ||
+						(api?.hasMaximizedGroup() && !panel.group.api.isMaximized())
+					) {
+						panel.group.model.openPanel(panel, { skipSetGroupActive: true });
+					} else {
+						panel.api.setActive();
+					}
+				},
+				canActivatePanel(panelId) {
+					return Boolean(apiRef.current?.getPanel(panelId));
+				},
+				maximizeActivePanel() {
+					const api = apiRef.current;
+					const activeId = activePanelIdRef.current ?? api?.activePanel?.id;
+					const panel =
+						(activeId && api?.getPanel(activeId)) ??
+						api?.panels.find((p) => {
+							const t = tabsRef.current.find((tab) => tab.id === p.id);
+							return t && !tabIsPaperNotes(t);
+						}) ??
+						api?.activePanel;
+					if (!api || !panel) return false;
+					if (!api.hasMaximizedGroup()) api.maximizeGroup(panel);
+					return true;
+				},
+				exitMaximizedPanel() {
+					apiRef.current?.exitMaximizedGroup();
+				},
+				isMaximizedPanel() {
+					return apiRef.current?.hasMaximizedGroup() ?? false;
+				},
+				rememberNotesSplitWidth(paperId, notesId) {
+					const api = apiRef.current;
+					if (api) rememberNotesSplitWidth(api, paperId, notesId);
+				},
+				restoreNotesSplitWidth(paperId, notesId) {
+					const api = apiRef.current;
+					if (api) restoreNotesSplitWidth(api, paperId, notesId);
+				},
+				readingColumns() {
+					const api = apiRef.current;
+					if (!api) return null;
+					const resolved = readingColumnAnchors(
+						api,
+						cachedReadingColumnsRef.current,
+						tabsRef.current,
+					);
+					if (resolved && !api.hasMaximizedGroup()) {
+						cachedReadingColumnsRef.current = resolved;
+					} else if (!resolved) {
+						cachedReadingColumnsRef.current = null;
+					}
+					return resolved;
 				},
 			}),
 			[endSync],
@@ -662,12 +695,32 @@ export const DockWorkspace = memo(
 				apiRef.current = api;
 
 				disposablesRef.current = [
+					api.onWillDragPanel((e) => {
+						if (isLibraryPanel(e.panel)) e.nativeEvent.preventDefault();
+					}),
+					api.onWillDragGroup((e) => {
+						if (e.group.panels.some(isLibraryPanel)) {
+							e.nativeEvent.preventDefault();
+						}
+					}),
+					installDockviewDragSelectionGuard(
+						workspaceRootRef.current as HTMLDivElement,
+						api,
+					),
 					api.onUnhandledDragOver((e: DockviewDndOverlayEvent) => {
 						if (!isExternalPathDrag(e.nativeEvent)) return;
 						e.accept();
 					}),
 					// Veto overlay for unknown external drags (keep internal + path drops).
 					api.onWillShowOverlay((e) => {
+						if (
+							e.kind === "tab" &&
+							isLibraryPanel(e.panel) &&
+							e.position === "left"
+						) {
+							e.preventDefault();
+							return;
+						}
 						if (isInternalDockDrag(() => e.getData())) return;
 						if (!isExternalPathDrag(e.nativeEvent)) {
 							e.preventDefault();
@@ -678,6 +731,13 @@ export const DockWorkspace = memo(
 						onActiveRef.current(ev.panel?.id ?? null);
 						publishVisiblePanels(api);
 					}),
+					api.onDidMaximizedGroupChange((event) => {
+						if (event.isMaximized) {
+							if (uiStore.getState().layoutMode !== "reading") {
+								setLayoutMode("reading");
+							}
+						}
+					}),
 					api.onDidRemovePanel((panel) => {
 						if (syncingRef.current) return;
 						onCloseRef.current(panel.id);
@@ -685,6 +745,8 @@ export const DockWorkspace = memo(
 					// Single layout-save path (debounce). Programmatic + user changes
 					// (incl. tab-group rename / color / membership via toJSON).
 					api.onDidLayoutChange(() => {
+						ensureLibraryTabFirst(api);
+						syncProjectPreviewHeaders(api);
 						if (!syncingRef.current) publishVisiblePanels(api);
 						scheduleLayoutSave(api);
 					}),
@@ -723,7 +785,12 @@ export const DockWorkspace = memo(
 		}, [panelIdsKey, syncPanels]);
 
 		// Title + persist params + renderer channel (mode/path without full membership).
-		const metaKey = tabs.map((t) => `${t.id}:${t.title}:${t.mode}`).join("|");
+		const metaKey = tabs
+			.map(
+				(t) =>
+					`${t.id}:${t.title}:${t.mode}:${t.texRoot ?? ""}:${t.writingRoot ?? ""}`,
+			)
+			.join("|");
 		useEffect(() => {
 			void metaKey;
 			const api = apiRef.current;
@@ -733,6 +800,7 @@ export const DockWorkspace = memo(
 				if (!panel) continue;
 				applyTabPanelMeta(panel, tab);
 			}
+			syncProjectPreviewHeaders(api);
 			// Param updates (e.g. resolved title) don't emit onDidLayoutChange;
 			// re-save so the next restore shows titles before hydration (#410).
 			scheduleLayoutSave(api);
@@ -775,8 +843,16 @@ export const DockWorkspace = memo(
 			onDropRef.current({ paths, direction, referencePanelId });
 		}, []);
 
-		/** Cancel drop for unknown external payloads; internal moves always ok. */
+		/** Protect Library's first slot and reject unknown external payloads. */
 		const handleWillDrop = useCallback((e: DockviewWillDropEvent) => {
+			if (
+				e.kind === "tab" &&
+				isLibraryPanel(e.panel) &&
+				e.position === "left"
+			) {
+				e.preventDefault();
+				return;
+			}
 			if (isInternalDockDrag(() => e.getData())) return;
 			if (!isExternalPathDrag(e.nativeEvent)) {
 				e.preventDefault();
@@ -785,26 +861,49 @@ export const DockWorkspace = memo(
 
 		/**
 		 * Tab right-click menu (dockview opt-in). Close actions + tab-group
-		 * create/remove. Closures go through panel.api.close() → onDidRemovePanel.
+		 * create/remove. Close requests go through workspace actions before removing panels.
 		 */
 		const getTabContextMenuItems = useCallback(
 			({ panel, group, api }: GetTabContextMenuItemsParams) => {
-				const hasOthers = group.panels.length > 1;
 				const existing = api.getTabGroupForPanel({
 					groupId: group.id,
 					panelId: panel.id,
 				});
 				const tab = tabsRef.current.find((t) => t.id === panel.id) ?? null;
+				const isLibraryPanel = (panelId: string) => {
+					const found =
+						tabsRef.current.find((candidate) => candidate.id === panelId) ??
+						null;
+					return Boolean(found && isLibraryVirtualPath(found.path));
+				};
+				const panelIsLibrary = isLibraryPanel(panel.id);
+				const closableOthers = group.panels.filter(
+					(p) => p !== panel && !isLibraryPanel(p.id),
+				).length;
 				const menu: Array<
 					| "separator"
 					| { label: string; disabled?: boolean; action: () => void }
+					| { element: HTMLElement }
 				> = [];
 				if (onOpenNotesRef.current && tabNotesEligible(tab) && tab?.notesPath) {
 					menu.push(
-						{
+						buildTabContextMenuItem({
 							label: t("tabs.contextOpenNotes"),
+							shortcut: formatShortcutById("splitPane"),
 							action: () => onOpenNotesRef.current?.(panel.id),
-						},
+						}),
+						"separator",
+					);
+				}
+				if (tab != null && isTexPath(tab.path) && !tab.writingRoot) {
+					menu.push(
+						buildTabContextMenuItem({
+							label: t("tabs.openTexPdf"),
+							shortcut: formatShortcutById("splitPane"),
+							action: () => {
+								void openTexPdf(tab.path, { referencePanelId: panel.id });
+							},
+						}),
 						"separator",
 					);
 				}
@@ -812,6 +911,7 @@ export const DockWorkspace = memo(
 					tab != null &&
 					tab.kind !== "library" &&
 					tab.kind !== "trash" &&
+					tab.kind !== "zen" &&
 					!isLibraryVirtualPath(tab.path) &&
 					!isTrashVirtualPath(tab.path);
 				if (canMoveToWindow && tab) {
@@ -822,17 +922,47 @@ export const DockWorkspace = memo(
 						},
 					});
 				}
+				if (tab?.mode === "pdf") {
+					const handle = pdfHandleFor(panel.id);
+					if (handle) {
+						menu.push({
+							label: t("viewer:pdf.exportAnnotatedPdf"),
+							action: () => {
+								handle
+									.exportAnnotatedPdf()
+									.catch((error: unknown) => notifyError(errorText(error)));
+							},
+						});
+					}
+				}
+				if (tabPathCopyable(tab)) {
+					menu.push(
+						buildTabContextMenuItem({
+							label: t("tabs.contextCopyPath"),
+							action: () => {
+								void copyTextToClipboard(displayPath(tab.path), {
+									successMessage: t("tabs.copiedPath"),
+									errorMessage: t("tabs.copyPathFailed"),
+									successNotify: { duration: 2000 },
+								});
+							},
+						}),
+					);
+				}
 				menu.push(
-					{
+					buildTabContextMenuItem({
 						label: t("tabs.contextClose"),
-						action: () => panel.api.close(),
-					},
+						shortcut: formatShortcutById("closeTab"),
+						disabled: panelIsLibrary,
+						action: () => onCloseRef.current(panel.id),
+					}),
 					{
 						label: t("tabs.contextCloseOthers"),
-						disabled: !hasOthers,
+						disabled: closableOthers === 0,
 						action: () => {
 							for (const p of group.panels) {
-								if (p !== panel) p.api.close();
+								if (p !== panel && !isLibraryPanel(p.id))
+									onCloseRef.current(p.id);
 							}
 						},
 					},
@@ -840,7 +970,7 @@ export const DockWorkspace = memo(
 						label: t("tabs.contextCloseAll"),
 						action: () => {
 							for (const p of [...group.panels]) {
-								p.api.close();
+								if (!isLibraryPanel(p.id)) onCloseRef.current(p.id);
 							}
 						},
 					},
@@ -919,6 +1049,9 @@ export const DockWorkspace = memo(
 						// Tauri WKWebView: HTML5 DnD is unreliable; pointer covers mouse+touch.
 						// Floating/popout already disabled — no cross-window HTML5 drag needed.
 						dndStrategy="pointer"
+						// Floating selection overlays sit against the tab strip; freeze
+						// tab/group drag while one is open so a stray drag cannot split (#608).
+						disableDnd={selectionOverlayActive}
 						dndEdges={{ size: { value: 24, type: "pixels" } }}
 						dropOverlayModel={resolveDropOverlayModel}
 						// Within-group tabs + between groups + Ctrl+M keyboard dock.

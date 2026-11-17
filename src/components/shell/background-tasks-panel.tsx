@@ -9,7 +9,9 @@ import {
 	CheckCircle2,
 	CircleX,
 	Download,
+	FileCode2,
 	FileUp,
+	Languages,
 	LayoutGrid,
 	ListOrdered,
 	Loader2,
@@ -17,9 +19,17 @@ import {
 	Plug,
 	ScanSearch,
 	Search,
+	Settings,
 	X,
 } from "lucide-react";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+	type CSSProperties,
+	useCallback,
+	useEffect,
+	useMemo,
+	useRef,
+	useState,
+} from "react";
 import { useTranslation } from "react-i18next";
 import { Button } from "@/components/ui/button";
 import { Progress } from "@/components/ui/progress";
@@ -32,41 +42,97 @@ import {
 import { useBackgroundTasks } from "@/hooks/use-background-tasks";
 import {
 	type BackgroundTask,
+	type BackgroundTaskIcon,
 	type BackgroundTaskKind,
 	cancelBackgroundTask,
 	clearFinishedBackgroundTasks,
 	getActiveBackgroundTasks,
+	getBackgroundTasksSnapshot,
 	isFinishedBackgroundTask,
 	setBackgroundTasksExpanded,
 } from "@/lib/core/background-tasks";
+import { MOTION_MS, prefersReducedMotion } from "@/lib/core/motion";
+import { notifyError } from "@/lib/core/notify";
 import { cn } from "@/lib/core/utils";
+import { openSettingsWindow } from "@/lib/shell/settings-window";
 
 /** Dwell before expanding detail from the ring (avoids flicker on pass-over). */
 const HOVER_EXPAND_MS = 400;
+/** Brief leave delay so a slip off the HUD does not slam it shut. */
+const LEAVE_COLLAPSE_MS = 100;
 
-/** Center icon for the primary active task kind. */
-function kindIcon(kind: BackgroundTaskKind | undefined) {
+/** Default icon per row kind; params-dependent rows carry an explicit hint. */
+const KIND_ICONS: Partial<Record<BackgroundTaskKind, BackgroundTaskIcon>> = {
+	downloadAssets: "download",
+	modelDownload: "download",
+	citingScan: "search",
+	import: "fileUp",
+	zoteroMigrate: "fileUp",
+	libraryIo: "package",
+	parseRefs: "layout",
+	layoutAnalyze: "layout",
+	layoutRun: "layout",
+	layoutTranslate: "translate",
+	connectorSync: "plug",
+	recognizeMetadata: "scan",
+	latexCompile: "fileCode",
+	paperRead: "read",
+	nodeInstall: "download",
+};
+
+function taskIcon(task: BackgroundTask | undefined): BackgroundTaskIcon {
+	if (!task) return "list";
+	return task.icon ?? KIND_ICONS[task.kind] ?? "list";
+}
+
+/**
+ * Failed layout / reference-parse rows can be caused by a missing or invalid
+ * provider key, so they offer a jump to the analysis settings (#656).
+ */
+const LAYOUT_SETTINGS_KINDS: ReadonlySet<BackgroundTaskKind> = new Set([
+	"layoutAnalyze",
+	"layoutRun",
+	"parseRefs",
+	"parseBody",
+]);
+
+/**
+ * JobCenter-driven failures need their own top-right toast: unlike the
+ * in-viewer run (`layoutRun`, which notifies from the viewer hook), headless
+ * `layoutAnalyze` / `parseBody` / `parseRefs` jobs only project a panel row.
+ * Excludes `layoutRun` to avoid a duplicate toast.
+ */
+const JOB_LAYOUT_TOAST_KINDS: ReadonlySet<BackgroundTaskKind> = new Set([
+	"layoutAnalyze",
+	"parseRefs",
+	"parseBody",
+]);
+
+/** Center icon for the primary active task. */
+function iconGlyph(icon: BackgroundTaskIcon) {
 	const cls = "relative size-3.5 text-foreground";
-	switch (kind) {
+	switch (icon) {
 		case "download":
-		case "downloadAll":
 			return <Download className={cls} aria-hidden />;
-		case "lookup":
+		case "search":
 			return <Search className={cls} aria-hidden />;
-		case "import":
+		case "fileUp":
 			return <FileUp className={cls} aria-hidden />;
-		case "export":
+		case "package":
 			return <Package className={cls} aria-hidden />;
-		case "parse":
 		case "layout":
 			return <LayoutGrid className={cls} aria-hidden />;
-		case "paperRead":
+		case "translate":
+			return <Languages className={cls} aria-hidden />;
+		case "read":
 			return <BookOpen className={cls} aria-hidden />;
-		case "connector":
+		case "plug":
 			return <Plug className={cls} aria-hidden />;
-		case "recognize":
+		case "scan":
 			return <ScanSearch className={cls} aria-hidden />;
-		default:
+		case "fileCode":
+			return <FileCode2 className={cls} aria-hidden />;
+		case "list":
 			return <ListOrdered className={cls} aria-hidden />;
 	}
 }
@@ -110,22 +176,22 @@ function TaskRow({ task }: { task: BackgroundTask }) {
 	}, [task.detail]);
 
 	return (
-		<div className="flex flex-col gap-1 border-b border-border/60 px-2.5 py-2 last:border-b-0">
+		<div className="flex flex-col gap-1 border-b border-border/60 px-3 py-2.5 last:border-b-0">
 			<div className="flex min-w-0 items-start gap-2">
 				<span className="mt-0.5">{statusIcon(task)}</span>
 				<div className="min-w-0 flex-1">
 					<div className="flex items-baseline gap-1.5">
 						{task.queueIndex > 0 ? (
-							<span className="shrink-0 font-mono text-[10px] text-muted-foreground tabular-nums">
+							<span className="shrink-0 font-mono text-caption text-muted-foreground tabular-nums">
 								#{task.queueIndex}
 							</span>
 						) : null}
-						<span className="truncate font-medium text-xs leading-tight">
+						<span className="truncate font-medium text-sm leading-tight">
 							{task.title}
 						</span>
 						{task.progress != null &&
 						(task.status === "running" || task.status === "queued") ? (
-							<span className="ml-auto shrink-0 font-mono text-[10px] text-muted-foreground tabular-nums">
+							<span className="ml-auto shrink-0 font-mono text-caption text-muted-foreground tabular-nums">
 								{Math.round(task.progress)}%
 							</span>
 						) : null}
@@ -133,7 +199,7 @@ function TaskRow({ task }: { task: BackgroundTask }) {
 					{task.detail ? (
 						<div
 							className={cn(
-								"mt-0.5 flex min-w-0 items-baseline gap-1 text-[11px] leading-snug text-muted-foreground",
+								"mt-0.5 flex min-w-0 items-baseline gap-1 text-caption leading-snug text-muted-foreground",
 								task.status === "failed" && "text-destructive",
 							)}
 							title={task.detail}
@@ -162,6 +228,44 @@ function TaskRow({ task }: { task: BackgroundTask }) {
 						<TooltipContent side="left">{t("tasks.cancel")}</TooltipContent>
 					</Tooltip>
 				) : null}
+				{task.status === "failed" && LAYOUT_SETTINGS_KINDS.has(task.kind) ? (
+					<Tooltip>
+						<TooltipTrigger asChild>
+							<Button
+								type="button"
+								variant="ghost"
+								size="icon-xs"
+								className="size-6 shrink-0"
+								aria-label={t("tasks.openLayoutSettings")}
+								onClick={() => openSettingsWindow("layout")}
+							>
+								<Settings className="size-3.5" />
+							</Button>
+						</TooltipTrigger>
+						<TooltipContent side="left">
+							{t("tasks.openLayoutSettings")}
+						</TooltipContent>
+					</Tooltip>
+				) : null}
+				{task.status === "failed" && task.kind === "layoutTranslate" ? (
+					<Tooltip>
+						<TooltipTrigger asChild>
+							<Button
+								type="button"
+								variant="ghost"
+								size="icon-xs"
+								className="size-6 shrink-0"
+								aria-label={t("tasks.openTranslateSettings")}
+								onClick={() => openSettingsWindow("translate")}
+							>
+								<Settings className="size-3.5" />
+							</Button>
+						</TooltipTrigger>
+						<TooltipContent side="left">
+							{t("tasks.openTranslateSettings")}
+						</TooltipContent>
+					</Tooltip>
+				) : null}
 			</div>
 			{showBar &&
 			task.status !== "completed" &&
@@ -182,37 +286,48 @@ function TaskRow({ task }: { task: BackgroundTask }) {
 type RingCenterPhase = "progress" | "icon";
 
 const RING_CENTER_MS = 2400;
+/** Success pop / ring-merge celebration after the last active task ends. */
+const RING_SUCCESS_MS = 900;
 
-/** Circular progress control — center cycles progress / kind icon. */
+/** Circular progress control — center cycles progress / task icon. */
 function ProgressRing({
 	activeCount,
 	failed,
 	label,
 	progress,
-	taskKind,
+	icon,
 	onActivate,
 }: {
 	activeCount: number;
 	failed: boolean;
 	label: string;
 	progress: number | null;
-	taskKind?: BackgroundTaskKind;
+	icon: BackgroundTaskIcon;
 	onActivate: () => void;
 }) {
 	const radius = 16;
 	const circumference = 2 * Math.PI * radius;
-	const normalizedProgress =
-		progress == null ? null : Math.max(0, Math.min(100, progress));
+	const finished = activeCount === 0;
+	// Finished → always a closed (merged) ring at 100%. While running with no
+	// numeric progress, keep the indeterminate arc.
+	const isIndeterminate = !finished && progress == null;
+	const normalizedProgress = finished
+		? 100
+		: progress == null
+			? null
+			: Math.max(0, Math.min(100, progress));
 	const offset =
 		normalizedProgress == null
 			? 0
 			: circumference - (normalizedProgress / 100) * circumference;
 
 	const [phase, setPhase] = useState<RingCenterPhase>("progress");
+	const [celebrate, setCelebrate] = useState(false);
+	const prevActiveRef = useRef(activeCount);
 	const active = activeCount > 0 && !failed;
 
 	useEffect(() => {
-		if (!active) {
+		if (!active || prefersReducedMotion()) {
 			setPhase("progress");
 			return;
 		}
@@ -226,42 +341,64 @@ function ProgressRing({
 		return () => window.clearInterval(id);
 	}, [active]);
 
+	// Last active task ended successfully → play merge/success animation once.
+	useEffect(() => {
+		const prev = prevActiveRef.current;
+		prevActiveRef.current = activeCount;
+		if (prev > 0 && activeCount === 0 && !failed) {
+			setCelebrate(true);
+			const id = window.setTimeout(() => setCelebrate(false), RING_SUCCESS_MS);
+			return () => window.clearTimeout(id);
+		}
+		if (activeCount > 0 || failed) {
+			setCelebrate(false);
+		}
+	}, [activeCount, failed]);
+
 	const center = (() => {
 		if (failed) {
 			return <CircleX className="relative size-3.5 text-destructive" />;
 		}
-		if (activeCount === 0) {
+		if (finished) {
 			return (
-				<CheckCircle2 className="relative size-3.5 text-emerald-600 dark:text-emerald-400" />
+				<CheckCircle2
+					className={cn(
+						"relative size-3.5 text-emerald-600 dark:text-emerald-400",
+						celebrate && "task-ring-success-icon",
+					)}
+				/>
 			);
 		}
-		// Active work: cycle progress ↔ kind icon.
+		// Active work: cycle progress ↔ task icon.
 		if (phase === "icon") {
-			return kindIcon(taskKind);
+			return iconGlyph(icon);
 		}
 		// progress phase
 		if (activeCount > 1) {
 			return (
-				<span className="relative font-mono font-medium text-[11px] tabular-nums">
+				<span className="relative font-mono font-medium text-caption tabular-nums">
 					{activeCount}
 				</span>
 			);
 		}
 		if (normalizedProgress != null) {
 			return (
-				<span className="relative font-mono font-medium text-[9px] tabular-nums leading-none text-foreground">
+				<span className="relative font-mono font-medium text-caption tabular-nums leading-none text-foreground">
 					{Math.round(normalizedProgress)}%
 				</span>
 			);
 		}
 		// No numeric progress yet — show task icon.
-		return kindIcon(taskKind);
+		return iconGlyph(icon);
 	})();
 
 	return (
 		<button
 			type="button"
-			className="relative flex size-9 items-center justify-center rounded-full bg-background text-foreground shadow-sm ring-1 ring-border transition-opacity hover:opacity-90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-1"
+			className={cn(
+				"relative flex size-9 items-center justify-center rounded-full bg-background text-foreground shadow-raised ring-1 ring-border transition-[opacity,transform] duration-100 hover:opacity-90 active:scale-[0.96] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-1",
+				celebrate && "task-ring-success-pulse",
+			)}
 			aria-label={label}
 			aria-expanded={false}
 			onClick={onActivate}
@@ -276,6 +413,11 @@ function ProgressRing({
 				className="pointer-events-none absolute inset-0 size-full -rotate-90"
 				viewBox="0 0 40 40"
 				aria-hidden="true"
+				style={
+					{
+						"--task-ring-c": String(circumference),
+					} as CSSProperties
+				}
 			>
 				{/* Track: muted-foreground (not --muted, which is nearly white in light mode). */}
 				<circle
@@ -296,17 +438,17 @@ function ProgressRing({
 					strokeLinecap="round"
 					strokeWidth="3"
 					strokeDasharray={
-						normalizedProgress == null
+						isIndeterminate
 							? `${circumference * 0.28} ${circumference}`
 							: circumference
 					}
 					strokeDashoffset={offset}
 					className={cn(
-						"text-primary transition-[stroke-dashoffset]",
+						"text-primary transition-[stroke-dashoffset,stroke] duration-500 ease-out",
+						isIndeterminate && "task-ring-indeterminate",
 						failed && "text-destructive",
-						activeCount === 0 &&
-							!failed &&
-							"text-emerald-600 dark:text-emerald-400",
+						finished && !failed && "text-emerald-600 dark:text-emerald-400",
+						celebrate && "task-ring-success-stroke",
 					)}
 				/>
 			</svg>
@@ -324,40 +466,93 @@ const ERROR_DETAIL_MS = 5000;
 export function BackgroundTasksPanel({ className }: { className?: string }) {
 	const { t } = useTranslation("app");
 	const { tasks } = useBackgroundTasks();
-	/** Detail open is hover-driven; store.expanded is only a fail signal. */
-	const [detailOpen, setDetailOpen] = useState(false);
+	/**
+	 * Detail open is hover-driven; store.expanded is only a fail signal.
+	 * `detailMounted` keeps the panel in the DOM through the exit transition;
+	 * `detailVisible` drives opacity/scale so enter and exit share one path.
+	 */
+	const [detailMounted, setDetailMounted] = useState(false);
+	const [detailVisible, setDetailVisible] = useState(false);
 	const pointerInsideRef = useRef(false);
 	const hoverExpandTimerRef = useRef<ReturnType<typeof setTimeout> | null>(
 		null,
 	);
+	const leaveCollapseTimerRef = useRef<ReturnType<typeof setTimeout> | null>(
+		null,
+	);
+	const exitAnimTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 	const errorCollapseTimerRef = useRef<ReturnType<typeof setTimeout> | null>(
 		null,
 	);
 	const seenFailedIdsRef = useRef<Set<string>>(new Set());
+	const detailOpen = detailMounted && detailVisible;
 
-	const openDetail = useCallback(() => {
-		setDetailOpen(true);
-		setBackgroundTasksExpanded(true);
-	}, []);
-
-	const closeDetail = useCallback(() => {
+	const clearHoverTimers = useCallback(() => {
 		if (hoverExpandTimerRef.current) {
 			clearTimeout(hoverExpandTimerRef.current);
 			hoverExpandTimerRef.current = null;
 		}
+		if (leaveCollapseTimerRef.current) {
+			clearTimeout(leaveCollapseTimerRef.current);
+			leaveCollapseTimerRef.current = null;
+		}
+	}, []);
+
+	const openDetail = useCallback(() => {
+		clearHoverTimers();
+		if (exitAnimTimerRef.current) {
+			clearTimeout(exitAnimTimerRef.current);
+			exitAnimTimerRef.current = null;
+		}
 		if (errorCollapseTimerRef.current) {
 			clearTimeout(errorCollapseTimerRef.current);
 			errorCollapseTimerRef.current = null;
 		}
-		setDetailOpen(false);
-		setBackgroundTasksExpanded(false);
-	}, []);
+		setBackgroundTasksExpanded(true);
+		setDetailMounted(true);
+		// Double rAF so the enter transition starts from the collapsed frame.
+		requestAnimationFrame(() => {
+			requestAnimationFrame(() => setDetailVisible(true));
+		});
+	}, [clearHoverTimers]);
 
-	const scheduleHoverExpand = useCallback(() => {
-		pointerInsideRef.current = true;
+	const closeDetail = useCallback(() => {
+		clearHoverTimers();
 		if (errorCollapseTimerRef.current) {
 			clearTimeout(errorCollapseTimerRef.current);
 			errorCollapseTimerRef.current = null;
+		}
+		setDetailVisible(false);
+		setBackgroundTasksExpanded(false);
+		if (exitAnimTimerRef.current) {
+			clearTimeout(exitAnimTimerRef.current);
+		}
+		const exitMs = prefersReducedMotion() ? 0 : MOTION_MS.normal;
+		exitAnimTimerRef.current = setTimeout(() => {
+			exitAnimTimerRef.current = null;
+			setDetailMounted(false);
+		}, exitMs);
+	}, [clearHoverTimers]);
+
+	const scheduleHoverExpand = useCallback(() => {
+		pointerInsideRef.current = true;
+		if (leaveCollapseTimerRef.current) {
+			clearTimeout(leaveCollapseTimerRef.current);
+			leaveCollapseTimerRef.current = null;
+		}
+		if (errorCollapseTimerRef.current) {
+			clearTimeout(errorCollapseTimerRef.current);
+			errorCollapseTimerRef.current = null;
+		}
+		if (detailMounted) {
+			// Re-entering mid-exit: cancel unmount and show again.
+			if (exitAnimTimerRef.current) {
+				clearTimeout(exitAnimTimerRef.current);
+				exitAnimTimerRef.current = null;
+			}
+			setDetailVisible(true);
+			setBackgroundTasksExpanded(true);
+			return;
 		}
 		if (hoverExpandTimerRef.current) {
 			clearTimeout(hoverExpandTimerRef.current);
@@ -365,17 +560,23 @@ export function BackgroundTasksPanel({ className }: { className?: string }) {
 		}
 		hoverExpandTimerRef.current = setTimeout(() => {
 			hoverExpandTimerRef.current = null;
-			if (pointerInsideRef.current) {
-				setDetailOpen(true);
-				setBackgroundTasksExpanded(true);
-			}
+			if (pointerInsideRef.current) openDetail();
 		}, HOVER_EXPAND_MS);
-	}, []);
+	}, [detailMounted, openDetail]);
 
 	const collapseOnLeave = useCallback(() => {
 		pointerInsideRef.current = false;
-		// Always return to the ring when the pointer leaves the panel.
-		closeDetail();
+		if (hoverExpandTimerRef.current) {
+			clearTimeout(hoverExpandTimerRef.current);
+			hoverExpandTimerRef.current = null;
+		}
+		if (leaveCollapseTimerRef.current) {
+			clearTimeout(leaveCollapseTimerRef.current);
+		}
+		leaveCollapseTimerRef.current = setTimeout(() => {
+			leaveCollapseTimerRef.current = null;
+			if (!pointerInsideRef.current) closeDetail();
+		}, LEAVE_COLLAPSE_MS);
 	}, [closeDetail]);
 
 	const active = useMemo(() => getActiveBackgroundTasks(tasks), [tasks]);
@@ -412,6 +613,37 @@ export function BackgroundTasksPanel({ className }: { className?: string }) {
 		for (const id of ids) seenFailedIdsRef.current.add(id);
 		if (fresh.length === 0) return;
 
+		// Headless layout / parse jobs have no viewer toast of their own — surface
+		// a top-right error with a jump to the analysis settings.
+		const failedTasks = getBackgroundTasksSnapshot().tasks;
+		for (const id of fresh) {
+			const task = failedTasks.find((item) => item.id === id);
+			if (!task) continue;
+			if (JOB_LAYOUT_TOAST_KINDS.has(task.kind)) {
+				notifyError(task.title, {
+					description: task.error?.trim() || undefined,
+					id: `layout-failed-${id}`,
+					action: {
+						label: t("tasks.openLayoutSettings"),
+						onClick: () => openSettingsWindow("layout"),
+					},
+				});
+				continue;
+			}
+			// Background import translation fails without a viewer: surface the
+			// provider / settings error here instead of only the panel row.
+			if (task.kind === "layoutTranslate") {
+				notifyError(task.title, {
+					description: task.error?.trim() || undefined,
+					id: `translate-failed-${id}`,
+					action: {
+						label: t("tasks.openTranslateSettings"),
+						onClick: () => openSettingsWindow("translate"),
+					},
+				});
+			}
+		}
+
 		openDetail();
 		if (errorCollapseTimerRef.current) {
 			clearTimeout(errorCollapseTimerRef.current);
@@ -420,13 +652,21 @@ export function BackgroundTasksPanel({ className }: { className?: string }) {
 			errorCollapseTimerRef.current = null;
 			if (!pointerInsideRef.current) closeDetail();
 		}, ERROR_DETAIL_MS);
-	}, [failedIdsKey, openDetail, closeDetail]);
+	}, [failedIdsKey, openDetail, closeDetail, t]);
 
 	useEffect(() => {
 		return () => {
 			if (hoverExpandTimerRef.current) {
 				clearTimeout(hoverExpandTimerRef.current);
 				hoverExpandTimerRef.current = null;
+			}
+			if (leaveCollapseTimerRef.current) {
+				clearTimeout(leaveCollapseTimerRef.current);
+				leaveCollapseTimerRef.current = null;
+			}
+			if (exitAnimTimerRef.current) {
+				clearTimeout(exitAnimTimerRef.current);
+				exitAnimTimerRef.current = null;
 			}
 			if (errorCollapseTimerRef.current) {
 				clearTimeout(errorCollapseTimerRef.current);
@@ -437,8 +677,8 @@ export function BackgroundTasksPanel({ className }: { className?: string }) {
 
 	// No tasks left → force ring state for the next job.
 	useEffect(() => {
-		if (tasks.length === 0 && detailOpen) closeDetail();
-	}, [tasks.length, detailOpen, closeDetail]);
+		if (tasks.length === 0 && detailMounted) closeDetail();
+	}, [tasks.length, detailMounted, closeDetail]);
 
 	if (tasks.length === 0) return null;
 
@@ -459,11 +699,15 @@ export function BackgroundTasksPanel({ className }: { className?: string }) {
 				? (active[0]?.title ?? t("tasks.title"))
 				: t("tasks.activeCount", { count: active.length });
 
+	const reduceMotion = prefersReducedMotion();
+
 	return (
 		<TooltipProvider delayDuration={300}>
 			<section
 				className={cn(
-					"pointer-events-auto fixed bottom-3 left-3 z-50 flex flex-col items-start gap-1",
+					"pointer-events-auto fixed bottom-3 left-3 z-50 flex flex-col items-start origin-bottom-left",
+					"transition-[width] ease-out",
+					reduceMotion ? "duration-0" : "duration-200",
 					detailOpen ? "w-[min(20rem,calc(100vw-1.5rem))]" : "w-9",
 					className,
 				)}
@@ -471,10 +715,21 @@ export function BackgroundTasksPanel({ className }: { className?: string }) {
 				onMouseEnter={scheduleHoverExpand}
 				onMouseLeave={collapseOnLeave}
 			>
-				{detailOpen ? (
-					<div className="w-full overflow-hidden rounded-md border bg-popover text-popover-foreground shadow-lg">
-						<div className="flex h-8 items-center gap-1 border-b bg-muted/40 px-2">
-							<span className="min-w-0 flex-1 truncate px-1 font-medium text-xs">
+				{detailMounted ? (
+					<div
+						className={cn(
+							"w-full origin-bottom-left overflow-hidden rounded-lg border border-border/70 bg-popover text-popover-foreground shadow-overlay",
+							"transition-[opacity,transform] ease-out",
+							reduceMotion ? "duration-150" : "duration-200",
+							detailVisible
+								? "scale-100 opacity-100"
+								: reduceMotion
+									? "opacity-0"
+									: "scale-95 opacity-0",
+						)}
+					>
+						<div className="flex h-9 items-center gap-1 border-b border-border/60 bg-muted/30 px-2.5">
+							<span className="min-w-0 flex-1 truncate px-1 font-medium text-sm">
 								{t("tasks.title")}
 								{active.length > 0 ? (
 									<span className="ml-1.5 text-muted-foreground tabular-nums">
@@ -518,13 +773,10 @@ export function BackgroundTasksPanel({ className }: { className?: string }) {
 						failed={hasFailed}
 						label={ringLabel}
 						progress={ringProgress}
-						taskKind={active[0]?.kind}
+						icon={taskIcon(active[0])}
 						onActivate={() => {
 							pointerInsideRef.current = true;
-							if (hoverExpandTimerRef.current) {
-								clearTimeout(hoverExpandTimerRef.current);
-								hoverExpandTimerRef.current = null;
-							}
+							clearHoverTimers();
 							openDetail();
 						}}
 					/>

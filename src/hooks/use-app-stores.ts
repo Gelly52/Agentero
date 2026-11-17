@@ -7,12 +7,12 @@ import { useStore } from "zustand";
 import { selectionStore } from "@/lib/agent/selection-store";
 import { visualContextStore } from "@/lib/agent/visual-context-store";
 import { libraryStore } from "@/lib/paper/library-store";
-import { annotationsStore } from "@/lib/pdf/annotations-store";
 import { settingsStore } from "@/lib/settings/react-store";
 import { uiStore } from "@/lib/shell/ui-store";
 import { vaultStore } from "@/lib/vault/store";
 import { wikiStore } from "@/lib/wiki/store";
 import { workspaceStore } from "@/lib/workspace/store";
+import { writingStore } from "@/lib/writing/store";
 
 type ExtractState<S> = S extends { getState: () => infer T } ? T : never;
 
@@ -32,12 +32,6 @@ export function useLibraryStore<T>(
 	selector: (state: ExtractState<typeof libraryStore>) => T,
 ): T {
 	return useStore(libraryStore, selector);
-}
-
-export function useAnnotationsStore<T>(
-	selector: (state: ExtractState<typeof annotationsStore>) => T,
-): T {
-	return useStore(annotationsStore, selector);
 }
 
 export function useWikiStore<T>(
@@ -68,4 +62,10 @@ export function useSettings<T>(
 	selector: (state: ExtractState<typeof settingsStore>) => T,
 ): T {
 	return useStore(settingsStore, selector);
+}
+
+export function useWritingStore<T>(
+	selector: (state: ExtractState<typeof writingStore>) => T,
+): T {
+	return useStore(writingStore, selector);
 }

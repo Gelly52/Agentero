@@ -46,7 +46,7 @@ Agent 回复过程中仍可继续输入，后续消息会进入队列，当前�
 
 论文需有本地 PDF 且具备可读正文（TeX 或 `PAPER.md`）：
 
-- **手动精读**：在未读论文行点击 **Zap** 图标。
+- **手动精读**：在未读论文行点击 **精读图标**。
 - **自动精读**：设置 → Agent 开启 **autoPaperReader**（默认关闭）。
 
 精读结果写入该论文的 `NOTES.md`，完成后论文标记为已读。
@@ -61,6 +61,15 @@ Agent 回复过程中仍可继续输入，后续消息会进入队列，当前�
 4. 如果应用探测不到，填写可执行文件的**绝对路径**。
 5. 选择默认 Agent。
 6. 发起一次测试对话。
+
+### 不直接支持的 Agent
+
+以下桌面应用目前**不能**直接作为 Agentero 内嵌 Agent 使用：
+
+- **OpenAI Codex 桌面版**：Agentero 通过 ACP 接入的是 **Codex CLI**（命令行版）+ `@agentclientprotocol/codex-acp` 适配器；独立的 Codex 桌面 App 未暴露可被 Agentero 连接的接口。
+- **WorkBuddy（腾讯）**：Agentero 当前没有 WorkBuddy 的 ACP 适配模板，不能直接接入。
+
+如需使用 Codex，请安装 Codex CLI 后通过 `codex-acp` 接入；WorkBuddy 暂无可行接入方式。
 
 ## 问题解决
 

@@ -16,11 +16,15 @@ import {
 	type ContextPathLabelOptions,
 	contextPathLabel,
 	normalizeContextPath,
+	paperContextRoot,
 	toPathSet,
 } from "@/lib/agent/context-path-icon";
 import type { ThinkTagParser } from "@/lib/agent/stream-parse";
+import { isZenVirtualPath } from "@/lib/agent/zen-path";
+import type { PaperMetadata } from "@/lib/paper";
 import { paperDirFromPath } from "@/lib/paper";
 import { isLibraryVirtualPath, isTrashVirtualPath } from "@/lib/paper/api";
+import { isPlazaVirtualPath } from "@/lib/plaza/sources";
 import { toVaultRelative } from "@/lib/wiki";
 
 /** Translate fn scoped to the `agent` i18n namespace (shared by sub-hooks). */
@@ -31,6 +35,11 @@ export type AgentPanelRefs = {
 	activeTabRef: RefObject<string>;
 	selectedAgentIdRef: RefObject<string | null>;
 	switchingRef: RefObject<boolean>;
+	/**
+	 * Submitting flag mirror for synchronous guards in event callbacks.
+	 * Write only through the panel's `setSubmittingFlag` so ref + render
+	 * state stay in lockstep.
+	 */
 	submittingRef: RefObject<boolean>;
 	submissionGenRef: RefObject<number>;
 	sessionContextGenRef: RefObject<number>;
@@ -43,7 +52,6 @@ export type AgentPanelRefs = {
 	thinkParsersRef: RefObject<Map<string, ThinkTagParser>>;
 	sessionHistoryRef: RefObject<ChatSessionHistoryItem[]>;
 	vaultPathRef: RefObject<string | null>;
-	previousVaultPathRef: RefObject<string | null>;
 	promptHistoryIndexRef: RefObject<number | null>;
 	promptHistoryDraftRef: RefObject<string>;
 	promptHistoryAppliedRef: RefObject<string | null>;
@@ -52,6 +60,12 @@ export type AgentPanelRefs = {
 export type AgentPanelContext = {
 	/** Focused document as Vault-relative context path (paper folder minimum). */
 	selectedVaultPath: string | null;
+	/**
+	 * Catalog metadata for the focused paper, when the focus is a paper and the
+	 * catalog knows it. Used as public context for chat-only agents that cannot
+	 * read Vault files.
+	 */
+	selectedPaperMeta: PaperMetadata | null;
 	directoryPathSet: ReadonlySet<string>;
 	paperPathSet: ReadonlySet<string>;
 	pathLabelOptions: ContextPathLabelOptions;
@@ -81,18 +95,40 @@ export function useAgentPanelContext({
 		if (!selectedPath) return null;
 		if (
 			isLibraryVirtualPath(selectedPath) ||
-			isTrashVirtualPath(selectedPath)
+			isTrashVirtualPath(selectedPath) ||
+			isZenVirtualPath(selectedPath) ||
+			// Plaza tabs are virtual; with the whole-list collection a focused
+			// Daily tab must not silently inject the full abstract catalog
+			// into every prompt — plaza context is explicit `@` only.
+			isPlazaVirtualPath(selectedPath)
 		) {
 			return null;
 		}
 		const relative = toVaultRelative(vaultPath, selectedPath);
 		if (!relative) return null;
-		if (isLibraryVirtualPath(relative) || isTrashVirtualPath(relative)) {
+		if (
+			isLibraryVirtualPath(relative) ||
+			isTrashVirtualPath(relative) ||
+			isZenVirtualPath(relative) ||
+			isPlazaVirtualPath(relative)
+		) {
 			return null;
 		}
 		const paperDir = paperDirFromPath(relative, vaultPaperPaths);
 		return paperDir ?? relative;
 	}, [selectedPath, vaultPath, vaultPaperPaths]);
+	/**
+	 * Catalog metadata for the focused paper (chat-only agent context). Only
+	 * resolved when the focus maps to a known paper folder — a plain note or
+	 * virtual tab yields null.
+	 */
+	const selectedPaperMeta = useMemo(() => {
+		if (!paperMetaByRelPath || !selectedVaultPath) return null;
+		const root = paperContextRoot(selectedVaultPath, vaultPaperPaths);
+		if (!root) return null;
+		return paperMetaByRelPath.get(root) ?? null;
+	}, [paperMetaByRelPath, selectedVaultPath, vaultPaperPaths]);
+
 	/** O(1) lookups for context chip icons (paper → ScrollText, dir → Folder). */
 	const directoryPathSet = useMemo(
 		() => toPathSet(vaultDirectoryPaths),
@@ -150,7 +186,6 @@ export function useAgentPanelContext({
 	const thinkParsersRef = useRef(new Map<string, ThinkTagParser>());
 	const sessionHistoryRef = useRef<ChatSessionHistoryItem[]>([]);
 	const vaultPathRef = useRef(vaultPath);
-	const previousVaultPathRef = useRef(vaultPath);
 	/**
 	 * ↑/↓ prompt history: index into chronological user prompts, or null when
 	 * not browsing. Draft is restored when stepping past the newest entry.
@@ -176,7 +211,6 @@ export function useAgentPanelContext({
 		thinkParsersRef,
 		sessionHistoryRef,
 		vaultPathRef,
-		previousVaultPathRef,
 		promptHistoryIndexRef,
 		promptHistoryDraftRef,
 		promptHistoryAppliedRef,
@@ -195,6 +229,7 @@ export function useAgentPanelContext({
 
 	return {
 		selectedVaultPath,
+		selectedPaperMeta,
 		directoryPathSet,
 		paperPathSet,
 		pathLabelOptions,

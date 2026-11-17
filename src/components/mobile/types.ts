@@ -19,6 +19,7 @@ export type AgentPermissionRequest = {
 	title: string;
 	paths: string[];
 	options: AgentPermissionOption[];
+	host?: string | null;
 };
 
 export type AgentStreamEvent = {
@@ -36,6 +37,16 @@ export type AgentFailedEvent = {
 	error?: string;
 };
 
+/** Loading phase of a turn bridged from the desktop host. */
+export type AgentTurnPhase = "starting" | "waiting-model" | "reconnecting";
+
+export type AgentStatusEvent = {
+	sessionId: string;
+	phase: AgentTurnPhase;
+	/** e.g. "2/5" attempt counter for reconnecting. */
+	detail?: string | null;
+};
+
 export type AcpSessionInfo = {
 	sessionId: string;
 	title?: string;
@@ -45,6 +56,12 @@ export type AcpSessionInfo = {
 export type AcpListSessionsResult = {
 	sessions: AcpSessionInfo[];
 	supported: boolean;
+};
+
+export type AcpDeleteSessionResult = {
+	sessionId: string;
+	deletedOnAgent: boolean;
+	agentError?: string | null;
 };
 
 export type AcpHistoryLine = {

@@ -5,7 +5,7 @@
  * cross-window session handoff, agent switch, and new conversation.
  * UI lives in sibling components under `src/components/agent/`.
  */
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useAgentComposer } from "@/components/agent/hooks/use-agent-composer";
 import { useAgentConfig } from "@/components/agent/hooks/use-agent-config";
@@ -20,24 +20,31 @@ import { useSessionComposerState } from "@/hooks/use-session-composer-state";
 import {
 	cancelAgentRun,
 	ensureCatalogAgent,
+	isChatOnlyAgentTemplate,
+	openAgentLoginTerminal,
 	setDefaultAgent,
 } from "@/lib/agent";
 import { agentChromeStore } from "@/lib/agent/agent-chrome-store";
 import {
 	applyAgentSessionHandoffOnce,
-	useActiveChatLines,
+	getActiveLines,
+	isActiveTabRunning,
+	useAgentSessionScope,
 	useAgentSessionStore,
 } from "@/lib/agent/agent-session-store";
 import {
 	type AgentOption,
 	buildOptions,
+	type ChatLine,
+	type ChatSessionHistoryItem,
 	errorChatLine,
 	errorText,
 	resolveSelected,
 } from "@/lib/agent/chat-state";
 import { removeVisualDraft } from "@/lib/agent/visual-context-store";
+import { notifyError } from "@/lib/core/notify";
 import { isTauri } from "@/lib/core/tauri";
-import { nextLineId } from "@/lib/pdf-visual/ids";
+import { toSafeDisposer } from "@/lib/core/tauri-events";
 import { listenAgentSessionHandoff } from "@/lib/shell/workspace-broadcast";
 
 export type UseAgentPanelArgs = Pick<
@@ -50,7 +57,21 @@ export type UseAgentPanelArgs = Pick<
 	| "vaultPaperPaths"
 	| "paperMetaByRelPath"
 	| "paperTreeLabelMode"
->;
+> & {
+	/** Start with this harness instead of the registry default (Zen slots). */
+	initialAgentId?: string | null;
+	/** Report the active harness to the host surface (Zen slot rows). */
+	onAgentChange?: (agent: {
+		id: string;
+		name: string;
+		template: string | null;
+	}) => void;
+	/** One-shot ACP history row to load once the history probe is ready. */
+	openHistoryItem?: ChatSessionHistoryItem | null;
+	onOpenHistoryHandled?: () => void;
+	/** Skip the per-panel ACP session import (Zen rail owns the history list). */
+	suppressHistoryImport?: boolean;
+};
 
 export function useAgentPanel({
 	vaultPath,
@@ -61,11 +82,20 @@ export function useAgentPanel({
 	vaultPaperPaths = [],
 	paperMetaByRelPath = null,
 	paperTreeLabelMode = "title-author",
+	initialAgentId = null,
+	onAgentChange,
+	openHistoryItem = null,
+	onOpenHistoryHandled,
+	suppressHistoryImport = false,
 }: UseAgentPanelArgs) {
 	const { t, i18n } = useTranslation("agent");
+	const { store: sessionStore, scopeId } = useAgentSessionScope();
+	/** The shared rail store also drives app chrome and cross-window handoff. */
+	const isRailScope = scopeId === null;
 
 	const {
 		selectedVaultPath,
+		selectedPaperMeta,
 		directoryPathSet,
 		paperPathSet,
 		labelForPath,
@@ -93,26 +123,62 @@ export function useAgentPanel({
 		knownSessionIdsRef,
 		sessionHistoryRef,
 		vaultPathRef,
-		previousVaultPathRef,
 	} = refs;
 
 	// Shared store selectors (single source of truth for the transcript).
-	const lines = useActiveChatLines();
+	// PERF: transcript lines are mirrored into a ref instead of subscribed —
+	// streaming flushes swap the array identity every rAF frame, which
+	// re-rendered the whole panel shell per frame. ChatTranscript owns the
+	// reactive subscription; sub-hooks only read the value at render time,
+	// and idle-time line writes always co-occur with a panel re-render
+	// (submitting / running / hydrating flips), so closures stay fresh.
+	const linesRef = useRef<ChatLine[] | null>(null);
+	if (linesRef.current === null) {
+		const initial = sessionStore.getState();
+		linesRef.current = getActiveLines(
+			initial.sessions,
+			initial.activeTabId,
+			initial.draftLines,
+		);
+		// A Zen slot can be seeded with the rail's sessions before the first
+		// store event fires; claim them now so their streams keep routing here.
+		if (sessionHistoryRef.current.length === 0 && initial.sessions.length > 0) {
+			sessionHistoryRef.current = initial.sessions;
+		}
+	}
+	const lines = linesRef.current;
 	const setLines = useAgentSessionStore((s) => s.setLines);
-	const sessionHistory = useAgentSessionStore((s) => s.sessions);
 	const setSessionHistory = useAgentSessionStore((s) => s.setSessions);
 	const activeTabId = useAgentSessionStore((s) => s.activeTabId);
+	const hydratingSessionId = useAgentSessionStore((s) => s.hydratingSessionId);
 	const setActiveTabId = useAgentSessionStore((s) => s.setActiveTabId);
 	const startDraft = useAgentSessionStore((s) => s.startDraft);
+	const setHydratingSessionId = useAgentSessionStore(
+		(s) => s.setHydratingSessionId,
+	);
 	const hydrateAndActivateSession = useAgentSessionStore(
 		(s) => s.hydrateAndActivateSession,
 	);
-	const setStoreSubmitting = useAgentSessionStore((s) => s.setSubmitting);
 
-	const [selectedAgentId, setSelectedAgentId] = useState<string | null>(null);
+	const [selectedAgentId, setSelectedAgentId] = useState<string | null>(
+		initialAgentId,
+	);
 	const [switching, setSwitching] = useState(false);
 	const [submitting, setSubmitting] = useState(false);
 	const [historyOpen, setHistoryOpen] = useState(false);
+
+	/**
+	 * Sole writer for the submitting flag: mirrors it into submittingRef for
+	 * synchronous guards in event callbacks while updating render state.
+	 * Never write the ref or the state directly.
+	 */
+	const setSubmittingFlag = useCallback(
+		(value: boolean) => {
+			submittingRef.current = value;
+			setSubmitting(value);
+		},
+		[submittingRef],
+	);
 
 	const composerState = useSessionComposerState({
 		vaultPath,
@@ -126,29 +192,39 @@ export function useAgentPanel({
 		mentionedPaths,
 		includeSelectedFile,
 		activateSession: activateComposerSession,
-		completeSubmission: completeComposerSubmission,
 		resetSession: resetComposerSession,
 		setText: setComposerText,
-		setMentionedPaths,
 		setSelectedSkillIds,
-		snapshot: snapshotComposerState,
 	} = composerState;
 
-	const contextPaths = useMemo(() => {
-		const paths = [
-			...(includeSelectedFile && selectedVaultPath ? [selectedVaultPath] : []),
-			...mentionedPaths,
-		];
-		return [...new Set(paths)];
-	}, [includeSelectedFile, mentionedPaths, selectedVaultPath]);
-
 	/** Current paper/file path when included (always-on chip; no dashed + toggle). */
-	const currentFilePath =
+	const selectedFileIncluded =
 		includeSelectedFile && selectedVaultPath ? selectedVaultPath : null;
 
-	useEffect(() => {
-		sessionHistoryRef.current = sessionHistory;
-	}, [sessionHistory, sessionHistoryRef]);
+	/**
+	 * Mirror the sessions array into the ref for synchronous guards without
+	 * re-rendering the panel: the array identity changes on every streamed
+	 * chunk, so a selector subscription re-rendered the whole panel ~25×/s.
+	 * Also refreshes the lines ref so the next panel render reads fresh
+	 * transcript lines without a per-frame subscription.
+	 */
+	// biome-ignore lint/correctness/useExhaustiveDependencies: refs are stable identity probes for the subscribe-once effect
+	useEffect(
+		() =>
+			sessionStore.subscribe(() => {
+				const state = sessionStore.getState();
+				sessionHistoryRef.current = state.sessions;
+				linesRef.current = getActiveLines(
+					state.sessions,
+					state.activeTabId,
+					state.draftLines,
+				);
+			}),
+		[sessionHistoryRef, linesRef],
+	);
+
+	/** Last-seen vault path; drives the vault-switch reset effect below. */
+	const previousVaultPathRef = useRef(vaultPath);
 
 	useEffect(() => {
 		vaultPathRef.current = vaultPath;
@@ -173,9 +249,9 @@ export function useAgentPanel({
 		setAcpCommandsByAgent,
 		collaborationOptions,
 		collaborationModeId,
-		effortOptionsInDisplayOrder,
+		effortOptions,
 		reasoningEffort,
-		setReasoningEffort,
+		pickReasoningEffort,
 		fastAvailable,
 		fastEnabled,
 		setFastEnabled,
@@ -186,7 +262,6 @@ export function useAgentPanel({
 		refresh,
 		selectedModelName,
 		groupedModels,
-		formatEffort,
 		selectedCollaborationName,
 		pickCollaborationMode,
 		pickModel,
@@ -202,35 +277,77 @@ export function useAgentPanel({
 
 	const options = buildOptions(registry, catalog);
 	const selected = resolveSelected(options, selectedAgentId, registry);
+	// PERF: depend on the primitive template id — `selected` comes from
+	// buildOptions/resolveSelected with a fresh identity every render, which
+	// made selectedLogin → onAgentLogin unstable and defeated
+	// memo(ChatTranscript).
+	const selectedTemplateId = selected?.templateId ?? selected?.template ?? null;
+	// Chat-only built-in agents (Zhihu) cannot read Vault files: keep no auto
+	// context so the UI matches what is actually sent (no path leakage).
+	const chatOnlyAgent = isChatOnlyAgentTemplate(selected?.template);
+	const contextPaths = useMemo(() => {
+		if (chatOnlyAgent) return [];
+		const paths = [
+			...(includeSelectedFile && selectedVaultPath ? [selectedVaultPath] : []),
+			...mentionedPaths,
+		];
+		return [...new Set(paths)];
+	}, [chatOnlyAgent, includeSelectedFile, mentionedPaths, selectedVaultPath]);
+	const currentFilePath = chatOnlyAgent ? null : selectedFileIncluded;
+	const selectedLogin = useMemo(() => {
+		const templateId = selectedTemplateId;
+		if (!templateId || templateId === "custom") return null;
+		const entry = catalog?.entries.find(
+			(candidate) => candidate.templateId === templateId,
+		);
+		const command = entry?.loginCommand?.trim();
+		if (!command) return null;
+		return { templateId, command };
+	}, [catalog, selectedTemplateId]);
 
-	// Keep app chrome (title bar, mobile nav, …) in sync with the active agent.
+	const openSelectedAgentLogin = useCallback(async () => {
+		if (!selectedLogin) return;
+		try {
+			await openAgentLoginTerminal(selectedLogin.templateId);
+			for (const delay of [2_000, 5_000, 10_000, 20_000]) {
+				window.setTimeout(() => {
+					void refresh();
+				}, delay);
+			}
+		} catch (error) {
+			notifyError(errorText(error));
+		}
+	}, [selectedLogin, refresh]);
+
+	// Keep app chrome (title bar, mobile nav, …) in sync with the active agent;
+	// other surfaces (Zen slots) only report their own harness upstream.
+	const selectedId = selected?.id ?? null;
+	const selectedName = selected?.name ?? null;
+	const selectedTemplate = selected?.template ?? null;
 	useEffect(() => {
-		if (!selected) return;
-		agentChromeStore.setState({
-			agentId: selected.id,
-			name: selected.name,
-			template: selected.template ?? null,
+		if (!selectedId) return;
+		onAgentChange?.({
+			id: selectedId,
+			name: selectedName ?? selectedId,
+			template: selectedTemplate,
 		});
-	}, [selected]);
+		if (!isRailScope) return;
+		agentChromeStore.setState({
+			agentId: selectedId,
+			name: selectedName ?? selectedId,
+			template: selectedTemplate,
+		});
+	}, [isRailScope, onAgentChange, selectedId, selectedName, selectedTemplate]);
 
-	const activeTabSession = sessionHistory.find(
-		(session) => session.id === activeTabId,
-	);
-	const activeTabIsRunning = activeTabSession?.status === "running";
+	const activeTabIsRunning = useAgentSessionStore(isActiveTabRunning);
 	const activeUsage = usageBySession[activeTabId] ?? usage;
-	const hasRunningSessions = sessionHistory.some(
-		(session) => session.status === "running",
+	// Primitive selector: the sessions array identity changes per streamed
+	// chunk, so subscribe to the boolean the UI actually needs.
+	const hasRunningSessions = useAgentSessionStore((s) =>
+		s.sessions.some((session) => session.status === "running"),
 	);
 
-	const {
-		toolAskUserRequest,
-		setToolAskUserRequest,
-		applyStreamEvent,
-		applyToolEvent,
-		applyPlanEvent,
-		completeSession,
-		failSession,
-	} = useAgentSessionRuntime({
+	const runtime = useAgentSessionRuntime({
 		refs,
 		t,
 		setSessionHistory,
@@ -243,6 +360,12 @@ export function useAgentPanel({
 		setAcpCommandsByAgent,
 		setAgentListenersReady,
 	});
+	const {
+		toolAskUserRequest,
+		setToolAskUserRequest,
+		isChatOwnedSession,
+		phaseBySession,
+	} = runtime;
 
 	const {
 		permissionRequest,
@@ -254,33 +377,11 @@ export function useAgentPanel({
 	} = useAgentPermissionSurfaces({
 		toolAskUserRequest,
 		setToolAskUserRequest,
+		ownsSession: isChatOwnedSession,
 	});
 
-	const {
-		send,
-		submitComposer,
-		messageQueue,
-		removeQueuedMessage,
-		clearMessageQueue,
-		cancelCurrentRun,
-		answerToolAskUser,
-	} = useAgentSend({
-		refs,
-		t,
-		i18nLanguage: i18n.language,
-		vaultPath,
-		lines,
-		setLines,
-		setSessionHistory,
-		setActiveTabId,
-		activeTabId,
-		activeTabIsRunning,
-		submitting,
-		switching,
-		setSubmitting,
-		setStoreSubmitting,
-		setHistoryOpen,
-		setSelectedAgentId,
+	/** Request-shaping context for the send pipeline (agent/model selection). */
+	const turnConfig = {
 		selected,
 		registry,
 		refresh,
@@ -291,20 +392,34 @@ export function useAgentPanel({
 		fastAvailable,
 		fastEnabled,
 		acpCommandsByAgent,
-		contextPaths,
+	};
+
+	const {
+		send,
+		submitComposer,
+		messageQueue,
+		removeQueuedMessage,
+		clearMessageQueue,
+		cancelCurrentRun,
+		answerToolAskUser,
+		recordAskUserAnswers,
+	} = useAgentSend({
+		refs,
+		t,
+		i18nLanguage: i18n.language,
+		vaultPath,
+		lines,
+		submitting,
+		switching,
+		setSubmittingFlag,
+		setHistoryOpen,
+		setSelectedAgentId,
 		selectedVaultPath,
-		snapshotComposerState,
-		completeComposerSubmission,
-		setComposerText,
-		setMentionedPaths,
-		setSelectedSkillIds,
-		activateComposerSession,
-		applyStreamEvent,
-		applyToolEvent,
-		applyPlanEvent,
-		completeSession,
-		failSession,
-		setToolAskUserRequest,
+		selectedPaperMeta,
+		contextPaths,
+		composer: composerState,
+		turnConfig,
+		runtime,
 	});
 
 	const {
@@ -332,7 +447,6 @@ export function useAgentPanel({
 		setSlashActiveIndex,
 		currentFileLabel,
 		mentionChipPaths,
-		selectionChips,
 		visualDrafts,
 		removeContextPath,
 		selectedSkills,
@@ -348,6 +462,7 @@ export function useAgentPanel({
 		skillOptions,
 		skillActiveIndex,
 		attachSkill,
+		removeSkill,
 		showSlashMenu,
 		slashOptions,
 		slashActiveIndex,
@@ -356,6 +471,7 @@ export function useAgentPanel({
 		handleComposerDragOver,
 		handleComposerDrop,
 		onComposerTextChangeFromUser,
+		composerInputRef,
 	} = useAgentComposer({
 		refs,
 		composer: composerState,
@@ -373,6 +489,7 @@ export function useAgentPanel({
 		skills,
 		acpCommandsByAgent,
 		selectedAgentId,
+		sessionId: activeTabId,
 		lines,
 		activeTabIsRunning,
 		cancelCurrentRun,
@@ -389,8 +506,7 @@ export function useAgentPanel({
 		}
 		resetSessionContext();
 		submissionGenRef.current += 1;
-		submittingRef.current = false;
-		setSubmitting(false);
+		setSubmittingFlag(false);
 		setLines([]);
 		setSessionHistory([]);
 		setUsage(null);
@@ -400,6 +516,7 @@ export function useAgentPanel({
 		setMentionActiveIndex(0);
 		setSkillActiveIndex(0);
 		setActiveTabId("draft");
+		setHydratingSessionId(null);
 		activeTabRef.current = "draft";
 		activeConversationRef.current = null;
 		clearMessageQueue();
@@ -409,15 +526,15 @@ export function useAgentPanel({
 		setLines,
 		setSessionHistory,
 		setActiveTabId,
+		setHydratingSessionId,
 		resetSessionContext,
 		setUsage,
 		setUsageBySession,
 		setComposerMenuDismissed,
 		setMentionActiveIndex,
 		setSkillActiveIndex,
-		previousVaultPathRef,
 		activeTabRef,
-		submittingRef,
+		setSubmittingFlag,
 		activeConversationRef,
 		submissionGenRef,
 		sessionHistoryRef.current,
@@ -425,38 +542,37 @@ export function useAgentPanel({
 
 	// Cross-window handoff: first snapshot only (retries may arrive later).
 	useEffect(() => {
-		let unlisten: (() => void) | undefined;
-		void listenAgentSessionHandoff((payload) => {
-			const applied = applyAgentSessionHandoffOnce({
-				sessions: payload.sessions,
-				activeTabId: payload.activeTabId,
-				draftLines: payload.draftLines,
-			});
-			if (!applied) return;
-			const agentId =
-				payload.selectedAgentId ??
-				payload.sessions.find((s) => s.id === payload.activeTabId)?.agentId ??
-				payload.sessions[0]?.agentId ??
-				null;
-			if (agentId) {
-				setSelectedAgentId(agentId);
-				selectedAgentIdRef.current = agentId;
-			}
-			const tabId = payload.activeTabId || "draft";
-			activeTabRef.current = tabId;
-			activeConversationRef.current = tabId === "draft" ? null : tabId;
-			knownSessionIdsRef.current = new Set(
-				(payload.sessions ?? []).map((s) => s.id),
-			);
-			// Composer scope follows session id; force activate after handoff.
-			activateComposerSession(tabId);
-		}).then((u) => {
-			unlisten = u;
-		});
-		return () => {
-			unlisten?.();
-		};
+		// Handoff seeds the shared rail store of a new Agent feature window.
+		if (!isRailScope) return;
+		return toSafeDisposer(
+			listenAgentSessionHandoff((payload) => {
+				const applied = applyAgentSessionHandoffOnce({
+					sessions: payload.sessions,
+					activeTabId: payload.activeTabId,
+					draftLines: payload.draftLines,
+				});
+				if (!applied) return;
+				const agentId =
+					payload.selectedAgentId ??
+					payload.sessions.find((s) => s.id === payload.activeTabId)?.agentId ??
+					payload.sessions[0]?.agentId ??
+					null;
+				if (agentId) {
+					setSelectedAgentId(agentId);
+					selectedAgentIdRef.current = agentId;
+				}
+				const tabId = payload.activeTabId || "draft";
+				activeTabRef.current = tabId;
+				activeConversationRef.current = tabId === "draft" ? null : tabId;
+				knownSessionIdsRef.current = new Set(
+					(payload.sessions ?? []).map((s) => s.id),
+				);
+				// Composer scope follows session id; force activate after handoff.
+				activateComposerSession(tabId);
+			}),
+		);
 	}, [
+		isRailScope,
 		activateComposerSession,
 		selectedAgentIdRef,
 		knownSessionIdsRef,
@@ -492,19 +608,12 @@ export function useAgentPanel({
 			activateComposerSession("draft");
 			activeTabRef.current = "draft";
 			setActiveTabId("draft");
+			setHydratingSessionId(null);
 			setLines([]);
 			setSessionHistory([]);
 			clearMessageQueue();
 			setSelectedAgentId(agentId);
 			await refresh();
-			setLines((p) => [
-				...p,
-				{
-					id: nextLineId("sys"),
-					kind: "system",
-					text: t("messages.switchedTo", { name: opt.name }),
-				},
-			]);
 		} catch (e) {
 			setLines((p) => [...p, errorChatLine(errorText(e))]);
 		} finally {
@@ -523,29 +632,48 @@ export function useAgentPanel({
 		clearMessageQueue();
 	};
 
-	const { openHistorySession } = useAgentHistory({
+	const { openHistorySession, removeHistorySession } = useAgentHistory({
 		refs,
 		t,
 		i18nLanguage: i18n.language,
 		vaultPath,
 		selectedAgentId,
-		setSelectedAgentId,
 		selected,
 		setSessionHistory,
 		setLines,
 		hydrateAndActivateSession,
+		setHydratingSessionId,
 		activateComposerSession,
 		setHistoryOpen,
+		historyOpen,
 		clearMessageQueue,
+		importHistory: !suppressHistoryImport,
 	});
+
+	// Zen history rows: load straight away (the agent is known from the slot),
+	// and keep the pending row until a load actually starts so a registry that
+	// is still resolving retries instead of landing on an empty conversation.
+	const openHistorySessionRef = useRef(openHistorySession);
+	openHistorySessionRef.current = openHistorySession;
+	const onOpenHistoryHandledRef = useRef(onOpenHistoryHandled);
+	onOpenHistoryHandledRef.current = onOpenHistoryHandled;
+	// biome-ignore lint/correctness/useExhaustiveDependencies: submitting is a retry trigger; the load reads it through refs
+	useEffect(() => {
+		if (!openHistoryItem || !selectedAgentId) return;
+		if (!openHistorySessionRef.current(openHistoryItem)) return;
+		onOpenHistoryHandledRef.current?.();
+	}, [openHistoryItem, selectedAgentId, submitting]);
 
 	return {
 		t,
-		// Transcript
-		lines,
+		// Transcript (lines are owned by ChatTranscript's store subscription)
+		selectedPaperMeta,
 		activeTabId,
+		hydratingSessionId,
 		selected,
 		activeTabIsRunning,
+		/** Loading phase of the active tab's in-flight turn (starting / waiting / reconnecting). */
+		activePhase: phaseBySession[activeTabId] ?? null,
 		submitting,
 		switching,
 		editingLineId,
@@ -557,16 +685,18 @@ export function useAgentPanel({
 		cancelEditingMessage,
 		resendEditedMessage,
 		startEditingMessage,
+		openSelectedAgentLogin,
+		selectedLogin,
 		send,
 		submitComposer,
 		messageQueue,
 		removeQueuedMessage,
 		// History
-		sessionHistory,
 		historyOpen,
 		setHistoryOpen,
 		newConversation,
 		openHistorySession,
+		removeHistorySession,
 		// Agent switcher
 		options,
 		selectedAgentId,
@@ -576,6 +706,7 @@ export function useAgentPanel({
 		composerText,
 		setComposerText,
 		onComposerTextChangeFromUser,
+		composerInputRef,
 		setComposerMenuDismissed,
 		setMentionActiveIndex,
 		setSkillActiveIndex,
@@ -586,7 +717,6 @@ export function useAgentPanel({
 		currentFilePath,
 		currentFileLabel,
 		mentionChipPaths,
-		selectionChips,
 		visualDrafts,
 		removeVisualDraft,
 		directoryPathSet,
@@ -607,6 +737,7 @@ export function useAgentPanel({
 		skillOptions,
 		skillActiveIndex,
 		attachSkill,
+		removeSkill,
 		showSlashMenu,
 		slashOptions,
 		slashActiveIndex,
@@ -625,10 +756,9 @@ export function useAgentPanel({
 		collaborationModeId,
 		selectedCollaborationName,
 		pickCollaborationMode,
-		effortOptionsInDisplayOrder,
+		effortOptions,
 		reasoningEffort,
-		setReasoningEffort,
-		formatEffort,
+		pickReasoningEffort,
 		activeUsage,
 		fastAvailable,
 		fastEnabled,
@@ -647,6 +777,7 @@ export function useAgentPanel({
 		toolAskUserRequest,
 		setToolAskUserRequest,
 		answerToolAskUser,
+		recordAskUserAnswers,
 		// Refs used by composer submit race guards
 		switchingRef,
 		submittingRef,

@@ -9,7 +9,7 @@
 - 入库命令与事件：[`api.md`](api.md) §3.5
 - Vault 文件模型：[`data-model.md`](data-model.md)
 - UI：[`../frontend/paper-import.md`](../frontend/paper-import.md)
-- **浏览器一键保存**：官方 Zotero Connector → 本机兼容服务 — [`connector.md`](connector.md)（与魔棒并存；元数据映射复用 `map_zotero_item`）
+- **浏览器一键保存**：官方 Zotero Connector → 本机兼容服务 — [`connector.md`](connector.md)（与魔棒并存；元数据映射复用 `map_zotero_item_to_record`）
 - **多入口入库统一方案**（魔棒 / Connector / 本地 PDF / Bib / 迁移 / CLI）— [`paper-import.md`](paper-import.md)
 
 ---
@@ -72,35 +72,34 @@ catalog **始终**写入 `pdf_url` / `html_url`（有则仍可供在线预览）
 | **PDF** | **始终**尝试下载到 **`{paper}/{id}.pdf`（论文文件夹根目录）**（`pdf_url` + arXiv 多候选 URL 回退） |
 | **arXiv LaTeX** | 从 `https://arxiv.org/e-print/{id}` 下载；gzip/tar 解压到 `source/`（路径穿越拒绝）；纯 PDF e-print 写到论文根目录 |
 | **已有文件** | 跳过对应资源 |
-| **`PAPER.md`（无 TeX 时）** | 下载结束后：若**无**本地 `.tex`/`.ltx`、**有** PDF、且尚无 `PAPER.md` → 用选定正文解析引擎（默认 **liteparse**，见 paper-import.md § 正文解析引擎）写 `{paper}/PAPER.md`，并写 catalog `body_source` / `body_quality`。有 TeX 则不自动生成 |
+| **`PAPER.md`（无 TeX 时）** | 下载结束后：若**无**本地 `.tex`/`.ltx`、**有** PDF、且尚无 `PAPER.md` → 用选定正文解析引擎（默认 `local`，见 paper-import.md § 正文解析引擎）写 `{paper}/PAPER.md`，并写 catalog `body_source` / `body_quality`。有 TeX 则不自动生成 |
 
 按需补下（**Download** 图标）：
 
 - **显示条件**：缺 PDF **或**（既无 TeX 也无 `PAPER.md`）。可读正文 **TeX 与 PAPER.md 二选一即可，优先 TeX**（有 TeX 不强制 PAPER.md）。**不再**因缺少空 `source/` 单独显示 Download。hover 说明原因。
-- **点击**：`paper_download_assets` → PDF 到论文根目录 → arXiv 尽量 TeX 到 `source/` → 无 TeX 则 liteparse `PAPER.md`。
-- **Library 行**：库内任一篇不完整时批量同一逻辑。
+- **点击**：`job_download_assets_enqueue`（DownloadAssets 后台任务）→ PDF 到论文根目录 → arXiv 尽量 TeX 到 `source/` → 无 TeX 则 ParseBody 后台任务生成 `PAPER.md`。
+- **论文库节点**（`papers/` 根文件夹右键）：库内任一篇不完整时批量同一逻辑。
 
-**精读（Zap 图标 + 自动触发）**：
+**精读（NotebookPen 图标 + 自动触发）**：
 
-- **显示条件（Zap）**：本地资源齐全且 catalog **`is_read === false`**（与 Download 互斥）。
-- **自动触发**：`lookup_import_batch`（魔棒，单条）或单篇 `paper_download_assets` 成功且 PDF/TeX/`PAPER.md` 任一可读正文/归档就绪时，前端 `maybeAutoRunPaperReader` 自动跑同一工作流（批量 Library 导入/批量 Download **不**自动连跑，避免并发炸 Agent）。
-- **手动**：点击 Zap → 同上。
+- **显示条件（精读图标）**：本地资源齐全且 catalog **`is_read === false`**（与 Download 互斥）。
+- **自动触发**：`lookup_import_batch`（魔棒，单条）或单篇 DownloadAssets 任务成功且 PDF/TeX/`PAPER.md` 任一可读正文/归档就绪时，前端 `maybeAutoRunPaperReader` 自动跑同一工作流（批量 Library 导入/批量 Download **不**自动连跑，避免并发炸 Agent）。
+- **手动**：点击精读图标 → 同上。
 - **实现**：`src/lib/paper/reader.ts` → `agent_run_once` + skill（**`hideFromChatHistory: true`**，不进 Agent 对话记录）；Codex `$paper-reader` / Claude `/paper-reader` / 其它注入 `SKILL.md` → 写 `{paper}/NOTES.md` → `paper_set_is_read(true)`；进度在左下角后台任务条。
 - **进度**：左下角后台任务条——入库/下载阶段 `kind=lookup|download`（分阶段 detail/progress），随后精读 `kind=paperRead`。
 
 UI 阅读：优先 catalog 远程 URL；`source/` 为 arXiv TeX 归档；`PAPER.md` 为无 TeX 时的派生正文。
 
-#### Translator 服务地址（设置）
+#### Translator 服务地址（固定）
 
 | 项 | 值 |
 |---|---|
-| 设置 key | `translatorBaseUrl`（Settings → General） |
-| 默认 | **`https://translator.philfan.cn`** |
-| Host 常量 | `DEFAULT_TRANSLATOR_BASE_URL`（与设置默认一致） |
+| 地址 | **`https://translation-server.agentero.app`** |
+| 来源 | 代码常量 `DEFAULT_TRANSLATOR_BASE_URL`（桌面端不读 `settings.json`） |
 
-- 魔棒入库时前端把设置中的 URL 传入 `lookup_import_batch.args.translatorBaseUrl`。
+- 魔棒入库时前端把固定常量传入 `lookup_import_batch.args.translatorBaseUrl`；CLI / 远程调用仍可显式覆盖。
 - Host：`POST {base}/search` 或 `/web`（`Content-Type: text/plain`）。
-- 服务不可达且输入为 arXiv 时，回退 export.arxiv.org。
+- 服务不可达时按标识符类型走直连兜底链（错峰投机并发，见 §3.2）：arXiv→S2→alphaXiv、DOI→Crossref→S2→OpenAlex、PMID→PubMed。HTTP 503 / `error code: 1102` 先重试两次。链未命中的 `http(s)` 网页改为按 URL、标题和页面元数据入库，不因翻译服务失败而中断。
 
 > ~~`downloadFulltextToLocal`~~ 已移除；始终下载 PDF。
 
@@ -134,8 +133,8 @@ UI 阅读：优先 catalog 远程 URL；`source/` 为 arXiv TeX 归档；`PAPER.
   Zotero API JSON Item
         │
         ▼
-  map → PaperMetadata（字段直接写入，见 §5）
-    + 补全：arxiv 时用 arxiv.ts 填 pdf_url/html_url/source_url（若 Translator 未给）
+  map → PaperRecord（字段直接写入，见 §5）
+    + 补全：enrich_remote_urls 按 arxiv_id / doi 推导 pdf_url/html_url/source_url
         │
         ▼
   parent_dir 解析 → path = {parent_dir}/{id}
@@ -159,7 +158,7 @@ UI 阅读：优先 catalog 远程 URL；`source/` 为 arXiv TeX 归档；`PAPER.
 
 原则：
 
-- **Translator 返回值 → 直接并入 `PaperMetadata`**，再落 catalog；不并行维护两套 arXiv 专用结构。
+- **Translator 返回值 → 直接并入 `PaperRecord`**（Rust 侧唯一论文模型；前端 `PaperMetadata` 只是其 IPC JSON 的派生别名），再落 catalog；不并行维护两套 arXiv 专用结构。
 - **魔棒 = 加入文库 + 本地归档**（metadata + 远程 URL + 笔记壳 + PDF；arXiv 含 LaTeX）。
 
 ---
@@ -174,7 +173,7 @@ UI 阅读：优先 catalog 远程 URL；`source/` 为 arXiv TeX 归档；`PAPER.
 └───────────────────────────┬──────────────────────────────┘
                             │ lookup:add / lookup:search+import
 ┌───────────────────────────▼──────────────────────────────┐
-│ Host：parse → Translator client → map→PaperMetadata      │
+│ Host：parse → Translator client → map→PaperRecord        │
 │       → catalog upsert + 最小文件落盘                      │
 └───────────────────────────┬──────────────────────────────┘
                             │ POST /search | /web
@@ -200,7 +199,7 @@ UI 阅读：优先 catalog 远程 URL；`source/` 为 arXiv TeX 归档；`PAPER.
 | Zotero | Agentero |
 |---|---|
 | `lookup.js` UI | `MagicWand` 弹层 |
-| `extractIdentifiers()` | `lookup:parse` / Host `parse.rs` |
+| `extractIdentifiers()` | `lookup:parse` / Host `scholar_api::identifiers::parsers` + `import::identifiers` |
 | `Zotero.Translate.Search` | `POST /search` on translation-server |
 | Search Translators 仓库 | sidecar 内置 / 可更新的 translators 目录 |
 | 写入 Zotero SQLite | 写 Vault 文件 + **catalog.sqlite** |
@@ -228,7 +227,7 @@ UI 阅读：优先 catalog 远程 URL；`source/` 为 arXiv TeX 归档；`PAPER.
 | **arXiv** | `1706.03762`、`arXiv:1706.03762v1`、abs URL | arXiv Search Translator 或 Agentero arXiv API |
 | **ADS Bibcode** | `2015ApJ...810...89S` | ADS 相关 Search Translator |
 
-批量：魔棒输入框支持一次粘贴多个标识符，按**换行 / 回车、逗号 `,`、分号 `;`、中文逗号 `，`、中文分号 `；`**拆分（正则 `/[\n\r,;，；]+/`）。空格**不再**是分隔符 —— 论文标题与 `npx skills add …` 都含空格，必须整段送到 Host。Host 侧 `classify_segment`（`src-tauri/src/features/import/batch.rs`）按以下顺序判定每一段：
+批量：魔棒输入框支持一次粘贴多个标识符，按**换行 / 回车、逗号 `,`、分号 `;`、中文逗号 `，`、中文分号 `；`**拆分（正则 `/[\n\r,;，；]+/`）。空格**不再**是分隔符 —— 论文标题与 `npx skills add …` 都含空格，必须整段送到 Host。Host 侧 `classify_segment`（`crates/agentero-core/src/features/paper/import/search_router.rs`）按以下顺序判定每一段：
 
 1. 单 token → `extract_primary_identifier`，命中即标识符，否则转标题搜索。
 2. 多 token 且整段是 Skill 来源（`npx skills add …`）→ 单条 Skill。
@@ -254,7 +253,9 @@ UI 阅读：优先 catalog 远程 URL；`source/` 为 arXiv TeX 归档；`PAPER.
 4. ADS Bibcode
 5. PMID（1–9 位数字，最后匹配）
 
-> 实现上，优先级由 `src-tauri/src/features/import/resolver.rs` 的静态 resolver 表驱动：Url / Doi / Arxiv / Isbn / Pmid / Ads 各实现 `PaperResolver`（`priority` 探测顺序、`catalog_column` 查重列、`translator_target` 构造 Translator 请求、`fetch_fallback` Translator 失败后的直连回退——arXiv→Atom、DOI→Crossref）。Skill 不入表，由 `parse::extract_skill_source` 前置分流。新增导入源只需实现一个 resolver 并登记进表（表按 `priority` 排序，有测试守护）。
+> 实现上，优先级由 `crates/agentero-core/src/features/paper/scholar_api/identifiers/resolver.rs` 的静态 resolver 表驱动：Url / Doi / Arxiv / Isbn / Pmid / Ads 各实现 `PaperResolver`（`priority` 探测顺序、`catalog_column` 查重列、`translator_target` 构造 Translator 请求）。Skill 不入表，由 `skill::skill_identifier`（内部调用 `skill::extract_skill_source`）前置分流。新增导入源只需实现一个 resolver 并登记进表（表按 `priority` 排序，有测试守护）。
+>
+> Translator 失败后的直连回退在 `scholar_api::identifiers::fallback`，按 kind 走**兜底链**：arXiv→S2→alphaXiv、DOI→Crossref→S2→OpenAlex、PMID→PubMed；URL/ISBN/ADS 暂无链（继续探测表中下一 resolver，`doi.org` URL 仍能命中 DOI 链）。链的执行模型是**错峰投机并发 + 优先级顺序接受**：所有源同时 spawn，第 i 个源先睡 `i×600ms` 再请求（给高优先级源让出先手窗口），然后严格按优先级顺序 await——首个返回非空记录的源胜出并 abort 其余在飞请求。健康主源在错峰窗口内完成时次级源尚未开火，请求数与单源直连完全相同；主源慢/429 时失败前缀时延取 `max` 而非顺序 `sum`（最坏 ≈ 单源超时上限，而非 3×）。
 
 解析失败：返回 `lookup.failure_to_id`，不调用网络。
 
@@ -272,19 +273,20 @@ interface ParsedIdentifier {
 }
 ```
 
-### 3.4 标题搜索回退
+### 3.4 标题搜索（S2 ∥ arXiv 并行竞速）
 
 **Zotero translator 无法承担这一步。** translation-server 的 `POST /search`（§4.2）是标识符入口，Zotero Search Translators 只做「标识符 → 元数据」，没有自由文本检索能力；Agentero 本地也没有 JS runtime 来跑 translator。因此标题搜索必须直连检索 API。
 
 兼容性通过分工保留：**搜索只负责「文本 → 候选标识符」**，用户选中后把 `identifier`（arXiv ID 优先，其次 DOI）重新提交 `lookup_import_batch`，Translator 仍是元数据的唯一事实来源，入库管道不分叉。
 
-- 实现：`src-tauri/src/features/import/title_search.rs`
-- 数据源：Semantic Scholar Graph API `/paper/search` 为主；报错或 0 结果时回退 **arXiv** `search_query=ti:"…"&sortBy=relevance`。两者均免 key，复用 `core::http::client_builder()` 与信号量限流（并发 2）。
-  > **S2 无 key 的搜索接口限流极严（实测连续 3 次均 429）**，所以 arXiv 才是线上的常走路径。不选 Crossref 兜底：NeurIPS proceedings 之类没有 Crossref DOI，搜 "Attention is all you need" 时正确论文**根本不在** Crossref 结果集里，只会返回一堆同名论文。
-  > arXiv 的 Atom 需要按 `<entry>` 切块解析 —— `map::map_arxiv_atom` 只处理单条响应，不能复用。
+- 实现：`crates/agentero-core/src/features/paper/import/search_router.rs`
+- 数据源：Semantic Scholar Graph API `/paper/search` 与 **arXiv** `search_query=ti:"…"&sortBy=relevance` **并行**发起；S2 在 5s 预算（`S2_SEARCH_BUDGET`）内返回非空则优先（跨域、带被引数），否则取已在途的 arXiv 结果。最坏耗时 ≈ max(预算, 单请求 20s 超时)，不再是串行 S2→arXiv 之和（~40s）。两者均免 key，复用 `core::http::client_builder()` 与信号量限流（并发 2）。实现层由 `scholar_api::search` 的 `ALL_TITLE_SOURCES` 驱动（S2 / Crossref / OpenAlex / arXiv / PubMed / alphaXiv 六源并发，各自 8s 预算含信号量排队时间）；alphaXiv 是未文档化的镜像层，仅作末位备份源，不进 Scope 预设。
+  > **S2 无 key 的搜索接口限流极严（实测连续 3 次均 429）**，所以 arXiv 才是线上的常走路径；并行发起后 429 快速失败时 arXiv 已在途，省掉一次串行往返。不选 Crossref 兜底：NeurIPS proceedings 之类没有 Crossref DOI，搜 "Attention is all you need" 时正确论文**根本不在** Crossref 结果集里，只会返回一堆同名论文。
+  > arXiv 的 Atom 需要按 `<entry>` 切块解析 —— `scholar_api/sources/arxiv.rs::parse_entries` 承担这件事，`fetch_by_id`（limit 1）与 `search_by_title` 共用同一解析器。
 - 排序：保留 provider 的相关度顺序，但把**标题与 query 归一化后完全相等**的条目提到最前（归一化 = 小写、去非字母数字、压空格）。同名论文很多，这一步防止真正那篇被埋掉。
 - **过滤掉既无 DOI 也无 arXiv ID 的条目** —— 没有标识符就无法入库，不能出现在候选里。
-- Top 3 返回给前端（`SEARCH_CANDIDATE_LIMIT`）；无结果或搜索失败写入 `errors`，不静默。单源失败走 `log::warn!`，否则 S2 的 429 完全不可见。
+- Top 3 返回给前端（`SEARCH_CANDIDATE_LIMIT`）；无结果或搜索失败写入 `errors`，不静默。单源失败走 `log::warn!`，否则 S2 的 429 完全不可见。**全部**在试源失败时不再吞掉错误（#524）：任一源应答（即使 0 命中）仍返回空列表——一个权威「没找到」胜过限流猜测；但整批失败且含 429 → 报 `rate limited`，整批失败无 429 → 报网络摘要，二者都会随 `errors` 透出，不再误报「no search results」。
+- 取消：`resolve_search_queries` 带前端 `task_id`，每条 query 前检查协作取消 —— 关闭搜索卡片即取消任务，剩余查询直接跳过。
 - 副作用：拼错的标识符（如 `1706.0376`）现在会走搜索并得到「无结果」，比原来的 `unrecognized identifier` 更可读。
 
 ---
@@ -365,24 +367,29 @@ lookup:search 被调用
 | `/search` 超时 | `lookup.timeout`；该 ID 标记 failed，其它 ID 继续 |
 | 无匹配书目 | `lookup.not_found` |
 | Runtime 返回部分成功 | 返回成功草稿 + 失败列表（对齐 Zotero「部分失败仍继续」） |
-| fallback 成功 | `source: 'fallback'`，libraryCatalog 填 `Agentero (Crossref)` 等 |
+| fallback 成功 | `source: 'fallback'`，libraryCatalog 填 `Agentero (Crossref)` 等；meta_source 如实反映链内实际应答源（arxiv / s2 / alphaxiv / crossref / openalex / pubmed） |
+| 回退链全部限流 | 链内先重试一趟（2s 冷却）；仍失败按 `rate_limited` 上报（PDF 识别路径触发 `arxiv_rate_limited` 警告码），不再静默误报「无结果」 |
+| Translator HTTP 503 / error code 1102 | 分类为 `service_unavailable`，同一请求再试两次（400ms、800ms）。仍失败则记 `agentero::lookup` 警告 |
+| 网页 URL，且直连链未命中或失败 | 抓取原网页。论文页用 `citation_*`（页内 DOI 再走一次直连链）；普通网页用 URL、标题、描述建成 `html` 条目。成功时 `asset_messages` 带 `translator_degraded\|状态\|错误码\|page\|服务地址`，界面提示翻译服务不可用但条目已导入。页面抓取失败则只保存 URL（`url_only`） |
+| 不是网页，也没有 DOI / arXiv / PMID | `translator_unavailable`，提示包含 HTTP 状态与错误码；不创建条目 |
 
 ---
 
-## 5. 数据映射：Translator Item → `PaperMetadata`（直接并入）
+## 5. 数据映射：Translator Item → `PaperRecord`（直接并入）
 
-Translator 输出的 **Zotero API JSON Item** 经 `map` **直接写入** `PaperMetadata` / catalog 列，**不再**先落到另一套 arXiv 专用结构。  
+Translator 输出的 **Zotero API JSON Item** 经 `map_zotero_item_to_record`（`features/paper/import/api_mapper.rs`）**直接写入** `PaperRecord` / catalog 列，**不再**先落到另一套 arXiv 专用结构。  
+`PaperRecord`（`features/paper/catalog/papers.rs`）是 Rust 侧唯一论文模型：同时充当 catalog SQLite 行、`papers/<id>/metadata.json` sidecar 投影与 IPC 出参。前端 `src/lib/paper/types.ts` 的 `PaperMetadata` 只是 specta 生成的 `PaperRecord_Serialize` 的派生别名，不是独立模型。  
 catalog **schema v2** 起补齐期刊/卷期页等字段（见 [`catalog.md`](catalog.md) §4.2）。
 
-### 5.1 字段对照（Item → metadata）
+### 5.1 字段对照（Item → record）
 
-| `PaperMetadata` / catalog | Translator Item 来源 | 说明 |
+| `PaperRecord` / catalog 列 | Translator Item 来源 | 说明 |
 |---|---|---|
 | `title` | `title` | 必填；缺失则失败 |
 | `authors` | `creators[]` → 展示串 | `firstName`+`lastName` 或 `name`；优先 `creatorType=author` |
 | `creators_json` | `creators` 原数组 | 保留角色（author/editor…），JSON 文本 |
-| `year` | 自 `date` 解析四位年 | |
-| `date` | `date` | 原始日期串（如 `2017-06-12`） |
+| `year` | 自 `date` 解析四位年 | 派生字段：手动编辑只传 `date`，`year` 由 Host 重算 |
+| `date` | `date` | 发表日期，规范化 `YYYY` / `YYYY-MM` / `YYYY-MM-DD`（精度随来源，如 `2017-06-12`） |
 | `abstract` | `abstractNote` | |
 | `summary` | 截断 `abstractNote` 或 Translator 短摘要 | 可选 |
 | `doi` | `DOI` | |
@@ -405,14 +412,14 @@ catalog **schema v2** 起补齐期刊/卷期页等字段（见 [`catalog.md`](ca
 | `zotero_item_type` | `itemType` | 如 `journalArticle`、`preprint`、`book` |
 | `meta_source` | `libraryCatalog` | 如 `DOI.org (Crossref)`、`arXiv.org` |
 | `extra` | `extra` | 未结构化残余 |
-| `type` | 由 `zotero_item_type` + 标识符推断 | 有 `arxiv_id`→`arxiv`；有 `doi`→`doi`；book→`other` 等 |
+| `type`（`PaperKind`） | 由标识符 + `itemType` 推断 | 序列化取值 `arxiv` \| `pdf` \| `html` \| `doi` \| `other`。`map_zotero_item_to_record` 顺序：有 `arxiv_id`→`arxiv`；否则有 `doi`→`doi`；否则 `itemType == webpage`→`html`；否则 `other`。`enrich_remote_urls` 在随后补出 arXiv id 时把 `other` 提升为 `arxiv`。`pdf` 是 `PaperRecord::local_pdf` 的初值（本地 PDF 导入） |
 | `id` | arXiv ID 或 citekey | |
 | `bibtex_key` | 生成或沿用 | 作者 + 年+题词 |
 | `path` | Host 用 `parent_dir`+`id` 写入 | 入库时填 |
-| `status` | Host | 入库完成 → `completed` |
+| `status` | Host | **导入状态**列，词表 `pending` \| `importing` \| `completed` \| `failed`；已读与否由 `is_read` 专管，不写进 `status`。当前所有生产者都写 `completed` |
 | `added_at` / `updated_at` | Host | ISO 8601 |
 | `body_source` / `body_quality` | 魔棒通常不填 | 无本地正文解析 |
-| `citation_count` | 一般无 | 可空 |
+| `citation_count` | Translator **不产出** | 可空；只有直连 API 源（Crossref / OpenAlex / S2）会带值，落库现状见 [`catalog.md`](catalog.md) |
 
 ### 5.2 URL 补全
 
@@ -425,16 +432,18 @@ catalog **schema v2** 起补齐期刊/卷期页等字段（见 [`catalog.md`](ca
 
 ### 5.3 中间结果
 
-入库前 Host 手中只有 **`PaperMetadata`（已 map）**；不必单独长期持有 Zotero Item。调试可选暂存 `raw` 日志，不进 catalog。
+入库前 Host 手中只有 **`PaperRecord`（已 map）**；不必单独长期持有 Zotero Item。调试可选暂存 `raw` 日志，不进 catalog。
 
 ```ts
 // 概念：一次魔棒调用（落地：lookup_import_batch）
-const item = await translator.searchOrWeb(input); // Zotero Item
-const metadata = mapZoteroItemToPaperMetadata(item); // → PaperMetadata
-enrichRemoteUrls(metadata); // arxiv/doi 推导
-await catalog.upsert({ ...metadata, path });
-await ensure_paper_assets(paperDir, metadata); // PDF + arXiv LaTeX → source/
+const item = await translator.searchOrWeb(input);      // Zotero Item
+const record = map_zotero_item_to_record(item);                  // → PaperRecord（path 为空）
+enrich_remote_urls(record);                            // arxiv/doi 推导
+await paper_commit(record, { parentDir, … });          // 内部分配 path → at_path → upsert_paper
+await ensure_paper_assets(paperDir, record);           // PDF + arXiv LaTeX → source/
 ```
+
+`PaperRecord::local_pdf(id, title)` 只给 id / title / `type=pdf` / `status=completed` / `meta_source=local` 兜底，`path` **故意为空**——入库管线要到分配文件夹之后才知道 Vault 相对路径，用 `at_path(rel)` 绑定。`upsert_conn` 会归一化分隔符并**拒绝空 path**，因此漏掉 `at_path` 不会写出 `path = ''` 的主键、也不会把 `metadata.json` 落到 Vault 根（#181）。
 
 ---
 
@@ -526,7 +535,7 @@ await ensure_paper_assets(paperDir, metadata); // PDF + arXiv LaTeX → source/
     vaultPath: string;
     parentDir: string;              // "papers" | "papers/nlp"
     texts: string[];                // 用户输入拆分后的原始 token 数组
-    translatorBaseUrl?: string;     // 同上
+    translatorBaseUrl?: string;     // GUI 固定官方常量；CLI/远程可覆盖
     taskId?: string;                // 前端后台任务 id
     concurrency?: number;           // 最大并发入库数，默认 5，范围 1–10
   }
@@ -550,11 +559,11 @@ await ensure_paper_assets(paperDir, metadata); // PDF + arXiv LaTeX → source/
   2. 按规范化 value（arXiv 去 version、DOI 小写等）去重：同一 batch 内重复 → `skipped`（`duplicate_in_batch`）。
   3. 对每条唯一标识符查 catalog：已存在同 `arxiv_id` / `doi` / `isbn` / `pmid` / `id` 的 paper → `skipped`（`already_in_library`）。
   4. 剩余条目以 `concurrency`（默认 5，范围 1–10）为上限**并发**调 `import_by_identifier_with_progress`。单条失败继续下一条，错误文本加入 `errors`。并发上限可在 **Settings → General → Batch import concurrency** 调整。commit 阶段仍按 `id` / `arxiv_id` / `doi` / `pmid` / `isbn` 做跨标识符去重（`DedupePolicy::ByIdentifiers`，#406），预检后出现的重复不会新建文件夹。
-  5. 返回全部 `imported` 条目；前端刷新树 / Library / wiki 后，对 `imported` 中仍缺资源的 paper 逐个加入下载队列，每篇对应一个独立的 `download` 后台任务，并按并发上限排队执行。
+  5. 返回全部 `imported` 条目；前端刷新树 / Library / wiki 后，对 `imported` 中仍缺资源的 paper 逐个入队 JobCenter `downloadAssets` job，按 kind 并发上限排队执行。
 
-魔棒界面使用通用的 `enqueueBackgroundTask` 为每个输入创建一个独立的前端任务。任务面板只展示每个标识符的状态和资源进度，不展示 Host 批处理的内部阶段或聚合计数；并发限制由同类任务共享的信号量执行。
+魔棒入库走 JobCenter `import` job（Renderer-host）：每个输入一个 job，面板行由 `job:changed` 投影产生，批次计数进度经 `job:progress` 写回行内。任务面板只展示每个标识符的状态和资源进度，不展示 Host 批处理的内部阶段或聚合计数；并发限制由 JobCenter 的 `Import` kind cap 执行（Settings → General → Batch import concurrency）。
 
-- **不自动精读**：批量入库不连跑 `paper-reader`，避免 Agent 与写笔记开销爆炸；用户可后续单篇手动 Zap 或等设置 `autoPaperReader` 对单篇触发。
+- **不自动精读**：批量入库不连跑 `paper-reader`，避免 Agent 与写笔记开销爆炸；用户可后续单篇手动精读或等设置 `autoPaperReader` 对单篇触发。
 
 ### 6.5 事件
 
@@ -637,7 +646,7 @@ await ensure_paper_assets(paperDir, metadata); // PDF + arXiv LaTeX → source/
 
 ## 9. Host 模块布局（早期规划，仅供参考）
 
-> 实际落地时相关逻辑并入了 `src-tauri/src/features/import/`（`parse.rs`、`map.rs`、`assets.rs`、`paper_import/mod.rs` 等），没有独立的 `commands/` / `services/` 分层。下列结构保留为设计阶段参考。
+> 实际落地时相关逻辑拆分到了 `crates/agentero-core/src/features/paper/`：`scholar_api::identifiers`（解析、resolver 表、直连回退）、`import`（Skill 分流、批量预检、落盘、Zotero 映射）等，没有独立的 `commands/` / `services/` 分层。下列结构保留为设计阶段参考。
 
 ```text
 src-tauri/src/
@@ -647,9 +656,9 @@ src-tauri/src/
   services/
     lookup/
       mod.rs
-      parse.rs             # extractIdentifiers 规则
+      identifiers.rs       # extractIdentifiers 规则（实际在 scholar_api::identifiers）
       client.rs            # Runtime HTTP
-      map.rs               # Zotero JSON → PaperMetadata
+      api_mapper.rs        # Zotero JSON → ApiPaper → PaperRecord
       dedupe.rs
       fallback/
         mod.rs
@@ -704,7 +713,7 @@ arXiv URL 推导：
 - `source_url`: `https://arxiv.org/abs/{id}`
 - e-print: `https://arxiv.org/e-print/{id}`（解压到 `source/`）
 
-`type`：`arxiv` | `doi` | `other`（按标识符）。
+`type`：`PaperKind` → `arxiv` | `pdf` | `html` | `doi` | `other`（按标识符推断，见 §5.1）。
 
 ---
 
@@ -719,17 +728,17 @@ arXiv URL 推导：
 
 ### Phase B — Translator 服务
 
-- [x] HTTP 客户端 → `POST {translatorBaseUrl}/search|/web`（默认 `https://translator.philfan.cn`）
-- [x] map → `PaperMetadata` / catalog schema v2；设置页 `translatorBaseUrl`
+- [x] HTTP 客户端 → `POST {base}/search|/web`（固定 `https://translation-server.agentero.app`）
+- [x] map → `PaperRecord` / catalog schema v2；地址为代码常量，不读设置
 - [ ] 可选本机 sidecar 捆绑 / 探测；更细 dedupe UX
 
 ### Phase C — 体验打磨
 
 - [x] 入库后刷新文件树；可打开 paper；树选中并滚到新论文行
-- [x] 入库后 `graph_rebuild` 并刷新 Backlinks/Graph
+- [x] 入库后更新双链索引并刷新 Backlinks/Graph
 - [x] 与文件树选中态同步目标 `parent_dir`
 - [x] 论文库 UI：`paper_list` 表格 + 虚拟 Library 节点（见 [`../frontend/library.md`](../frontend/library.md)）
-- [x] 单篇 / Library 批量补下缺失 PDF 与 arXiv TeX（`paper_download_assets`）
+- [x] 单篇 / Library 批量补下缺失 PDF 与 arXiv TeX（`job_download_assets_enqueue`）
 - [x] 无 TeX 时 liteparse → `PAPER.md`（下载后自动）
 - [x] `⇧⌘I` 魔棒快捷键
 - [x] 魔棒批量入库：多标识符粘贴、去重、批量下载、进度聚合
@@ -739,7 +748,7 @@ arXiv URL 推导：
 ### Phase D — 可选
 
 - [x] 默认下载 PDF；arXiv e-print 解压 LaTeX；无 `downloadFulltextToLocal` 开关
-- [x] 文件树缺 PDF，或既无 TeX 也无 `PAPER.md` 时 Download → `paper_download_assets`
+- [x] 文件树缺 PDF，或既无 TeX 也无 `PAPER.md` 时 Download → `job_download_assets_enqueue`
 - [x] 无 TeX 时生成 `PAPER.md`（liteparse）
 - [ ] PDF prepare 复用同一 Lookup
 
@@ -800,7 +809,7 @@ arXiv URL 推导：
 | 2026-07-15 | 数据流合并：arXiv/DOI 等统一 Translator → 直接 map 进 PaperMetadata；catalog schema v2 补字段 |
 | 2026-07-15 | 下载策略：无预览 URL 始终尝试下载；有 URL 时仅 `downloadFulltextToLocal` 开才额外本地下载 |
 | 2026-07-15 | 实现进度：`lookup_import` / 设置 Translator URL / catalog 权威 / `paper_list` + Library UI |
-| 2026-07-15 | 默认下载 PDF；arXiv 解压 LaTeX；移除 `downloadFulltextToLocal`；`paper_download_assets` + 树行 Download |
+| 2026-07-15 | 默认下载 PDF；arXiv 解压 LaTeX；移除 `downloadFulltextToLocal`；`job_download_assets_enqueue` + 树行 Download |
 | 2026-07-15 | 无 TeX 时 liteparse → `PAPER.md`（下载后自动） |
 | 2026-07-16 | 从本地 Zotero 迁移（直读 `zotero.sqlite` + `storage/`；`zotero_scan` / `zotero_migrate`；可选拷 PDF） |
 
@@ -814,20 +823,24 @@ arXiv URL 推导：
   1. **无 Vault 欢迎页**：与 Create / Open vault 同一行的 **Migrate from Zotero**（先创建 Vault，再打开对话框）；
   2. **论文库工具栏**（已打开 Vault 时）：图标按钮。
   共用 `ZoteroMigrateDialog`。打开时自动探测默认 `~/Zotero` 目录（否则手动选含 `zotero.sqlite` + `storage/` 的目录）；扫描预览以 chips 显示文献 / PDF / 笔记数，迁移后展示结果小结（导入 / 补笔记 / 拷 PDF / 清理）。
+- 选错目录兜底：扫描报 `zotero.sqlite not found` 时，若所选目录的**父目录**含 `zotero.sqlite`（如误选 `storage/`），对话框提示一键改用父目录；否则显示本地化错误（不再透出后端原始英文串）。
 - Host：`zotero_scan`（只读预览：文献数 / 有本地 PDF 数）、`zotero_migrate`（执行）；实现在 `features/zotero/db.rs`。
 - 读库：把 `zotero.sqlite`（含 `-wal`/`-shm`）**拷到临时目录**再只读打开（容忍 Zotero 正在运行）；查 `items`/`itemData`/`creators`/`itemTags`/`itemAttachments`，跳过 `deletedItems` 与 attachment/note/annotation 类型，并排除插件产生的 `computerProgram` 垃圾条目（如标题为 "Addon Item" 的项）。
-- 映射：每条**拼装成 Zotero-API-JSON item** → 复用 `map_zotero_item` + `enrich_remote_urls` + `write_paper_shell` + `paper_record_from_meta` + catalog upsert，落到 `{parent_dir}/{id}/`（id/citekey 与魔棒 / 文件导入一致）。
-- 附件 PDF URL：`map_zotero_item` 未给出 `pdf_url` 时，采用 Connector `attachments[]` 里的 PDF 链接（浏览器侧捕获，ACM/IEEE 等常仅经此暴露）。
+- 集合目录：开启「按 Zotero 分类建子文件夹」时，所有集合（包括空集合）都会先创建。论文单元只有一个物理目录：多集合条目选择层级最深的集合；同深度按完整路径字母顺序稳定取一处。迁移对话框会在开始前报告受影响条目数；所有集合叶子名仍会保留为论文标签。每个完整集合路径另以隐藏 `@zotero:collection:<path>` metadata 保存，并记录 collection tree 的父目录；侧栏会在同一论文的其他真实分类文件夹内插入带链接标识的虚拟条目，全部指向该唯一物理论文目录。
+- 映射：每条**拼装成 Zotero-API-JSON item** → 复用 `map_zotero_item_to_record` + `enrich_remote_urls` + `write_paper_shell` + `PaperRecord::at_path` + catalog upsert，落到 `{parent_dir}/{id}/`（id/citekey 与魔棒 / 文件导入一致）。
+- 附件 PDF URL：`map_zotero_item_to_record` 未给出 `pdf_url` 时，采用 Connector `attachments[]` 里的 PDF 链接（浏览器侧捕获，ACM/IEEE 等常仅经此暴露）。
+- 去重审计：迁移日志会分别写出导入、跳过、因不支持类型（如 `computerProgram`）而忽略、合并重复、移动既有条目和补充笔记的数量；重复合并仍只保留一个物理论文目录。
 - 中文摘要：为不超 Connector 15s 超时，壳先以原文写入；**后台**三引擎并行竞速翻译摘要，成功则安全替换 `NOTES.md` 的 `>` 摘要块（mtime 守卫，用户已编辑或 MT 全失败则跳过）。
-- 标签：用户标签原样保留；Zotero 自动标签（网络翻译器加的来源/状态标签，`itemTags.type ≠ 0`）保留并加 `@zotero:` 前缀，因此在 Agentero 的标签界面中隐藏。arXiv 学科分类（`Computer Science - Machine Learning` 等）无论来自魔棒 Translator 还是 Zotero 条目，都加 `@arxiv:` 前缀，同样隐藏。旧库无 `type` 列时回退为将全部标签视为用户标签。collection 名仍作为组织标签补充。
+- 标签：用户标签原样保留；Zotero 自动标签（网络翻译器加的来源/状态标签，`itemTags.type ≠ 0`）保留并加 `@zotero:` 前缀，因此在 Agentero 的标签界面中隐藏。arXiv 学科分类（`Computer Science - Machine Learning` 等）无论来自魔棒 Translator 还是 Zotero 条目，都加 `@arxiv:` 前缀，同样隐藏。旧库无 `type` 列时回退为将全部标签视为用户标签。collection 名仍作为组织标签补充；完整 collection 路径以 `@zotero:collection:<path>`、其物化根以 `@zotero:collection-root:<parent>` 隐藏 metadata 保存，供侧栏在原文件夹内恢复多归属引用。
 - PDF：对话框 **“把 PDF 复制进知识库”** 勾选项（默认开）。勾选时从 `storage/<attachmentKey>/` 拷到 `{paper}/{id}.pdf` 并 liteparse `PAPER.md`；不勾则只留书目，`pdf_url` 供按需下载。
 - 去重：按 arXiv id / DOI / 归一化标题跳过重复（re-run 与既有）；不同文献 citekey 相撞时目录追加后缀。**不覆盖** `NOTES.md`。开启分类建文件夹时，去重命中的旧论文若不在其分类文件夹内（如早期平铺导入），会**自动移入**并改写 catalog 路径（目标已占用则保留原位，失败自动回滚；结果含 `relocated` 计数），重迁移即收敛到 Zotero 树。
 - 自愈：迁移前 `prune_missing` 清掉「文件夹已被手动删除」的 catalog 孤儿行，防止幽灵条目占位、去重误跳过导致无法重导（结果含 `pruned` 计数）。
 - 分类：对话框 **“按 Zotero 分类建子文件夹”** 勾选项（**默认开**，可手动关闭）→ 迁移开始时**物化完整 collection 树**（含空分类与条目被去重的分类，目录结构与 Zotero 完全对应），条目落在 `{parent}/<collection 路径>/<id>/`，collection 名同时写入 tags（多归属不丢失）；关闭则平铺。条目在多个 collection 时取确定性的单一路径（**最深路径优先**，同深按字典序，避免父级分类吸走子级条目）。
 - 选择性导入：`zotero_scan` 预览返回各 collection（含「未分类」= id 0）及条目数，并返回逐条 `items`（id/title/itemType/year/hasPdf/notes/collections）；对话框提供**搜索 + 文件夹筛选 + 逐条勾选**（`include_items` 优先于 `include_collections`，缺省 = 全部），非常规类型（webpage 等）在列表中以类型徽标标出；迁移经 Tauri Channel 回传 `{current,total}` 进度，选项记于 localStorage。
-- 笔记：对话框「迁移 Zotero 笔记」勾选项（默认开）→ 每篇挂载的子笔记（`itemNotes`）HTML 经 `htmd` 转 Markdown，追加进该篇 `NOTES.md`（以 `---` 分隔）；`zotero_scan` 预览显示笔记总数。仅处理有父条目的子笔记。
-- 批注：对话框「迁移 PDF 高亮批注」勾选项（默认开）→ 读 `itemAnnotations`（高亮 text + comment + 页码）转 Markdown 引用块追加进 `NOTES.md`（与笔记共用幂等追加）。**注**：阅读器运行时批注为 `marks/*.json`；Zotero 导入侧暂只把文本迁入 `NOTES.md`，不做原位 PDF 高亮还原。
-- 非目标（v1）：Zotero 批注的**原位高亮渲染**（现仅迁移文本入 NOTES.md）、独立笔记（无父条目）、群组库。
+- 笔记：对话框「迁移 Zotero 笔记」勾选项（默认开）覆盖两类笔记。挂在论文下的子笔记（`itemNotes.parentItemID` 指向该论文）HTML 经 `htmd` 转 Markdown，追加进该篇 `NOTES.md`（以 `---` 分隔）。没有父条目的独立笔记各写成一篇 Markdown：未归类落到 `notes/<标题>.md`，开启「按分类建子文件夹」时落到 `notes/<分类路径>/<标题>.md`，关闭则全部平铺在 `notes/`。文件名取笔记标题，否则取正文第一行，再否则取 Zotero key；与已有文件重名时加 `-2` 后缀，不覆盖用户文件。文件首行写入 `<!-- zotero-note:<key> -->`，再次迁移认出标记后跳过。嵌在独立笔记下的子笔记并入同一文件。空笔记、回收站笔记不写文件。`zotero_scan` 预览把独立笔记放进条目列表（类型 `note`），未归类归到 collection id `0`。
+- 批注：对话框「迁移 PDF 高亮批注」勾选项（默认开）→ 读 `itemAnnotations`（`type`、`color`、`text`、`comment`、`position`）。高亮与下划线写入该论文的 `marks/annotations.json`（EmbedPDF 传输格式，阅读器打开 PDF 时画在页面上），批注文字进 annotation 的 `contents`，不追加进 `NOTES.md`。`position.rects` 是 PDF 用户坐标 `[left, bottom, right, top]`，经与阅读器相同的 PDFium 视口变换换成页面点；没有 `position` 的旧库用划选原文在 PDF 里定位。同一 Zotero key 再次迁移不会重复写入。子笔记仍只进 `NOTES.md`。
+- 平台：PDF 高亮迁移与增量同步依赖桌面端 PDFium，仅在桌面构建启用。iOS / Android 跳过高亮写入，仍可处理元数据与笔记；移动端不能引用桌面专用的 `pdf_locate` 模块。
+- 非目标（v1）：独立笔记的双向同步（迁移是一次性写入 `notes/`，不推回 Zotero）、群组库。把 Zotero 高亮写回 PDF 文件字节（高亮只在 `annotations.json`，不改原 PDF）。
 | 2026-07-16 | 精读：入库/单篇 Download 后自动 paper-reader + Zap 手动；任务条 lookup/download → paperRead 衔接 |
 
 ---
@@ -846,7 +859,7 @@ arXiv URL 推导：
 - 沿用「拷 `zotero.sqlite`+WAL/SHM 到临时目录」方案（`copy_zotero_sqlite`）。
 - **元数据**：仅填补空字段（year/doi/arxiv/abstract/publication/creators 等），永不覆盖已有值。
 - **笔记**：只拉取**非 Agentero 标记**的子笔记（用户手写的），`htmd` 转 MD 后幂等追加进 NOTES.md。
-- **批注**：`itemAnnotations` 转 MD 块幂等追加（与迁移同格式，内容级去重）。
+- **批注**：与迁移相同，写入已关联论文的 `marks/annotations.json`（按 Zotero key 去重），不写入 `NOTES.md`。论文目录里没有 PDF 时跳过，因为没有页面几何可对齐。
 - **冲突**：水位之后两侧都变更（Zotero 笔记 dateModified 与 NOTES.md mtime 都新于水位）→ 跳过该篇笔记拉取并计入 conflicts 列表报告，不自动合并。
 - **不做**：不自动导入 Zotero 新增条目（那是迁移的职责）；Zotero 侧删除不联动删 paper。
 

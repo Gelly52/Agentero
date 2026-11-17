@@ -146,7 +146,13 @@ describe("Dockview sash pointer scheduling", () => {
 		});
 		ownerDocument.defaultView = ownerWindow;
 
-		const sash = {} as Element;
+		const sashClasses = new Set<string>();
+		const sash = {
+			classList: {
+				add: (name: string) => sashClasses.add(name),
+				remove: (name: string) => sashClasses.delete(name),
+			},
+		} as unknown as Element;
 		const classes = new Set<string>();
 		const root = Object.assign(new EventTarget(), {
 			ownerDocument,
@@ -183,6 +189,7 @@ describe("Dockview sash pointer scheduling", () => {
 		});
 		root.dispatchEvent(pointerDown);
 		expect(classes.has("agentero-dock-sash-active")).toBe(true);
+		expect(sashClasses.has("agentero-dock-sash-dragging")).toBe(true);
 		expect(pointerDown.defaultPrevented).toBe(true);
 
 		for (const clientX of [20, 30, 40]) {
@@ -207,6 +214,7 @@ describe("Dockview sash pointer scheduling", () => {
 		);
 		expect(dockviewMoves).toEqual([40, 50]);
 		expect(classes.has("agentero-dock-sash-active")).toBe(false);
+		expect(sashClasses.has("agentero-dock-sash-dragging")).toBe(false);
 		expect(dockviewEnds).toBe(1);
 
 		root.dispatchEvent(
@@ -217,8 +225,89 @@ describe("Dockview sash pointer scheduling", () => {
 		);
 		ownerWindow.dispatchEvent(new Event("blur"));
 		expect(classes.has("agentero-dock-sash-active")).toBe(false);
+		expect(sashClasses.has("agentero-dock-sash-dragging")).toBe(false);
 		expect(dockviewEnds).toBe(2);
 
 		dispose();
+	});
+
+	it("announces the gesture so the pane can freeze its re-wrap", () => {
+		const frames = frameHarness();
+		const ownerWindow = Object.assign(new EventTarget(), {
+			PointerEvent: FakePointerEvent,
+			requestAnimationFrame: frames.requestFrame,
+			cancelAnimationFrame: frames.cancelFrame,
+		});
+		const ownerDocument = new EventTarget() as EventTarget & {
+			defaultView: typeof ownerWindow;
+		};
+		ownerDocument.defaultView = ownerWindow;
+
+		const sash = {
+			classList: { add: () => {}, remove: () => {} },
+		} as unknown as Element;
+		const classes = new Set<string>();
+		let sashTarget = true;
+		const root = Object.assign(new EventTarget(), {
+			ownerDocument,
+			classList: {
+				add: (name: string) => classes.add(name),
+				remove: (name: string) => classes.delete(name),
+			},
+			closest: (selector: string) =>
+				sashTarget && selector === ".dv-sash" ? sash : null,
+			contains: (element: Element) => element === sash,
+		}) as unknown as HTMLElement;
+
+		// The pinned width must be measured before Dockview lays anything out,
+		// and released only after the final coordinate has been forwarded.
+		const order: string[] = [];
+
+		installDockviewSashFrameLoop(root, {
+			onSashDragBegin: () => order.push("begin"),
+			onSashDragEnd: () => order.push("end"),
+		});
+		// Registered after install: listeners on the same target run in
+		// registration order, so this sees only what Dockview itself would see
+		// (the loop stops immediate propagation on the native bursts).
+		ownerDocument.addEventListener("pointermove", () => {
+			order.push("dockview-move");
+		});
+
+		// A pointerdown outside any sash must not arm the freeze.
+		sashTarget = false;
+		root.dispatchEvent(new FakePointerEvent("pointerdown", { pointerId: 1 }));
+		expect(order).toEqual([]);
+		sashTarget = true;
+
+		root.dispatchEvent(
+			new FakePointerEvent("pointerdown", { cancelable: true, pointerId: 2 }),
+		);
+		expect(order).toEqual(["begin"]);
+
+		// A second pointerdown during the gesture must not re-arm it.
+		root.dispatchEvent(new FakePointerEvent("pointerdown", { pointerId: 3 }));
+		expect(order).toEqual(["begin"]);
+
+		ownerDocument.dispatchEvent(
+			new FakePointerEvent("pointermove", { pointerId: 2, clientX: 20 }),
+		);
+		frames.flushFrame();
+		expect(order).toEqual(["begin", "dockview-move"]);
+
+		ownerDocument.dispatchEvent(
+			new FakePointerEvent("pointermove", { pointerId: 2, clientX: 30 }),
+		);
+		ownerDocument.dispatchEvent(
+			new FakePointerEvent("pointerup", { pointerId: 2, clientX: 30 }),
+		);
+		// Flush of the pending move, then the release.
+		expect(order).toEqual(["begin", "dockview-move", "dockview-move", "end"]);
+
+		// Losing the window mid-drag must still release the freeze.
+		root.dispatchEvent(new FakePointerEvent("pointerdown", { pointerId: 4 }));
+		order.length = 0;
+		ownerWindow.dispatchEvent(new Event("blur"));
+		expect(order).toEqual(["end"]);
 	});
 });

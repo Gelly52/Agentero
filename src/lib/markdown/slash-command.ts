@@ -12,6 +12,7 @@ import {
 	type TElement,
 	type TText,
 } from "platejs";
+import { COLUMN_GROUP_KEY, COLUMN_KEY } from "@/lib/markdown/columns";
 import { insertEditorLinkTemplate } from "@/lib/markdown/editor-context-menu";
 import { findWikiCompletionTrigger } from "@/lib/wiki/completion";
 
@@ -27,11 +28,14 @@ export type SlashCommandId =
 	| "mermaid"
 	| "internalLink"
 	| "externalLink"
-	| "callout";
+	| "callout"
+	| "columns"
+	| "researchTable";
 
 export type SlashCommand = {
 	id: SlashCommandId;
 	labelKey:
+		| "researchTable.insert"
 		| "slashCommand.commands.heading1"
 		| "slashCommand.commands.heading2"
 		| "slashCommand.commands.heading3"
@@ -42,6 +46,7 @@ export type SlashCommand = {
 		| "slashCommand.commands.codeBlock"
 		| "slashCommand.commands.mermaid"
 		| "slashCommand.commands.callout"
+		| "slashCommand.commands.columns"
 		| "contextMenu.insertWikiLink"
 		| "contextMenu.insertExternalLink";
 	keywords: readonly string[];
@@ -62,6 +67,11 @@ export function isSlashCommandSubmitKey(key: string): key is "Enter" | "Tab" {
 }
 
 const SLASH_COMMANDS: readonly SlashCommand[] = [
+	{
+		id: "researchTable",
+		labelKey: "researchTable.insert",
+		keywords: ["table", "data", "result", "eln", "表格", "数据", "实验"],
+	},
 	{
 		id: "heading1",
 		labelKey: "slashCommand.commands.heading1",
@@ -136,6 +146,11 @@ const SLASH_COMMANDS: readonly SlashCommand[] = [
 		id: "callout",
 		labelKey: "slashCommand.commands.callout",
 		keywords: ["callout", "note", "admonition", "提示", "标注"],
+	},
+	{
+		id: "columns",
+		labelKey: "slashCommand.commands.columns",
+		keywords: ["columns", "col", "column", "分栏", "栏"],
 	},
 ];
 
@@ -367,6 +382,12 @@ export function executeSlashCommand(
 	consumeSlashCommand(editor, live.trigger);
 
 	switch (commandId) {
+		case "researchTable":
+			editor.tf.replaceNodes(
+				{ type: "research_table", tablePath: "", children: [{ text: "" }] },
+				{ at: live.blockPath },
+			);
+			return true;
 		case "heading1":
 			applyBlockType(editor, editor.getType(KEYS.h1));
 			break;
@@ -406,6 +427,35 @@ export function executeSlashCommand(
 			break;
 		case "callout":
 			return insertObsidianCallout(editor, live.blockPath);
+		case "columns":
+			return insertColumns(editor, live.blockPath);
 	}
+	return true;
+}
+
+function insertColumns(editor: SlateEditor, blockPath: number[]): boolean {
+	const entry = editor.api.node(blockPath);
+	const block = entry?.[0] as TElement | undefined;
+	if (!block || !Array.isArray(block.children)) return false;
+	const children = block.children.length ? block.children : [{ text: "" }];
+	const pType = editor.getType(KEYS.p);
+	editor.tf.replaceNodes(
+		{
+			type: COLUMN_GROUP_KEY,
+			children: [
+				{
+					type: COLUMN_KEY,
+					children: [{ type: pType, children }],
+				},
+				{
+					type: COLUMN_KEY,
+					children: [{ type: pType, children: [{ text: "" }] }],
+				},
+			],
+		},
+		{ at: blockPath },
+	);
+	const bodyEnd = editor.api.end([...blockPath, 0, 0]);
+	if (bodyEnd) editor.tf.select(bodyEnd);
 	return true;
 }

@@ -12,8 +12,9 @@ import {
 	useRef,
 	useState,
 } from "react";
-import { isPaperDirectory, isUnderPaperAttachments } from "@/lib/paper";
+import { isPaperDirectory, paperSurfacesChildPath } from "@/lib/paper";
 import type { FileNode } from "@/lib/vault";
+import { adjustAgentRevealAncestors } from "@/lib/vault/agent-tree";
 import {
 	ancestorPaths,
 	collectDefaultExpanded,
@@ -27,6 +28,13 @@ import type { TreeCreateDraft } from "../types";
 export type TreeExpansion = {
 	expanded: Set<string>;
 	setExpanded: Dispatch<SetStateAction<Set<string>>>;
+	/**
+	 * `onExpandedChange` for AiFileTree (chevron / folder-row clicks). A shrink
+	 * is a user collapse: arm reveal suppression so the flatRows-driven
+	 * auto-reveal does not instantly re-expand the folder (VS Code semantics:
+	 * an intentional collapse always wins over reveal).
+	 */
+	setExpandedFromTree: (next: Set<string>) => void;
 	/** Paths currently being listed (lazy expand). */
 	loadingDirs: ReadonlySet<string>;
 	/** Only expand papers/ (list direct children; do not expand subfolders). */
@@ -199,7 +207,11 @@ export function useTreeExpansion({
 	const expandAncestorsOf = useCallback(
 		(target: string) => {
 			if (isVirtualTreePath(target)) return;
-			const parents = ancestorPaths(target, vaultPath);
+			const parents = adjustAgentRevealAncestors(
+				target,
+				vaultPath,
+				ancestorPaths(target, vaultPath),
+			);
 			if (parents.length === 0) return;
 			setExpanded((prev) => {
 				let changed = false;
@@ -207,10 +219,11 @@ export function useTreeExpansion({
 				for (const parent of parents) {
 					const node = byPathKey.get(pathKey(parent));
 					if (node?.kind !== "directory") continue;
-					// Papers stay collapsed unless we are revealing an attachment.
+					// Papers stay collapsed unless we are revealing a surfaced child
+					// (root Markdown/HTML note or an attachment).
 					if (
 						isPaperDirectory(node.path, node.children) &&
-						!isUnderPaperAttachments(target, node.path)
+						!paperSurfacesChildPath(target, node)
 					) {
 						continue;
 					}
@@ -234,9 +247,18 @@ export function useTreeExpansion({
 		});
 	}, []);
 
+	const setExpandedFromTree = useCallback(
+		(next: Set<string>) => {
+			if (next.size < expanded.size) suppressAutoRevealRef.current = true;
+			setExpanded(next);
+		},
+		[expanded],
+	);
+
 	return {
 		expanded,
 		setExpanded,
+		setExpandedFromTree,
 		loadingDirs,
 		collapseToDefault,
 		collapsePaths,

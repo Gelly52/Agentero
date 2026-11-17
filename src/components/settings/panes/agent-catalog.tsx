@@ -1,5 +1,6 @@
 import { Loader2 } from "lucide-react";
 import type { ReactNode } from "react";
+import { agentLogoKeyForTemplate } from "@/components/agent/agent-logo";
 import type {
 	AgentDescriptor,
 	AgentTemplate,
@@ -25,7 +26,7 @@ export function StatusBadge({
 		<span
 			title={title}
 			className={cn(
-				"inline-flex shrink-0 items-center justify-center gap-1 rounded px-1.5 py-0.5 text-[10px] font-medium leading-none",
+				"inline-flex shrink-0 items-center justify-center gap-1 rounded px-1.5 py-0.5 text-caption font-medium leading-none",
 				tone === "ok" &&
 					"bg-emerald-500/15 text-emerald-700 dark:text-emerald-400",
 				tone === "warn" && "bg-amber-500/15 text-amber-800 dark:text-amber-400",
@@ -110,15 +111,22 @@ export function showInstallAcp(entry: CatalogEntry): boolean {
 	return Boolean(entry.offerInstall || entry.canInstall);
 }
 
-/** Host CLI already on PATH — silent upgrade via `runToolLifecycle(..., "update")`. */
+/**
+ * Host CLI on PATH and a newer silent-update target is known.
+ * Hidden while versions are unknown / equal / check failed.
+ */
 export function showUpdateAgent(entry: CatalogEntry): boolean {
-	return Boolean(entry.canInstall) && entry.binaryAvailable;
+	return (
+		Boolean(entry.canInstall) &&
+		entry.binaryAvailable &&
+		entry.updateAvailable === true
+	);
 }
 
 /**
  * Row can be uninstalled/removed: a registry entry always qualifies; otherwise
- * an installed CLI of a lifecycle template (excludes plain-PATH templates like
- * qodercli that we never installed).
+ * an installed CLI of a lifecycle template (`canInstall`). Templates without a
+ * silent installer stay out.
  */
 export function showUninstallAgent(entry: CatalogEntry): boolean {
 	return (
@@ -139,25 +147,6 @@ export type DefaultAgentChoice = {
 	isDefault: boolean;
 };
 
-function catalogTemplateFromId(templateId: string): AgentTemplate {
-	switch (templateId) {
-		case "opencode":
-		case "openclaw":
-		case "gemini":
-		case "hermes":
-		case "claude-acp":
-		case "codex-acp":
-		case "qodercli":
-		case "grok-build":
-		case "pi":
-		case "dsh":
-		case "kimi-code":
-			return templateId;
-		default:
-			return "custom";
-	}
-}
-
 export function buildDefaultAgentChoices(
 	scan: CatalogScanResponse | null | undefined,
 ): DefaultAgentChoice[] {
@@ -167,15 +156,13 @@ export function buildDefaultAgentChoices(
 
 	for (const entry of scan.entries) {
 		const needsInstall = showInstallAgent(entry) || showInstallAcp(entry);
-		const canUse =
-			(entry.acpCommandAvailable || entry.acpStatus === "ready") &&
-			!needsInstall;
+		const canUse = entry.acpCommandAvailable && !needsInstall;
 		if (!canUse) continue;
 		if (entry.registeredId) seenAgentIds.add(entry.registeredId);
 		choices.push({
 			value: `catalog:${entry.templateId}`,
 			name: entry.name,
-			template: catalogTemplateFromId(entry.templateId),
+			template: agentLogoKeyForTemplate(entry.templateId),
 			source: "catalog",
 			templateId: entry.templateId,
 			agentId: entry.registeredId ?? undefined,
@@ -220,7 +207,9 @@ export function patchCatalogProbe(
 	return {
 		...scan,
 		entries: scan.entries.map((entry) => {
-			if (entry.templateId !== templateId) return entry;
+			if (entry.templateId !== templateId || !entry.acpCommandAvailable) {
+				return entry;
+			}
 			return {
 				...entry,
 				registeredId: entry.registeredId ?? result.agentId,

@@ -1,10 +1,10 @@
 #[cfg(test)]
 mod acp_live {
     use crate::features::agent::acp::permission_response;
-    use crate::features::agent::discover::resolve_command;
     use crate::features::agent::list_acp_sessions;
     use crate::features::agent::models::{AgentDescriptor, AgentTemplate, CatalogAcpStatus};
-    use crate::features::agent::templates::catalog_templates;
+    use crate::features::agent::registry::discovery::resolve_command;
+    use crate::features::agent::registry::templates::{catalog_templates, interactive_cli};
     use crate::features::agent::AgentRegistry;
     use agent_client_protocol::schema::v1::{
         PermissionOption, PermissionOptionId, PermissionOptionKind, RequestPermissionOutcome,
@@ -36,21 +36,85 @@ mod acp_live {
     }
 
     #[test]
+    fn interactive_cli_tracks_the_host_cli() {
+        let cats = catalog_templates();
+        let find = |id: &str| cats.iter().find(|entry| entry.id == id).expect("template");
+        // Most agents expose the same binary as the "installed" badge.
+        assert_eq!(interactive_cli(find("codex-acp")).as_deref(), Some("codex"));
+        assert_eq!(interactive_cli(find("pi")).as_deref(), Some("pi"));
+        // Dsh needs an explicit profile; `tui` is the shipped interactive one.
+        assert_eq!(
+            interactive_cli(find("dsh")).as_deref(),
+            Some("dsh --profile tui")
+        );
+        if let Some(antigravity) = cats.iter().find(|entry| entry.id == "antigravity-acp") {
+            assert_eq!(interactive_cli(antigravity).as_deref(), Some("agy"));
+        }
+        // ZCode ships no user-facing CLI, so the terminal action is hidden.
+        assert_eq!(interactive_cli(find("zcode")), None);
+    }
+
+    #[test]
     fn catalog_has_common_agents() {
         let cats = catalog_templates();
         let ids: Vec<_> = cats.iter().map(|c| c.id.as_str()).collect();
         assert!(ids.contains(&"opencode"));
-        assert!(ids.contains(&"openclaw"));
         assert!(ids.contains(&"claude-acp"));
         assert!(ids.contains(&"codex-acp"));
+        assert!(ids.contains(&"cursor-agent"));
         assert!(ids.contains(&"hermes"));
-        assert!(ids.contains(&"gemini"));
+        assert!(!ids.contains(&"antigravity"));
+        assert_eq!(
+            ids.contains(&"antigravity-acp"),
+            !cfg!(all(target_os = "macos", target_arch = "x86_64"))
+        );
         assert!(ids.contains(&"qodercli"));
+        assert!(ids.contains(&"qoder-cn"));
         assert!(ids.contains(&"grok-build"));
         assert!(ids.contains(&"pi"));
         assert!(ids.contains(&"dsh"));
         assert!(ids.contains(&"kimi-code"));
+        assert!(ids.contains(&"zcode"));
+        assert!(ids.contains(&"minimax-code"));
         assert!(!ids.contains(&"custom"));
+    }
+
+    #[test]
+    fn antigravity_template_uses_native_acp() {
+        let agent = catalog_templates()
+            .into_iter()
+            .find(|entry| entry.id == "antigravity-acp")
+            .expect("Antigravity template");
+        assert_eq!(agent.command, "agy");
+        assert_eq!(agent.args, vec!["acp".to_string()]);
+        assert_eq!(agent.detect_command.as_deref(), Some("agy"));
+        assert_eq!(agent.login_command.as_deref(), Some("agy acp --login"));
+    }
+
+    #[test]
+    fn zcode_template_uses_the_acp_adapter() {
+        let zcode = catalog_templates()
+            .into_iter()
+            .find(|entry| entry.id == "zcode")
+            .expect("ZCode template");
+        assert_eq!(zcode.command, "zcode-acp-server");
+        assert_eq!(zcode.args, vec!["server".to_string()]);
+        // The adapter discovers the desktop app's zcode.cjs itself, so the
+        // "installed" badge tracks the adapter rather than a host `zcode` CLI.
+        assert_eq!(zcode.detect_command.as_deref(), Some("zcode-acp-server"));
+        assert!(zcode.install_command.is_some());
+    }
+
+    #[test]
+    fn qoder_cn_template_uses_native_acp() {
+        let qoder = catalog_templates()
+            .into_iter()
+            .find(|entry| entry.id == "qoder-cn")
+            .expect("Qoder CN template");
+        assert_eq!(qoder.command, "qodercn");
+        assert_eq!(qoder.args, vec!["--acp".to_string()]);
+        assert_eq!(qoder.detect_command.as_deref(), Some("qodercn"));
+        assert_eq!(qoder.login_command.as_deref(), Some("qodercn login"));
     }
 
     #[test]
@@ -63,6 +127,37 @@ mod acp_live {
         assert_eq!(codex.command, "codex-acp");
         assert_eq!(codex.args, Vec::<String>::new());
         assert_eq!(codex.detect_command.as_deref(), Some("codex"));
+        assert_eq!(codex.login_command.as_deref(), Some("codex login"));
+    }
+
+    #[test]
+    fn cursor_template_uses_native_acp() {
+        let cursor = catalog_templates()
+            .into_iter()
+            .find(|entry| entry.id == "cursor-agent")
+            .expect("Cursor template");
+        // `--acp` is not a flag; ACP is the hidden `acp` subcommand.
+        assert_eq!(cursor.command, "cursor-agent");
+        assert_eq!(cursor.args, vec!["acp".to_string()]);
+        assert_eq!(cursor.detect_command.as_deref(), Some("cursor-agent"));
+        assert_eq!(cursor.login_command.as_deref(), Some("cursor-agent login"));
+        assert!(crate::features::agent::registry::lifecycle::supports_lifecycle(&cursor.id));
+    }
+
+    #[test]
+    fn oauth_templates_define_login_commands() {
+        let cats = catalog_templates();
+        let claude = cats
+            .iter()
+            .find(|entry| entry.id == "claude-acp")
+            .expect("Claude template");
+        let codex = cats
+            .iter()
+            .find(|entry| entry.id == "codex-acp")
+            .expect("Codex template");
+
+        assert_eq!(claude.login_command.as_deref(), Some("claude auth login"));
+        assert_eq!(codex.login_command.as_deref(), Some("codex login"));
     }
 
     #[test]
@@ -78,16 +173,8 @@ mod acp_live {
     }
 
     #[test]
-    fn openclaw_and_hermes_templates_use_native_acp() {
+    fn hermes_template_uses_native_acp() {
         let cats = catalog_templates();
-        let openclaw = cats
-            .iter()
-            .find(|entry| entry.id == "openclaw")
-            .expect("OpenClaw template");
-        assert_eq!(openclaw.command, "openclaw");
-        assert_eq!(openclaw.args, vec!["acp".to_string()]);
-        assert_eq!(openclaw.detect_command.as_deref(), Some("openclaw"));
-
         let hermes = cats
             .iter()
             .find(|entry| entry.id == "hermes")
@@ -106,6 +193,18 @@ mod acp_live {
         assert_eq!(kimi.command, "kimi");
         assert_eq!(kimi.args, vec!["acp".to_string()]);
         assert_eq!(kimi.detect_command.as_deref(), Some("kimi"));
+    }
+
+    #[test]
+    fn minimax_template_uses_native_acp() {
+        let minimax = catalog_templates()
+            .into_iter()
+            .find(|entry| entry.id == "minimax-code")
+            .expect("MiniMax Code template");
+        assert_eq!(minimax.command, "mcode");
+        assert_eq!(minimax.args, vec!["acp".to_string()]);
+        assert_eq!(minimax.detect_command.as_deref(), Some("mcode"));
+        assert_eq!(minimax.login_command.as_deref(), Some("mcode login"));
     }
 
     /// grok-build must not detect or launch through `npx`: `npx` resolves on any
@@ -190,10 +289,6 @@ mod acp_live {
             assert!(by_id("opencode").binary_available);
             assert_ne!(by_id("opencode").acp_status, CatalogAcpStatus::Missing);
         }
-        if resolve_command("openclaw").is_some() {
-            assert!(by_id("openclaw").binary_available);
-            assert_ne!(by_id("openclaw").acp_status, CatalogAcpStatus::Missing);
-        }
         if resolve_command("claude").is_some() {
             assert!(by_id("claude-acp").binary_available);
         }
@@ -217,10 +312,6 @@ mod acp_live {
         if resolve_command("codex").is_some() {
             assert!(by_id("codex-acp").binary_available);
         }
-        if resolve_command("gemini").is_none() {
-            assert!(!by_id("gemini").binary_available);
-            assert_eq!(by_id("gemini").acp_status, CatalogAcpStatus::Missing);
-        }
     }
 
     /// #338: codex-acp pages `session/list` over a global time window and filters
@@ -239,8 +330,12 @@ mod acp_live {
             "codex-acp",
             vec![],
         );
-        let cwd = std::env::current_dir().expect("cwd");
-        let result = list_acp_sessions(&d, cwd.clone(), None, None)
+        let vault = std::env::current_dir().expect("cwd");
+        let cwd =
+            crate::features::agent::acp::client::agent_spawn_cwd(None, vault.to_str()).unwrap();
+        let queries =
+            std::sync::Arc::new(crate::features::agent::session::query::AgentQueryPool::new());
+        let result = list_acp_sessions(&queries, &d, cwd.clone(), None, None)
             .await
             .expect("session/list must succeed");
         assert!(result.supported, "codex-acp advertises session.list");
@@ -263,7 +358,7 @@ mod acp_live {
 
 #[cfg(test)]
 mod tool_payload {
-    use crate::features::agent::acp::{cap_tool_payload, TOOL_PAYLOAD_MAX_BYTES};
+    use crate::features::agent::acp::updates::{cap_tool_payload, TOOL_PAYLOAD_MAX_BYTES};
     use serde_json::{json, Value};
 
     #[test]
@@ -314,7 +409,7 @@ mod tool_payload {
 
 #[cfg(test)]
 mod list_sessions_paging {
-    use crate::features::agent::acp::{
+    use crate::features::agent::session::{
         list_sessions_page_done, LIST_SESSIONS_BUDGET, LIST_SESSIONS_MAX, LIST_SESSIONS_MAX_PAGES,
     };
     use std::time::Duration;

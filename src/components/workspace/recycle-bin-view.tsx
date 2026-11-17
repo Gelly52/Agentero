@@ -1,6 +1,7 @@
 import { FileIcon, FolderIcon, RotateCcw, Trash2 } from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { PaperTitle } from "@/components/paper/paper-title";
 import { Button } from "@/components/ui/button";
 import {
 	Dialog,
@@ -128,7 +129,12 @@ export function RecycleBinView({
 	}, [vaultPath, purgeTarget, busyId, t]);
 
 	return (
-		<div className={cn("flex min-h-0 min-w-0 flex-1 flex-col", className)}>
+		<div
+			className={cn(
+				"flex min-h-0 min-w-0 flex-1 select-none flex-col",
+				className,
+			)}
+		>
 			{loading ? (
 				<div className="flex min-h-0 flex-1 items-center justify-center text-muted-foreground text-sm">
 					{t("recycleBin.loading")}
@@ -155,10 +161,17 @@ export function RecycleBinView({
 											)}
 										/>
 										<div className="min-w-0 flex-1">
-											<div className="truncate text-sm" title={item.rel}>
-												{item.name}
-											</div>
-											<div className="truncate text-[11px] text-muted-foreground">
+											{item.title ? (
+												<PaperTitle
+													text={item.title}
+													className="block truncate text-sm"
+												/>
+											) : (
+												<div className="truncate text-sm" title={item.name}>
+													{item.name}
+												</div>
+											)}
+											<div className="truncate text-caption text-muted-foreground">
 												{item.rel} · {formatWhen(item.deletedAt)}
 											</div>
 										</div>
@@ -218,7 +231,7 @@ export function RecycleBinView({
 						<DialogDescription>
 							{purgeTarget
 								? t("recycleBin.deleteForeverConfirm", {
-										name: purgeTarget.name,
+										name: purgeTarget.title ?? purgeTarget.name,
 									})
 								: null}
 						</DialogDescription>

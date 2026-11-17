@@ -1,21 +1,39 @@
 /**
  * Sticky header row for the papers library table.
  *
- * Per-column sort button, title-header inline search, publication refresh,
- * and the tags-filter popover; right-click customizes column order +
- * visibility. Transient drag state (dragKey/dragOverKey) lives here — the
- * parent only receives committed reorder events. Memoized so scrolling the
- * virtualized body does not re-render the header.
+ * Per-column sort button, title-header inline search, one publication sync
+ * action, and the tags-filter popover; right-click customizes column order +
+ * visibility. When `compact` (table is actively scrolling), search +
+ * action icons hide so only column labels remain; row height stays
+ * fixed (`h-10`). Transient drag state (dragKey/dragOverKey) lives here —
+ * the parent only receives committed reorder events. Memoized so
+ * scrolling the virtualized body does not re-render the header unless
+ * compact/props change.
  */
-import { ListFilter, RefreshCw, Search, X } from "lucide-react";
-import { memo, useState } from "react";
-import { COLUMN_META, SortIcon } from "@/components/library/library-columns";
+import {
+	Check,
+	ListFilter,
+	MoreHorizontal,
+	Plus,
+	RefreshCw,
+	Search,
+	X,
+} from "lucide-react";
+import { memo, useEffect, useState } from "react";
+import {
+	CreatePropertyDialog,
+	DeletePropertyDialog,
+	RenamePropertyDialog,
+} from "@/components/library/custom-property-dialogs";
+import { LibraryColumnResizeHandle } from "@/components/library/library-column-resize-handle";
+import { getColumnMeta, SortIcon } from "@/components/library/library-columns";
 import type {
 	CellT,
 	SortDir,
 	SortKey,
 } from "@/components/library/library-row-utils";
 import { PaperTagChip } from "@/components/library/paper-tag-chip";
+import { Checkbox } from "@/components/ui/checkbox";
 import {
 	ContextMenu,
 	ContextMenuCheckboxItem,
@@ -37,6 +55,10 @@ import {
 	TooltipTrigger,
 } from "@/components/ui/tooltip";
 import { cn } from "@/lib/core/utils";
+import {
+	type CustomProperty,
+	useCustomProperties,
+} from "@/lib/paper/custom-properties-store";
 import type { PaperTag } from "@/lib/paper/tags";
 import type { LibraryColumnPref } from "@/lib/settings";
 
@@ -49,13 +71,18 @@ type LibraryTableHeaderProps = {
 	sortKey: SortKey;
 	sortDir: SortDir;
 	onSort: (key: SortKey) => void;
+	/**
+	 * Actively scrolling: hide search input and header action icons,
+	 * keep column label text (and active sort chevron). Idle restores.
+	 */
+	compact?: boolean;
 	/** Inline title search; hidden when the shared query is not controlled. */
 	searchEnabled: boolean;
 	inputValue: string;
 	onInputChange: (value: string) => void;
-	/** Publication refresh (local vault only). */
-	canRefreshPublications: boolean;
-	onRefreshPublications: () => void;
+	/** Publication sync (metadata + Host tag/metrics projection). */
+	canSyncPublication: boolean;
+	onSyncPublication: () => void;
 	/** Tags-column filter popover. */
 	availableTags: PaperTag[];
 	tagFilterSet: Set<string>;
@@ -67,6 +94,13 @@ type LibraryTableHeaderProps = {
 	onToggleColumn: (key: SortKey) => void;
 	onResetColumns: () => void;
 	onColumnReorder: (fromKey: SortKey, toKey: SortKey) => void;
+	onColumnResize: (key: SortKey, width: number | null, commit: boolean) => void;
+	vaultPath?: string | null;
+	/** Selection mode: leading select-all checkbox column is drawn. */
+	showSelection: boolean;
+	allSelected: boolean;
+	someSelected: boolean;
+	onToggleAll: (next: boolean) => void;
 };
 
 export const LibraryTableHeader = memo(function LibraryTableHeader({
@@ -76,11 +110,12 @@ export const LibraryTableHeader = memo(function LibraryTableHeader({
 	sortKey,
 	sortDir,
 	onSort,
+	compact = false,
 	searchEnabled,
 	inputValue,
 	onInputChange,
-	canRefreshPublications,
-	onRefreshPublications,
+	canSyncPublication,
+	onSyncPublication,
 	availableTags,
 	tagFilterSet,
 	tagFilterActive,
@@ -90,19 +125,65 @@ export const LibraryTableHeader = memo(function LibraryTableHeader({
 	onToggleColumn,
 	onResetColumns,
 	onColumnReorder,
+	onColumnResize,
+	vaultPath,
+	showSelection,
+	allSelected,
+	someSelected,
+	onToggleAll,
 }: LibraryTableHeaderProps) {
 	// --- Column customization (order + visibility) ---
 	const [dragKey, setDragKey] = useState<SortKey | null>(null);
 	const [dragOverKey, setDragOverKey] = useState<SortKey | null>(null);
 	const [tagFilterOpen, setTagFilterOpen] = useState(false);
+	// Custom Property Dialog states
+	const customProps = useCustomProperties();
+	const [createPropOpen, setCreatePropOpen] = useState(false);
+	const [renamePropTarget, setRenamePropTarget] =
+		useState<CustomProperty | null>(null);
+	const [deletePropTarget, setDeletePropTarget] =
+		useState<CustomProperty | null>(null);
+
+	useEffect(() => {
+		if (compact) setTagFilterOpen(false);
+	}, [compact]);
+
+	const showActions = !compact;
+	/** Fade chrome in place (keeps h-10); hide instantly, restore with fade-in. */
+	const chromeFadeClass = showActions
+		? "opacity-100 duration-300"
+		: "pointer-events-none opacity-0 duration-0";
 
 	return (
 		<ContextMenu>
 			<ContextMenuTrigger asChild>
-				<thead className="sticky top-0 z-[1] border-b bg-background/95 backdrop-blur-sm">
-					<tr className="text-muted-foreground text-xs">
+				<thead
+					data-library-header
+					className="sticky top-0 z-[1] select-none border-b border-transparent bg-background/72 shadow-[0_1px_0_0_color-mix(in_oklch,var(--border)_55%,transparent)] backdrop-blur-xl backdrop-saturate-150 supports-backdrop-blur:bg-background/60"
+				>
+					<tr className="text-muted-foreground text-xs tracking-wide">
+						{showSelection ? (
+							<th className="w-8 min-w-8 p-0 font-normal">
+								<div className="flex h-10 items-center justify-center">
+									<Checkbox
+										checked={
+											allSelected
+												? true
+												: someSelected
+													? "indeterminate"
+													: false
+										}
+										aria-label={t("papersLibrary.selection.selectAll")}
+										title={t("papersLibrary.selection.selectAll")}
+										onClick={(e) => e.stopPropagation()}
+										onMouseDown={(e) => e.stopPropagation()}
+										onCheckedChange={(next) => onToggleAll(next === true)}
+									/>
+								</div>
+							</th>
+						) : null}
 						{visibleColumns.map((col) => {
-							const meta = COLUMN_META[col.key];
+							const meta = getColumnMeta(col.key);
 							const active = sortKey === col.key;
 							const isDragOver = dragOverKey === col.key && dragKey !== col.key;
 							const isTitle = col.key === "title";
@@ -113,7 +194,7 @@ export const LibraryTableHeader = memo(function LibraryTableHeader({
 									key={col.key}
 									className={cn(
 										meta.headerClassName,
-										"p-0 font-medium",
+										"relative p-0 font-medium",
 										dragKey === col.key && "opacity-50",
 										isDragOver && "bg-muted",
 									)}
@@ -128,7 +209,9 @@ export const LibraryTableHeader = memo(function LibraryTableHeader({
 									onDragStart={(e) => {
 										const target = e.target as HTMLElement;
 										if (
-											target.closest("input,button[data-library-header-action]")
+											target.closest(
+												"input,button[data-library-header-action],[data-library-resize]",
+											)
 										) {
 											e.preventDefault();
 											return;
@@ -156,27 +239,61 @@ export const LibraryTableHeader = memo(function LibraryTableHeader({
 										setDragOverKey(null);
 									}}
 								>
-									<div className="flex min-w-0 items-center gap-1 px-3 py-1.5">
+									{/* Fixed h-10 so compact fade never changes header height. */}
+									<div className="flex h-10 min-w-0 items-center gap-1.5 px-3.5">
 										<button
 											type="button"
 											className={cn(
-												"flex min-w-0 shrink items-center gap-1 py-0.5 text-left cursor-grab active:cursor-grabbing",
+												"flex min-w-0 shrink items-center gap-1 py-1 text-left cursor-grab active:cursor-grabbing",
 												"hover:text-foreground",
 												"focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring",
 												active && "text-foreground",
 											)}
 											onClick={() => onSort(col.key)}
 											aria-label={t("papersLibrary.sortBy", {
-												column: t(meta.labelKey),
+												column: col.key.startsWith("prop:")
+													? meta.labelKey
+													: t(meta.labelKey),
 											})}
 										>
-											<span className="truncate">{t(meta.labelKey)}</span>
-											<SortIcon active={active} dir={sortDir} />
+											<span className="truncate">
+												{col.key.startsWith("prop:")
+													? meta.labelKey
+													: t(meta.labelKey)}
+											</span>
+											<span
+												className={cn(
+													"inline-flex transition-opacity ease-out",
+													showActions || active
+														? "opacity-100 duration-300"
+														: "opacity-0 duration-0",
+												)}
+												aria-hidden={!showActions && !active}
+											>
+												<SortIcon active={active} dir={sortDir} />
+											</span>
+											{isTags ? (
+												<span
+													className={cn(
+														"size-1.5 shrink-0 rounded-full bg-primary transition-opacity ease-out",
+														!showActions && tagFilterActive
+															? "opacity-100 duration-300"
+															: "opacity-0 duration-0",
+													)}
+													aria-hidden
+												/>
+											) : null}
 										</button>
 										{isTitle && searchEnabled ? (
-											<div className="relative ml-1 min-w-0 flex-1">
+											<div
+												className={cn(
+													"relative ml-1 min-w-0 flex-1 transition-opacity ease-out",
+													chromeFadeClass,
+												)}
+												aria-hidden={!showActions}
+											>
 												<Search
-													className="pointer-events-none absolute top-1/2 left-1.5 size-3 -translate-y-1/2 text-muted-foreground"
+													className="pointer-events-none absolute top-1/2 left-2 size-3.5 -translate-y-1/2 text-muted-foreground"
 													aria-hidden
 												/>
 												<Input
@@ -184,28 +301,33 @@ export const LibraryTableHeader = memo(function LibraryTableHeader({
 													value={inputValue}
 													onChange={(e) => onInputChange(e.target.value)}
 													aria-label={t("papersLibrary.search")}
-													className="h-6 border-transparent bg-muted/50 pl-6 pr-1.5 text-xs shadow-none focus-visible:border-input focus-visible:bg-background"
+													tabIndex={showActions ? undefined : -1}
+													className="h-7 border-transparent bg-muted/70 pl-7 pr-2 text-xs shadow-none placeholder:text-muted-foreground/70 focus-visible:border-border/60 focus-visible:bg-card"
 													onMouseDown={(e) => e.stopPropagation()}
 													onClick={(e) => e.stopPropagation()}
 													onKeyDown={(e) => e.stopPropagation()}
 												/>
 											</div>
 										) : null}
-										{isPublication && canRefreshPublications ? (
+										{isPublication && canSyncPublication ? (
 											<Tooltip>
 												<TooltipTrigger asChild>
 													<button
 														type="button"
 														data-library-header-action
+														tabIndex={showActions ? undefined : -1}
 														className={cn(
-															"ml-1 flex size-6 shrink-0 items-center justify-center rounded-sm",
+															"ml-1 flex size-7 shrink-0 items-center justify-center rounded-md",
 															"hover:bg-muted/60 hover:text-foreground",
 															"focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring",
+															"transition-opacity ease-out",
+															chromeFadeClass,
 														)}
-														aria-label={t("papersLibrary.refreshPublication")}
+														aria-hidden={!showActions}
+														aria-label={t("papersLibrary.syncPublication")}
 														onClick={(e) => {
 															e.stopPropagation();
-															onRefreshPublications();
+															onSyncPublication();
 														}}
 														onMouseDown={(e) => e.stopPropagation()}
 													>
@@ -213,7 +335,7 @@ export const LibraryTableHeader = memo(function LibraryTableHeader({
 													</button>
 												</TooltipTrigger>
 												<TooltipContent side="bottom">
-													{t("papersLibrary.refreshPublication")}
+													{t("papersLibrary.syncPublication")}
 												</TooltipContent>
 											</Tooltip>
 										) : null}
@@ -228,13 +350,18 @@ export const LibraryTableHeader = memo(function LibraryTableHeader({
 															<button
 																type="button"
 																data-library-header-action
+																tabIndex={showActions ? undefined : -1}
 																className={cn(
-																	"ml-auto flex size-6 shrink-0 items-center justify-center rounded-sm",
+																	"ml-auto flex size-7 shrink-0 items-center justify-center rounded-md",
 																	"hover:bg-muted/60 hover:text-foreground",
 																	"focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring",
+																	"transition-opacity ease-out",
+																	chromeFadeClass,
 																	tagFilterActive &&
+																		showActions &&
 																		"bg-muted/60 text-foreground",
 																)}
+																aria-hidden={!showActions}
 																aria-label={t("papersLibrary.filterTags")}
 																aria-pressed={tagFilterActive}
 																onClick={(e) => e.stopPropagation()}
@@ -250,7 +377,7 @@ export const LibraryTableHeader = memo(function LibraryTableHeader({
 												</Tooltip>
 												<PopoverContent
 													align="start"
-													className="w-56 p-2"
+													className="w-56 p-1.5"
 													onOpenAutoFocus={(e) => e.preventDefault()}
 												>
 													{availableTags.length === 0 ? (
@@ -266,7 +393,7 @@ export const LibraryTableHeader = memo(function LibraryTableHeader({
 																		key={tag.name}
 																		type="button"
 																		className={cn(
-																			"flex w-full items-center gap-2 rounded-md px-1.5 py-1 text-left text-xs",
+																			"flex w-full cursor-pointer items-center gap-2 rounded-md px-2 py-1.5 text-left text-xs",
 																			"hover:bg-muted/60",
 																			selected && "bg-muted/50",
 																		)}
@@ -275,7 +402,7 @@ export const LibraryTableHeader = memo(function LibraryTableHeader({
 																	>
 																		<span
 																			className={cn(
-																				"flex size-3.5 shrink-0 items-center justify-center rounded-sm border",
+																				"flex size-4 shrink-0 items-center justify-center rounded-[4px] border",
 																				selected
 																					? "border-primary bg-primary text-primary-foreground"
 																					: "border-muted-foreground/40",
@@ -283,9 +410,7 @@ export const LibraryTableHeader = memo(function LibraryTableHeader({
 																			aria-hidden
 																		>
 																			{selected ? (
-																				<span className="text-[9px] leading-none">
-																					✓
-																				</span>
+																				<Check className="size-3.5" />
 																			) : null}
 																		</span>
 																		<PaperTagChip tag={tag} />
@@ -310,10 +435,102 @@ export const LibraryTableHeader = memo(function LibraryTableHeader({
 												</PopoverContent>
 											</Popover>
 										) : null}
+										{col.key.startsWith("prop:")
+											? (() => {
+													const propId = col.key.slice(5);
+													const prop = customProps.find((p) => p.id === propId);
+													if (!prop) return null;
+													return (
+														<Popover>
+															<PopoverTrigger asChild>
+																<button
+																	type="button"
+																	data-library-header-action
+																	className={cn(
+																		"flex size-5 shrink-0 items-center justify-center rounded p-0.5 text-muted-foreground",
+																		"hover:bg-muted/60 hover:text-foreground",
+																		"focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring",
+																		"transition-opacity ease-out",
+																		chromeFadeClass,
+																	)}
+																	onClick={(e) => e.stopPropagation()}
+																	onMouseDown={(e) => e.stopPropagation()}
+																>
+																	<MoreHorizontal
+																		className="size-3.5"
+																		aria-hidden
+																	/>
+																</button>
+															</PopoverTrigger>
+															<PopoverContent
+																align="start"
+																className="w-40 p-1.5 text-xs"
+																onClick={(e) => e.stopPropagation()}
+															>
+																<button
+																	type="button"
+																	className="flex w-full items-center gap-1.5 rounded-md px-2 py-1.5 text-xs text-left hover:bg-muted"
+																	onClick={() => setRenamePropTarget(prop)}
+																>
+																	{t(
+																		"papersLibrary.customProperties.renameProperty",
+																	)}
+																</button>
+																<div className="my-0.5 border-t" />
+																<button
+																	type="button"
+																	className="flex w-full items-center gap-1.5 rounded-md px-2 py-1.5 text-xs text-destructive text-left hover:bg-destructive/10"
+																	onClick={() => setDeletePropTarget(prop)}
+																>
+																	{t(
+																		"papersLibrary.customProperties.deleteProperty",
+																	)}
+																</button>
+															</PopoverContent>
+														</Popover>
+													);
+												})()
+											: null}
 									</div>
+									{canCustomizeColumns ? (
+										<LibraryColumnResizeHandle
+											label={t("papersLibrary.resizeColumn", {
+												column: col.key.startsWith("prop:")
+													? meta.labelKey
+													: t(meta.labelKey),
+											})}
+											onResize={(width, commit) =>
+												onColumnResize(col.key, width, commit)
+											}
+										/>
+									) : null}
 								</th>
 							);
 						})}
+						<th className="w-9 min-w-9 p-0 text-center">
+							<div className="flex h-10 items-center justify-center">
+								<Tooltip>
+									<TooltipTrigger asChild>
+										<button
+											type="button"
+											onClick={() => setCreatePropOpen(true)}
+											className={cn(
+												"flex size-7 items-center justify-center rounded-md p-1 text-muted-foreground transition-colors hover:bg-muted/80 hover:text-foreground",
+												chromeFadeClass,
+											)}
+											aria-label={t(
+												"papersLibrary.customProperties.addProperty",
+											)}
+										>
+											<Plus className="size-3.5" />
+										</button>
+									</TooltipTrigger>
+									<TooltipContent side="bottom">
+										{t("papersLibrary.customProperties.addProperty")}
+									</TooltipContent>
+								</Tooltip>
+							</div>
+						</th>
 					</tr>
 				</thead>
 			</ContextMenuTrigger>
@@ -329,9 +546,16 @@ export const LibraryTableHeader = memo(function LibraryTableHeader({
 						onSelect={(e) => e.preventDefault()}
 						onCheckedChange={() => onToggleColumn(col.key)}
 					>
-						{t(COLUMN_META[col.key].labelKey)}
+						{col.key.startsWith("prop:")
+							? getColumnMeta(col.key).labelKey
+							: t(getColumnMeta(col.key).labelKey)}
 					</ContextMenuCheckboxItem>
 				))}
+				<ContextMenuSeparator />
+				<ContextMenuItem onSelect={() => setCreatePropOpen(true)}>
+					<Plus className="size-3.5 mr-1.5" />
+					{t("papersLibrary.customProperties.addProperty")}
+				</ContextMenuItem>
 				<ContextMenuSeparator />
 				<ContextMenuItem
 					disabled={!canCustomizeColumns}
@@ -340,6 +564,21 @@ export const LibraryTableHeader = memo(function LibraryTableHeader({
 					{t("papersLibrary.resetColumns")}
 				</ContextMenuItem>
 			</ContextMenuContent>
+			<CreatePropertyDialog
+				open={createPropOpen}
+				onOpenChange={setCreatePropOpen}
+				vaultPath={vaultPath}
+			/>
+			<RenamePropertyDialog
+				property={renamePropTarget}
+				open={Boolean(renamePropTarget)}
+				onOpenChange={(open) => !open && setRenamePropTarget(null)}
+			/>
+			<DeletePropertyDialog
+				property={deletePropTarget}
+				open={Boolean(deletePropTarget)}
+				onOpenChange={(open) => !open && setDeletePropTarget(null)}
+			/>
 		</ContextMenu>
 	);
 });

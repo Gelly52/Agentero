@@ -8,6 +8,7 @@ import {
 	detectPdfTextLinks,
 	excludeOverlappingPdfTextLinks,
 	getLinkDestination,
+	linkTargetUrl,
 } from "@/components/viewer/pdf/layers/citation-links";
 
 function dest(mode: PdfZoomMode, view: number[]): PdfDestinationObject {
@@ -45,7 +46,11 @@ describe("getLinkDestination", () => {
 			mode: PdfZoomMode.XYZ,
 			params: { x: 0, y: 500, zoom: 1 },
 		};
-		expect(getLinkDestination(target(d))).toEqual({ pageIndex: 2, pdfY: 500 });
+		expect(getLinkDestination(target(d))).toEqual({
+			pageIndex: 2,
+			pdfX: 0,
+			pdfY: 500,
+		});
 	});
 
 	it("reads /XYZ y from GoTo action", () => {
@@ -60,28 +65,45 @@ describe("getLinkDestination", () => {
 		};
 		expect(getLinkDestination(actionTarget(d))).toEqual({
 			pageIndex: 2,
+			pdfX: 0,
 			pdfY: 600,
 		});
 	});
 
-	it("reads /FitR top from view array", () => {
+	it("reads /FitR top and left from view array", () => {
 		const d = dest(PdfZoomMode.FitRectangle, [0, 10, 500, 800]);
-		expect(getLinkDestination(target(d))).toEqual({ pageIndex: 2, pdfY: 800 });
+		expect(getLinkDestination(target(d))).toEqual({
+			pageIndex: 2,
+			pdfX: 0,
+			pdfY: 800,
+		});
 	});
 
-	it("reads /FitH top from view array", () => {
+	it("reads /FitH top with no x anchor", () => {
 		const d = dest(PdfZoomMode.FitHorizontal, [750]);
-		expect(getLinkDestination(target(d))).toEqual({ pageIndex: 2, pdfY: 750 });
+		expect(getLinkDestination(target(d))).toEqual({
+			pageIndex: 2,
+			pdfX: null,
+			pdfY: 750,
+		});
 	});
 
 	it("falls back to pdfY 0 for page-only destinations", () => {
 		const d = dest(PdfZoomMode.FitPage, []);
-		expect(getLinkDestination(target(d))).toEqual({ pageIndex: 2, pdfY: 0 });
+		expect(getLinkDestination(target(d))).toEqual({
+			pageIndex: 2,
+			pdfX: null,
+			pdfY: 0,
+		});
 	});
 
 	it("falls back to pdfY 0 when /FitR view is incomplete", () => {
 		const d = dest(PdfZoomMode.FitRectangle, [0, 10]);
-		expect(getLinkDestination(target(d))).toEqual({ pageIndex: 2, pdfY: 0 });
+		expect(getLinkDestination(target(d))).toEqual({
+			pageIndex: 2,
+			pdfX: null,
+			pdfY: 0,
+		});
 	});
 });
 
@@ -252,6 +274,41 @@ describe("CitationLinkLayer", () => {
 		);
 
 		expect(html).toContain('aria-label="https://example.com"');
-		expect(html).toContain('title="https://example.com"');
+		expect(html).toContain('data-url="https://example.com"');
+		expect(html).not.toContain("title=");
+	});
+});
+
+describe("linkTargetUrl", () => {
+	it("returns null when the link has no external address", () => {
+		expect(linkTargetUrl(undefined)).toBeNull();
+		expect(
+			linkTargetUrl({
+				type: "action",
+				action: { type: PdfActionType.URI, uri: "   " },
+			}),
+		).toBeNull();
+	});
+
+	it("returns the full URI, including a long address", () => {
+		const url = `https://example.com/${"a".repeat(180)}`;
+		expect(
+			linkTargetUrl({
+				type: "action",
+				action: { type: PdfActionType.URI, uri: `  ${url}  ` },
+			}),
+		).toBe(url);
+	});
+
+	it("returns a launch path", () => {
+		expect(
+			linkTargetUrl({
+				type: "action",
+				action: {
+					type: PdfActionType.LaunchAppOrOpenFile,
+					path: "C:\\papers\\a.pdf",
+				},
+			}),
+		).toBe("C:\\papers\\a.pdf");
 	});
 });

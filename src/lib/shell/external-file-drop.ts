@@ -1,20 +1,23 @@
 /**
- * OS file drops on the webview. `dragDropEnabled: false` so HTML5 DnD
- * stays available (Windows WebView2 otherwise swallows it). Path-less
- * File bytes are staged via Host `paper_stage_import_file` into
- * `~/.agentero/import-tmp/`. Tauri `onDragDropEvent` is a no-op extra
- * if a platform still emits it.
+ * OS file drops on the webview. Windows/macOS use `dragDropEnabled: false`
+ * so HTML5 DnD stays available (Windows WebView2 otherwise swallows it).
+ * Linux enables native GTK file paths. Path-less File bytes are staged via
+ * Host `paper_stage_import_file` into
+ * `~/.agentero/import-tmp/`. Tauri `onDragDropEvent` supplies the native-path
+ * fallback on platforms whose WebView does not forward Finder drops as DOM
+ * `DataTransfer` events.
  *
  * Without preventDefault, dropping a PDF can navigate the webview to the
  * native viewer and freeze the SPA.
  */
 
+import { commands } from "@/lib/core/bindings";
 import { errorText } from "@/lib/core/error";
 import {
 	dataTransferLooksLikeOsFiles,
 	hasPdfExtension,
 } from "@/lib/core/file-accept";
-import { invokeApi } from "@/lib/core/ipc";
+import { callApi } from "@/lib/core/ipc";
 import { basenameOf } from "@/lib/core/path";
 import { isTauri } from "@/lib/core/tauri";
 
@@ -25,6 +28,19 @@ export type ResolvedDropPdf = {
 	/** Original filename for title/id defaults (e.g. `Attention.pdf`). */
 	sourceName: string;
 };
+
+/** Normalize and deduplicate native paths before handing them to import. */
+export function pdfsFromPaths(paths: readonly string[]): ResolvedDropPdf[] {
+	const out: ResolvedDropPdf[] = [];
+	const seen = new Set<string>();
+	for (const raw of paths) {
+		const path = normalizeDroppedPath(raw);
+		if (!path || !isPdfFileName(path) || seen.has(path)) continue;
+		seen.add(path);
+		out.push({ path, sourceName: basenameOf(path) });
+	}
+	return out;
+}
 
 /** True when the drag payload includes OS files (not in-app text/plain moves). */
 export function dataTransferHasFiles(dt: DataTransfer | null): boolean {
@@ -289,12 +305,12 @@ async function stageImportBytes(
 	bytes: Uint8Array,
 ): Promise<string> {
 	const contentBase64 = uint8ToBase64(bytes);
-	const result = await invokeApi<{ path: string }>("paper_stage_import_file", {
-		args: {
+	const result = await callApi(() =>
+		commands.paperStageImportFile({
 			fileName: fileName || "drop.pdf",
 			contentBase64,
-		},
-	});
+		}),
+	);
 	if (!result.path) {
 		throw new Error("stage import failed");
 	}
@@ -312,7 +328,7 @@ function uint8ToBase64(bytes: Uint8Array): string {
 	return btoa(binary);
 }
 
-function normalizeDroppedPath(raw: string): string | null {
+export function normalizeDroppedPath(raw: string): string | null {
 	const s = raw.trim();
 	if (!s) return null;
 	if (/^file:\/\//i.test(s)) {

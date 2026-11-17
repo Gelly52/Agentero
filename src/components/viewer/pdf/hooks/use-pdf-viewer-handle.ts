@@ -19,6 +19,8 @@ import {
 	useEffect,
 	useRef,
 } from "react";
+import { useTranslation } from "react-i18next";
+import { toast } from "sonner";
 import type {
 	LayoutAnalysisTask,
 	StartLayoutAnalysisOptions,
@@ -28,12 +30,19 @@ import type {
 	PdfViewerHandle,
 	PdfViewerProps,
 } from "@/components/viewer/pdf/types";
+import { errorText } from "@/lib/core/error";
+import { notifyError, notifySuccess } from "@/lib/core/notify";
+import { isTauri } from "@/lib/core/tauri";
 import type { PdfVisualSessionTrace } from "@/lib/pdf/agent-trace";
 import { deletePdfAskThread, type PdfAskThread } from "@/lib/pdf/ask";
-import { isHighlightObject } from "@/lib/pdf/highlight/annotation-store";
+import {
+	isLiveAnnotation,
+	isTextMarkupObject,
+} from "@/lib/pdf/highlight/annotation-store";
 import type { PdfHighlight } from "@/lib/pdf/highlight/types";
 import { setFocusedLayoutRegion } from "@/lib/pdf/layout";
-import type { ActiveSelectionCard } from "@/lib/pdf/selection";
+import { planVisualTraceJump } from "@/lib/pdf/visual-trace-jump";
+import { writeVaultBytes } from "@/lib/vault/fs";
 
 /** Longest edge of a figure-rail thumbnail crop (px). */
 const REGION_THUMBNAIL_MAX_EDGE = 360;
@@ -49,9 +58,12 @@ type DocumentManagerCapability = ReturnType<
 type ScrollCapability = ReturnType<typeof useScroll>["provides"];
 
 export type UsePdfViewerHandleOptions = {
+	goToRegion: PdfViewerHandle["scrollToLayoutRegion"];
 	docId: string;
 	/** Sidecar root; deleting an ask also removes its `marks/<id>.json`. */
 	paperAbsPath: string | null;
+	/** Default file name (no extension) for the exported annotated PDF. */
+	defaultExportName: string;
 	/** Parent callback, often an inline lambda — kept in a ref. */
 	onHandle: PdfViewerProps["onHandle"];
 	/** EmbedPDF capability; owned by `PdfViewerInner` (plugin context). */
@@ -72,14 +84,19 @@ export type UsePdfViewerHandleOptions = {
 	>;
 	openEditorForAnnotation: (id: string) => void;
 	openThread: (thread: PdfAskThread) => void;
-	openCard: (card: ActiveSelectionCard) => void;
 	deleteVisualTraceById: (id: string) => void;
+	/** Highlight deletion coordinated with any in-flight commit for the same uid. */
+	deleteHighlightAnnotation: (pageIndex: number, id: string) => void;
 	toggleRegionSelect: () => void;
+	/** Dual-pane-aware full-text translate toggle; parent callback — kept in a ref. */
+	toggleLayoutTranslate: () => void;
 };
 
 export function usePdfViewerHandle({
+	goToRegion,
 	docId,
 	paperAbsPath,
+	defaultExportName,
 	onHandle,
 	annotationCap,
 	scrollRef,
@@ -93,12 +110,22 @@ export function usePdfViewerHandle({
 	startLayoutAnalysisRef,
 	openEditorForAnnotation,
 	openThread,
-	openCard,
 	deleteVisualTraceById,
+	deleteHighlightAnnotation,
 	toggleRegionSelect,
+	toggleLayoutTranslate,
 }: UsePdfViewerHandleOptions): void {
+	const { t } = useTranslation("viewer");
+	const goToRegionRef = useRef(goToRegion);
+	goToRegionRef.current = goToRegion;
 	const onHandleRef = useRef(onHandle);
 	onHandleRef.current = onHandle;
+	// Dual-pane deps (translation-tab callback) churn per render; mirror the
+	// latest callback so the handle object never needs re-registering.
+	const toggleLayoutTranslateRef = useRef(toggleLayoutTranslate);
+	toggleLayoutTranslateRef.current = toggleLayoutTranslate;
+	const defaultExportNameRef = useRef(defaultExportName);
+	defaultExportNameRef.current = defaultExportName;
 
 	// biome-ignore lint/correctness/useExhaustiveDependencies: the injected refs and setters are stable identities; depending on them would re-register the handle on every mark change.
 	useEffect(() => {
@@ -107,10 +134,10 @@ export function usePdfViewerHandle({
 		const handle: PdfViewerHandle = {
 			getHighlights: () => highlightsRef.current,
 			scrollToHighlight: (id) => {
-				const obj = annotationCap
-					?.forDocument(docId)
-					.getAnnotationById(id)?.object;
-				if (!obj || !isHighlightObject(obj)) return;
+				const tracked = annotationCap?.forDocument(docId).getAnnotationById(id);
+				if (!tracked || !isLiveAnnotation(tracked)) return;
+				const obj = tracked.object;
+				if (!isTextMarkupObject(obj)) return;
 				// Instant: smooth jumps across distant pages feel like slow render.
 				scrollRef.current?.scrollToPage({
 					pageNumber: obj.pageIndex + 1,
@@ -120,11 +147,10 @@ export function usePdfViewerHandle({
 			},
 			editComment: (id) => openEditorForAnnotation(id),
 			deleteHighlight: (id) => {
-				const obj = annotationCap
-					?.forDocument(docId)
-					.getAnnotationById(id)?.object;
-				if (obj && isHighlightObject(obj))
-					annotationCap?.forDocument(docId).deleteAnnotation(obj.pageIndex, id);
+				const tracked = annotationCap?.forDocument(docId).getAnnotationById(id);
+				if (tracked && isTextMarkupObject(tracked.object)) {
+					deleteHighlightAnnotation(tracked.object.pageIndex, id);
+				}
 			},
 			scrollToAsk: (id) => {
 				const thread = threadsRef.current.find((th) => th.id === id);
@@ -143,16 +169,41 @@ export function usePdfViewerHandle({
 			scrollToVisualTrace: (id) => {
 				const tr = visualTracesRef.current.find((item) => item.id === id);
 				if (!tr) return;
+				const page =
+					docCapRef.current?.getDocument(docId)?.pages[
+						Math.max(0, tr.page - 1)
+					];
+				const plan = planVisualTraceJump(tr, page?.size);
+				// Locate only. The floating transcript card stays on the pin click.
 				scrollRef.current?.scrollToPage({
-					pageNumber: tr.page,
+					pageNumber: plan.pageNumber,
 					behavior: "instant",
+					...(plan.pageCoordinates
+						? {
+								pageCoordinates: plan.pageCoordinates,
+								alignX: 0,
+								alignY: 18,
+							}
+						: {}),
 				});
-				openCard({ kind: "visual", id: tr.id });
+				if (plan.bbox) {
+					setFocusedLayoutRegion(
+						docId,
+						tr.id,
+						{
+							pageIndex: plan.pageIndex,
+							bbox: plan.bbox,
+							kind: "image",
+						},
+						{ flash: true },
+					);
+				}
 			},
 			deleteVisualTrace: (id) => {
 				deleteVisualTraceById(id);
 			},
 			toggleVisualAnnotation: toggleRegionSelect,
+			toggleLayoutTranslate: () => toggleLayoutTranslateRef.current(),
 			analyzeLayout: () => {
 				// Prefer source/layout.json → merge → sidebar. Full ONNX (PDF→JSON)
 				// only when there is no sidecar (or force is set elsewhere).
@@ -164,13 +215,7 @@ export function usePdfViewerHandle({
 					notifyOnError: true,
 				});
 			},
-			scrollToLayoutRegion: (region) => {
-				scrollRef.current?.scrollToPage({
-					pageNumber: region.pageIndex + 1,
-					behavior: "instant",
-				});
-				setFocusedLayoutRegion(docId, region.id);
-			},
+			scrollToLayoutRegion: (region) => goToRegionRef.current(region),
 			renderRegion: async ({ pageIndex, bbox, maxEdgePx }) => {
 				const eng = engineRef.current;
 				const docs = docCapRef.current;
@@ -192,6 +237,46 @@ export function usePdfViewerHandle({
 					return null;
 				}
 			},
+			exportAnnotatedPdf: async () => {
+				if (!isTauri()) {
+					notifyError(t("pdf.exportDesktopOnly"));
+					return;
+				}
+				const engine = engineRef.current;
+				const docCap = docCapRef.current;
+				if (!engine || !docCap) return;
+				const document = docCap.getDocument(docId);
+				if (!document) return;
+
+				let path: string | null;
+				try {
+					const { save } = await import("@tauri-apps/plugin-dialog");
+					path = await save({
+						defaultPath: `${defaultExportNameRef.current}.pdf`,
+						filters: [{ name: "PDF", extensions: ["pdf"] }],
+					});
+				} catch (error) {
+					notifyError(errorText(error));
+					return;
+				}
+				if (!path) return;
+
+				const exportingToast = toast.loading(t("pdf.exportingAnnotatedPdf"));
+				try {
+					const scope = annotationCap?.forDocument(docId);
+					if (scope) {
+						await scope.commit().toPromise();
+					}
+					const buffer = await engine.saveAsCopy(document).toPromise();
+					await writeVaultBytes(path, new Uint8Array(buffer));
+					notifySuccess(t("pdf.exportAnnotatedPdfSaved"), {
+						id: exportingToast,
+					});
+				} catch (error) {
+					toast.dismiss(exportingToast);
+					notifyError(errorText(error) || t("pdf.exportAnnotatedPdfFailed"));
+				}
+			},
 		};
 		register(handle);
 		return () => {
@@ -208,8 +293,8 @@ export function usePdfViewerHandle({
 		paperAbsPath,
 		openEditorForAnnotation,
 		openThread,
-		openCard,
 		deleteVisualTraceById,
+		deleteHighlightAnnotation,
 		toggleRegionSelect,
 	]);
 }

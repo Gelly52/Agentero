@@ -2,14 +2,16 @@ import {
 	Bot,
 	CloudUpload,
 	Compass,
+	FlaskConical,
 	Info,
 	Keyboard,
 	Languages,
 	LayoutTemplate,
-	MonitorSmartphone,
 	Paintbrush,
 	SlidersHorizontal,
+	Smartphone,
 	Stethoscope,
+	UserRound,
 	Wand2,
 	X,
 } from "lucide-react";
@@ -17,6 +19,7 @@ import {
 	Fragment,
 	lazy,
 	memo,
+	type KeyboardEvent as ReactKeyboardEvent,
 	Suspense,
 	useCallback,
 	useEffect,
@@ -31,13 +34,14 @@ import type {
 	SettingsSection,
 } from "@/components/settings/types";
 import { Button } from "@/components/ui/button";
+import { accountSurfaceEnabled } from "@/features/account/visibility";
+import { scrollBehavior } from "@/lib/core/motion";
 import { cn } from "@/lib/core/utils";
 import {
 	broadcastOnboardingRequest,
 	broadcastTourRequest,
 } from "@/lib/onboarding/api";
 import type { AppSettings } from "@/lib/settings";
-import { patchSettings } from "@/lib/settings/react-store";
 import { closeSettingsWindow } from "@/lib/shell/settings-window";
 import {
 	getRemoteSessionMeta,
@@ -51,11 +55,13 @@ import {
 // the shell (see `preloadSettingsPane`), so only the sections you actually visit
 // pay for a chunk — a lazy default pane would just move the stall after render.
 const PANE_LOADERS = {
+	account: () => import("@/components/settings/panes/account-pane"),
 	general: () => import("@/components/settings/panes/general-pane"),
 	appearance: () => import("@/components/settings/panes/appearance-pane"),
 	agent: () => import("@/components/settings/panes/agent-pane"),
 	translate: () => import("@/components/settings/panes/translate-pane"),
 	layout: () => import("@/components/settings/panes/layout-pane"),
+	experimental: () => import("@/components/settings/panes/experimental-pane"),
 	doctor: () => import("@/components/settings/panes/doctor-pane"),
 	keyboard: () => import("@/components/settings/panes/keyboard-pane"),
 	"remote-access": () =>
@@ -68,13 +74,25 @@ const PANE_LOADERS = {
  * Warm the chunk for `section` before the shell renders. Module promises are
  * cached, so the matching `lazy()` below resolves without a second request.
  */
+function sectionVisible(id: SettingsSection): boolean {
+	if (!accountSurfaceEnabled && id === "account") return false;
+	return true;
+}
+
 export function preloadSettingsPane(section: string): Promise<unknown> {
-	const load = PANE_LOADERS[section as SettingsSection] ?? PANE_LOADERS.general;
+	const requested = sectionVisible(section as SettingsSection)
+		? section
+		: "general";
+	const load =
+		PANE_LOADERS[requested as SettingsSection] ?? PANE_LOADERS.general;
 	return load();
 }
 
 // memo(): visited panes stay mounted across section switches; without this
 // every switch re-rendered ALL mounted panes (agent pane is ~1.5k lines).
+const AccountPane = memo(
+	lazy(() => PANE_LOADERS.account().then((m) => ({ default: m.AccountPane }))),
+);
 const GeneralPane = memo(
 	lazy(() => PANE_LOADERS.general().then((m) => ({ default: m.GeneralPane }))),
 );
@@ -98,6 +116,13 @@ const TranslatePane = memo(
 );
 const LayoutPane = memo(
 	lazy(() => PANE_LOADERS.layout().then((m) => ({ default: m.LayoutPane }))),
+);
+const ExperimentalPane = memo(
+	lazy(() =>
+		PANE_LOADERS.experimental().then((m) => ({
+			default: m.ExperimentalPane,
+		})),
+	),
 );
 const DoctorPane = memo(
 	lazy(() => PANE_LOADERS.doctor().then((m) => ({ default: m.DoctorPane }))),
@@ -126,13 +151,15 @@ const NAV: {
 	icon: typeof Bot;
 	dividerBefore?: boolean;
 }[] = [
+	{ id: "account", icon: UserRound },
 	{ id: "general", icon: SlidersHorizontal },
 	{ id: "appearance", icon: Paintbrush },
 	{ id: "agent", icon: Bot, dividerBefore: true },
 	{ id: "translate", icon: Languages },
 	{ id: "layout", icon: LayoutTemplate },
-	{ id: "remote-access", icon: MonitorSmartphone },
+	{ id: "remote-access", icon: Smartphone },
 	{ id: "sync", icon: CloudUpload },
+	{ id: "experimental", icon: FlaskConical },
 	{ id: "doctor", icon: Stethoscope, dividerBefore: true },
 	{ id: "keyboard", icon: Keyboard },
 	{ id: "about", icon: Info },
@@ -169,19 +196,29 @@ export function SettingsContent({
 	const { t } = useTranslation(["settings", "common"]);
 	const fallbackTitleId = useId();
 	const headingId = titleId ?? fallbackTitleId;
+	const navItems = useMemo(
+		() => NAV.filter((item) => sectionVisible(item.id)),
+		[],
+	);
+	const activeSection =
+		sectionVisible(section) && section in PANE_LOADERS ? section : "general";
+
+	useEffect(() => {
+		if (activeSection !== section) onSectionChange(activeSection);
+	}, [activeSection, onSectionChange, section]);
 
 	// Keep visited panes mounted (hidden when inactive) so switching sections
 	// doesn't unmount/remount them — avoids re-running their load effects
 	// (agent list, connector status, cache stats, dynamic imports) and makes
 	// section switches instant instead of re-fetching on every visit.
 	const [visitedSections, setVisitedSections] = useState<SettingsSection[]>([
-		section,
+		activeSection,
 	]);
 	useEffect(() => {
 		setVisitedSections((prev) =>
-			prev.includes(section) ? prev : [...prev, section],
+			prev.includes(activeSection) ? prev : [...prev, activeSection],
 		);
-	}, [section]);
+	}, [activeSection]);
 
 	// Warm every pane chunk in the background shortly after the window opens.
 	// Only the initial section is preloaded at boot; without this, the FIRST
@@ -191,7 +228,9 @@ export function SettingsContent({
 	// contends with the main window.
 	useEffect(() => {
 		let cancelled = false;
-		const sections = Object.keys(PANE_LOADERS) as SettingsSection[];
+		const sections = (Object.keys(PANE_LOADERS) as SettingsSection[]).filter(
+			(id) => sectionVisible(id),
+		);
 		let i = 0;
 		let timer: ReturnType<typeof setTimeout> | null = null;
 		const warmNext = () => {
@@ -208,10 +247,45 @@ export function SettingsContent({
 		};
 	}, []);
 	const contentScrollRef = useRef<HTMLDivElement>(null);
+	const navListRef = useRef<HTMLUListElement>(null);
+	const navItemRefs = useRef<
+		Partial<Record<SettingsSection, HTMLButtonElement>>
+	>({});
+	const [navIndicator, setNavIndicator] = useState<{
+		top: number;
+		height: number;
+	} | null>(null);
+
 	// biome-ignore lint/correctness/useExhaustiveDependencies: section intentionally triggers a scroll-to-top on switch
 	useEffect(() => {
-		contentScrollRef.current?.scrollTo({ top: 0 });
-	}, [section]);
+		contentScrollRef.current?.scrollTo({ top: 0, behavior: scrollBehavior() });
+	}, [activeSection]);
+
+	// Slide the sidebar highlight to the active item (motion-17).
+	const measureNavIndicator = useCallback(() => {
+		const list = navListRef.current;
+		const btn = navItemRefs.current[activeSection];
+		if (!list || !btn) return;
+		const listRect = list.getBoundingClientRect();
+		const btnRect = btn.getBoundingClientRect();
+		setNavIndicator({
+			top: btnRect.top - listRect.top + list.scrollTop,
+			height: btnRect.height,
+		});
+	}, [activeSection]);
+
+	useEffect(() => {
+		measureNavIndicator();
+		const list = navListRef.current;
+		if (!list) return;
+		const onScroll = () => measureNavIndicator();
+		list.addEventListener("scroll", onScroll, { passive: true });
+		window.addEventListener("resize", measureNavIndicator);
+		return () => {
+			list.removeEventListener("scroll", onScroll);
+			window.removeEventListener("resize", measureNavIndicator);
+		};
+	}, [measureNavIndicator]);
 
 	const hostContext = useMemo((): SettingsHostContext => {
 		if (vaultPath && isRemoteVaultHandle(vaultPath)) {
@@ -248,17 +322,54 @@ export function SettingsContent({
 		[onChange, settings],
 	);
 
+	const selectSection = useCallback(
+		(id: SettingsSection) => {
+			onSectionChange(id);
+		},
+		[onSectionChange],
+	);
+
+	const onNavItemKeyDown = useCallback(
+		(
+			event: ReactKeyboardEvent<HTMLButtonElement>,
+			current: SettingsSection,
+		) => {
+			const ids = navItems.map((item) => item.id);
+			const index = ids.indexOf(current);
+			if (index < 0) return;
+			let next = index;
+			if (event.key === "ArrowDown" || event.key === "ArrowRight") {
+				next = Math.min(ids.length - 1, index + 1);
+			} else if (event.key === "ArrowUp" || event.key === "ArrowLeft") {
+				next = Math.max(0, index - 1);
+			} else if (event.key === "Home") {
+				next = 0;
+			} else if (event.key === "End") {
+				next = ids.length - 1;
+			} else {
+				return;
+			}
+			if (next === index) return;
+			event.preventDefault();
+			const id = ids[next];
+			selectSection(id);
+			navItemRefs.current[id]?.focus();
+		},
+		[navItems, selectSection],
+	);
+
 	return (
 		<>
-			{/* Sidebar — macOS Settings style */}
-			<nav className="flex w-[180px] shrink-0 flex-col border-r bg-muted/40">
+			{/* Sidebar — macOS System Settings weight (heavier material). */}
+			<nav
+				data-settings-sidebar
+				className="flex w-12 sm:w-[11.5rem] shrink-0 select-none flex-col border-r border-sidebar-border bg-sidebar text-sidebar-foreground"
+				aria-label={t("title")}
+			>
 				{/* Modal fallback only: native window already shows the title in its title bar. */}
 				{onClose ? (
 					<div className="flex items-center justify-between gap-1 px-3 pt-3 pb-2">
-						<span
-							id={headingId}
-							className="font-semibold text-[13px] leading-none tracking-tight"
-						>
+						<span id={headingId} className="font-semibold text-sm leading-none">
 							{t("title")}
 						</span>
 						<Button
@@ -274,33 +385,64 @@ export function SettingsContent({
 					</div>
 				) : null}
 				<ul
+					ref={navListRef}
 					className={cn(
-						"agentero-scroll flex min-h-0 flex-1 flex-col gap-0.5 px-2 pb-2",
+						"agentero-scroll relative flex min-h-0 flex-1 flex-col gap-0.5 overscroll-y-contain px-2 pb-2",
 						!onClose && "pt-3",
 					)}
 				>
-					{NAV.map((item) => {
+					{navIndicator ? (
+						<span
+							aria-hidden
+							className="pointer-events-none absolute inset-x-2 top-0 z-0 rounded-md bg-sidebar-primary transition-[transform,height] duration-[var(--motion-duration-fast)] ease-[var(--motion-ease-out)] motion-reduce:transition-none will-change-transform"
+							style={{
+								height: navIndicator.height,
+								transform: `translate3d(0, ${navIndicator.top}px, 0)`,
+							}}
+						/>
+					) : null}
+					{navItems.map((item) => {
 						const Icon = item.icon;
-						const active = section === item.id;
+						const active = activeSection === item.id;
 						return (
 							<Fragment key={item.id}>
 								{item.dividerBefore ? (
-									<li aria-hidden className="mx-1 my-1 border-t" />
+									<li
+										aria-hidden
+										className="relative z-10 mx-1 my-1.5 border-t border-sidebar-border/80"
+									/>
 								) : null}
-								<li>
+								<li className="relative z-10">
 									<button
+										id={`settings-nav-${item.id}`}
+										ref={(el) => {
+											if (el) navItemRefs.current[item.id] = el;
+											else delete navItemRefs.current[item.id];
+										}}
 										type="button"
-										className={cn(
-											"flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-[13px] outline-none transition-colors",
-											"hover:bg-black/5 dark:hover:bg-white/10",
-											active &&
-												"bg-primary text-primary-foreground hover:bg-primary dark:hover:bg-primary",
-										)}
 										aria-current={active ? "page" : undefined}
-										onClick={() => onSectionChange(item.id)}
+										className={cn(
+											"flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-sm outline-none",
+											"transition-[color,background-color,transform,opacity] duration-[var(--motion-duration-micro)] ease-[var(--motion-ease-out)]",
+											"focus-visible:ring-2 focus-visible:ring-sidebar-ring/60 focus-visible:ring-offset-1 focus-visible:ring-offset-sidebar",
+											"active:scale-[0.98]",
+											active
+												? "font-medium text-sidebar-primary-foreground"
+												: "text-sidebar-foreground/90 hover:bg-sidebar-accent/70 hover:text-sidebar-accent-foreground",
+										)}
+										onClick={() => selectSection(item.id)}
+										onKeyDown={(event) => onNavItemKeyDown(event, item.id)}
 									>
-										<Icon className="size-3.5 shrink-0 opacity-90" />
-										<span className="truncate">{t(`nav.${item.id}`)}</span>
+										<Icon
+											className={cn(
+												"size-3.5 shrink-0",
+												active ? "opacity-100" : "opacity-75",
+											)}
+											aria-hidden
+										/>
+										<span className="truncate max-sm:sr-only">
+											{t(`nav.${item.id}`)}
+										</span>
 									</button>
 								</li>
 							</Fragment>
@@ -309,44 +451,51 @@ export function SettingsContent({
 				</ul>
 
 				{/* Sidebar footer: replay the first-run wizard / feature tour. */}
-				<div className="flex flex-col gap-1.5 border-t px-2 py-2">
+				<div className="flex flex-col gap-1.5 border-t border-sidebar-border px-2 py-2">
 					<Button
 						type="button"
 						variant="outline"
 						size="sm"
-						className="w-full"
+						className="w-full border-sidebar-border bg-sidebar/40 hover:bg-sidebar-accent"
 						onClick={() => {
-							patchSettings({ onboardingDone: false });
 							broadcastOnboardingRequest();
 							closeSettingsWindow();
 						}}
 					>
 						<Wand2 data-icon="inline-start" />
-						{t("nav.quickSetup")}
+						<span className="max-sm:sr-only">{t("nav.quickSetup")}</span>
 					</Button>
 					<Button
 						type="button"
 						variant="outline"
 						size="sm"
-						className="w-full"
+						className="w-full border-sidebar-border bg-sidebar/40 hover:bg-sidebar-accent"
 						onClick={() => {
 							broadcastTourRequest();
 							closeSettingsWindow();
 						}}
 					>
 						<Compass data-icon="inline-start" />
-						{t("nav.featureTour")}
+						<span className="max-sm:sr-only">{t("nav.featureTour")}</span>
 					</Button>
 				</div>
 			</nav>
 
 			{/* Content */}
-			<div ref={contentScrollRef} className="agentero-scroll min-w-0 flex-1">
-				<div className="px-6 py-5">
+			<div
+				ref={contentScrollRef}
+				data-settings-content
+				className="agentero-scroll min-w-0 flex-1 overscroll-y-contain bg-background"
+			>
+				<div className="px-3 py-5 sm:px-6">
 					{/* One boundary per pane: a section still loading must not blank out
 					    the panes already visited and kept mounted next to it. */}
 					{visitedSections.includes("general") && (
-						<div hidden={section !== "general"}>
+						<div
+							data-settings-pane
+							data-active={activeSection === "general" ? "true" : "false"}
+							hidden={activeSection !== "general"}
+						>
 							<Suspense fallback={<PaneFallback />}>
 								<GeneralPane
 									settings={settings}
@@ -358,26 +507,37 @@ export function SettingsContent({
 						</div>
 					)}
 					{visitedSections.includes("appearance") && (
-						<div hidden={section !== "appearance"}>
+						<div
+							data-settings-pane
+							data-active={activeSection === "appearance" ? "true" : "false"}
+							hidden={activeSection !== "appearance"}
+						>
 							<Suspense fallback={<PaneFallback />}>
 								<AppearancePane
 									theme={settings.theme}
 									uiTheme={settings.uiTheme}
 									locale={settings.locale}
 									uiScale={settings.uiScale}
+									soundEnabled={settings.soundEnabled}
 									editorFontSize={settings.editorFontSize}
 									interfaceFontFamily={settings.interfaceFontFamily}
 									textFontFamily={settings.textFontFamily}
 									monoFontFamily={settings.monoFontFamily}
 									editorLineHeight={settings.editorLineHeight}
 									showEditorToolbar={settings.showEditorToolbar}
+									wikiEmbedFontSize={settings.wikiEmbedFontSize}
+									markdownMaxWidth={settings.markdownMaxWidth}
 									patch={patch}
 								/>
 							</Suspense>
 						</div>
 					)}
 					{visitedSections.includes("agent") && (
-						<div hidden={section !== "agent"}>
+						<div
+							data-settings-pane
+							data-active={activeSection === "agent" ? "true" : "false"}
+							hidden={activeSection !== "agent"}
+						>
 							<Suspense fallback={<PaneFallback />}>
 								{hostContext.kind === "remote" ? (
 									<RemoteAgentPane
@@ -386,16 +546,25 @@ export function SettingsContent({
 										hostContext={hostContext}
 									/>
 								) : (
-									<AgentPane settings={settings} patch={patch} />
+									<AgentPane
+										settings={settings}
+										patch={patch}
+										onOpenDiagnostics={() => onSectionChange("doctor")}
+									/>
 								)}
 							</Suspense>
 						</div>
 					)}
 					{visitedSections.includes("translate") && (
-						<div hidden={section !== "translate"}>
+						<div
+							data-settings-pane
+							data-active={activeSection === "translate" ? "true" : "false"}
+							hidden={activeSection !== "translate"}
+						>
 							<Suspense fallback={<PaneFallback />}>
 								<TranslatePane
 									settings={settings}
+									vaultPath={vaultPath}
 									patch={patch}
 									onOpenAgentSettings={() => onSectionChange("agent")}
 								/>
@@ -403,42 +572,97 @@ export function SettingsContent({
 						</div>
 					)}
 					{visitedSections.includes("layout") && (
-						<div hidden={section !== "layout"}>
+						<div
+							data-settings-pane
+							data-active={activeSection === "layout" ? "true" : "false"}
+							hidden={activeSection !== "layout"}
+						>
 							<Suspense fallback={<PaneFallback />}>
-								<LayoutPane settings={settings} patch={patch} />
+								<LayoutPane
+									settings={settings}
+									patch={patch}
+									vaultPath={vaultPath}
+									hostContext={hostContext}
+								/>
 							</Suspense>
 						</div>
 					)}
 					{visitedSections.includes("doctor") && (
-						<div hidden={section !== "doctor"}>
+						<div
+							data-settings-pane
+							data-active={activeSection === "doctor" ? "true" : "false"}
+							hidden={activeSection !== "doctor"}
+						>
 							<Suspense fallback={<PaneFallback />}>
 								<DoctorPane vaultPath={vaultPath} hostContext={hostContext} />
 							</Suspense>
 						</div>
 					)}
-					{visitedSections.includes("keyboard") && (
-						<div hidden={section !== "keyboard"}>
+					{activeSection === "keyboard" && (
+						<div
+							data-settings-pane
+							data-active={activeSection === "keyboard" ? "true" : "false"}
+							hidden={activeSection !== "keyboard"}
+						>
 							<Suspense fallback={<PaneFallback />}>
-								<KeyboardPane />
+								<KeyboardPane
+									settings={settings}
+									shortcutOverrides={settings.shortcutOverrides}
+									patch={patch}
+								/>
 							</Suspense>
 						</div>
 					)}
 					{visitedSections.includes("remote-access") && (
-						<div hidden={section !== "remote-access"}>
+						<div
+							data-settings-pane
+							data-active={activeSection === "remote-access" ? "true" : "false"}
+							hidden={activeSection !== "remote-access"}
+						>
 							<Suspense fallback={<PaneFallback />}>
 								<RemoteAccessPane vaultPath={vaultPath} />
 							</Suspense>
 						</div>
 					)}
 					{visitedSections.includes("sync") && (
-						<div hidden={section !== "sync"}>
+						<div
+							data-settings-pane
+							data-active={activeSection === "sync" ? "true" : "false"}
+							hidden={activeSection !== "sync"}
+						>
 							<Suspense fallback={<PaneFallback />}>
 								<SyncPane vaultPath={vaultPath} />
 							</Suspense>
 						</div>
 					)}
+					{visitedSections.includes("experimental") && (
+						<div
+							data-settings-pane
+							data-active={activeSection === "experimental" ? "true" : "false"}
+							hidden={activeSection !== "experimental"}
+						>
+							<Suspense fallback={<PaneFallback />}>
+								<ExperimentalPane settings={settings} patch={patch} />
+							</Suspense>
+						</div>
+					)}
+					{visitedSections.includes("account") && (
+						<div
+							data-settings-pane
+							data-active={activeSection === "account" ? "true" : "false"}
+							hidden={activeSection !== "account"}
+						>
+							<Suspense fallback={<PaneFallback />}>
+								<AccountPane />
+							</Suspense>
+						</div>
+					)}
 					{visitedSections.includes("about") && (
-						<div hidden={section !== "about"}>
+						<div
+							data-settings-pane
+							data-active={activeSection === "about" ? "true" : "false"}
+							hidden={activeSection !== "about"}
+						>
 							<Suspense fallback={<PaneFallback />}>
 								<AboutPane />
 							</Suspense>

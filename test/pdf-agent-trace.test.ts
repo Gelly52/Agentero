@@ -1,17 +1,21 @@
 import { beforeEach, describe, expect, it } from "vitest";
 
 import {
+	activateVisualDraftSession,
 	addVisualDraft,
+	clearVisualDraftSession,
 	clearVisualDrafts,
 	consumeVisualDrafts,
 	currentVisualDrafts,
 	groupVisualDraftsByPaper,
+	rebindVisualDraftSession,
 	removeVisualDraft,
+	takeVisualDrafts,
 	updateVisualDraftComment,
-	visualContextStore,
 } from "@/lib/agent/visual-context-store";
 import {
 	beginTraceContinue,
+	bindVisualTracesForTurn,
 	buildChatLinesFromVisualTrace,
 	buildVisualAnnotationsPrompt,
 	buildVisualTraceContinuePrompt,
@@ -47,7 +51,8 @@ const image = { data: "aaa", mimeType: "image/png" };
 
 describe("visual-context-store", () => {
 	beforeEach(() => {
-		visualContextStore.setState({ drafts: [] });
+		clearVisualDrafts();
+		activateVisualDraftSession("");
 	});
 
 	it("adds, updates, removes, and consumes drafts", () => {
@@ -77,6 +82,29 @@ describe("visual-context-store", () => {
 		const consumed = consumeVisualDrafts();
 		expect(consumed).toHaveLength(1);
 		expect(currentVisualDrafts()).toHaveLength(0);
+	});
+
+	it("takes only the requested drafts and leaves the rest", () => {
+		const a = addVisualDraft({
+			paperPath: "papers/a",
+			page: 1,
+			rects: [rect],
+			comment: "a",
+			image,
+		});
+		const b = addVisualDraft({
+			paperPath: "papers/a",
+			page: 2,
+			rects: [rect],
+			comment: "b",
+			image,
+		});
+		expect(
+			takeVisualDrafts([b.id, "missing"]).map((draft) => draft.id),
+		).toEqual([b.id]);
+		expect(currentVisualDrafts().map((draft) => draft.id)).toEqual([a.id]);
+		expect(takeVisualDrafts([])).toEqual([]);
+		expect(currentVisualDrafts().map((draft) => draft.id)).toEqual([a.id]);
 	});
 
 	it("clearVisualDrafts drops without returning items", () => {
@@ -121,6 +149,45 @@ describe("visual-context-store", () => {
 		expect(c.id).toBe("custom-id");
 	});
 
+	it("keeps one entry per mark id when the same crop is re-added", () => {
+		// "Add to sidebar chat" passes the mark id, so a second click on the same
+		// comment card must refresh the queued entry, not stack an identical chip
+		// that shares its React key and gets removed along with it.
+		addVisualDraft({
+			id: "mark-a",
+			paperPath: "papers/a",
+			page: 2,
+			rects: [rect],
+			comment: "第一次",
+			image,
+		});
+		addVisualDraft({
+			id: "mark-b",
+			paperPath: "papers/a",
+			page: 4,
+			rects: [rect],
+			comment: "另一处",
+			image,
+		});
+		addVisualDraft({
+			id: "mark-a",
+			paperPath: "papers/a",
+			page: 2,
+			rects: [rect],
+			comment: "改过的备注",
+			image,
+		});
+		expect(currentVisualDrafts().map((d) => d.id)).toEqual([
+			"mark-a",
+			"mark-b",
+		]);
+		// Re-adding refreshes in place — the later note wins.
+		expect(currentVisualDrafts()[0]?.comment).toBe("改过的备注");
+
+		removeVisualDraft("mark-a");
+		expect(currentVisualDrafts().map((d) => d.id)).toEqual(["mark-b"]);
+	});
+
 	it("groups drafts by paper path", () => {
 		addVisualDraft({
 			paperPath: "papers/a",
@@ -147,6 +214,46 @@ describe("visual-context-store", () => {
 		expect([...groups.keys()].sort()).toEqual(["papers/a", "papers/b"]);
 		expect(groups.get("papers/a")).toHaveLength(2);
 		expect(groups.get("papers/b")).toHaveLength(1);
+	});
+
+	it("keeps the same mark independently in each session", () => {
+		activateVisualDraftSession("scope\nsession-a");
+		addVisualDraft({
+			id: "mark-1",
+			paperPath: "papers/a",
+			page: 2,
+			rects: [rect],
+			comment: "A",
+			image,
+		});
+		activateVisualDraftSession("scope\nsession-b");
+		addVisualDraft({
+			id: "mark-1",
+			paperPath: "papers/a",
+			page: 2,
+			rects: [rect],
+			comment: "B",
+			image,
+		});
+
+		expect(currentVisualDrafts().map((draft) => draft.comment)).toEqual(["B"]);
+		activateVisualDraftSession("scope\nsession-a");
+		expect(currentVisualDrafts().map((draft) => draft.comment)).toEqual(["A"]);
+
+		expect(updateVisualDraftComment("mark-1", "A2")).toBe(true);
+		takeVisualDrafts(["mark-1"], "scope\nsession-b");
+		activateVisualDraftSession("scope\nsession-b");
+		expect(currentVisualDrafts()).toEqual([]);
+		activateVisualDraftSession("scope\nsession-a");
+		expect(currentVisualDrafts().map((draft) => draft.comment)).toEqual(["A2"]);
+
+		clearVisualDraftSession("scope\nsession-b");
+		expect(currentVisualDrafts().map((draft) => draft.comment)).toEqual(["A2"]);
+
+		rebindVisualDraftSession("scope\nsession-a", "scope\nsession-a2");
+		expect(currentVisualDrafts().map((draft) => draft.comment)).toEqual(["A2"]);
+		activateVisualDraftSession("scope\nsession-a");
+		expect(currentVisualDrafts()).toEqual([]);
 	});
 });
 
@@ -321,6 +428,58 @@ describe("agent-trace schema and lifecycle", () => {
 		expect(
 			await readPdfVisualTrace("/vault/papers/delete", trace.id),
 		).toBeNull();
+	});
+
+	it("leaves a visual mark unchanged when the turn is not that mark's pin", async () => {
+		resetPendingVisualTracesForTests();
+		const note = createNoteTrace({
+			id: "mark-ref",
+			paperPath: "papers/ref",
+			page: 3,
+			rects: [rect],
+			comment: "原批注",
+			image,
+		});
+		await writePdfVisualTrace("/vault/papers/ref", note);
+		await bindVisualTracesForTurn({
+			runtimeSessionId: "sidebar-run",
+			messageId: "msg-1",
+			agentId: "agent",
+			userText: "解释这个内容. 另外分析下这个表格",
+		});
+		const saved = await readPdfVisualTrace("/vault/papers/ref", "mark-ref");
+		expect(saved?.comment).toBe("原批注");
+		expect(saved?.agent).toBeUndefined();
+		expect(takePendingVisualTraces("sidebar-run")).toEqual([]);
+	});
+
+	it("appends a follow-up only for the mark the session was opened from", async () => {
+		resetPendingVisualTracesForTests();
+		const note = createNoteTrace({
+			id: "mark-pin",
+			paperPath: "papers/pin",
+			page: 6,
+			rects: [rect],
+			comment: "原批注",
+			image,
+		});
+		await writePdfVisualTrace("/vault/papers/pin", note);
+		await bindVisualTracesForTurn({
+			runtimeSessionId: "pin-run",
+			messageId: "msg-2",
+			agentId: "agent",
+			userText: "继续问这个区域",
+			continueVisualTraceId: "mark-pin",
+			continuePaperAbs: "/vault/papers/pin",
+		});
+		const saved = await readPdfVisualTrace("/vault/papers/pin", "mark-pin");
+		expect(saved?.comment).toBe("原批注");
+		expect(saved?.agent?.messages?.map((message) => message.content)).toEqual([
+			"继续问这个区域",
+		]);
+		expect(takePendingVisualTraces("pin-run")).toEqual([
+			{ paperAbsPath: "/vault/papers/pin", traceId: "mark-pin" },
+		]);
 	});
 
 	it("rejects wrong kind or missing geometry", () => {

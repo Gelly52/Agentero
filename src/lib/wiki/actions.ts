@@ -5,18 +5,16 @@
  */
 
 import i18n from "@/i18n";
-import { notifyError, notifySuccess, notifyWarning } from "@/lib/core/notify";
-import { refreshLibrary, setLibraryScopePath } from "@/lib/paper/library-store";
-import { remapTabAnnotations } from "@/lib/pdf/annotations-store";
+import { commands } from "@/lib/core/bindings";
+import { callApi } from "@/lib/core/ipc";
+import { notifyError, notifySuccess } from "@/lib/core/notify";
+import { isUnderPapers } from "@/lib/paper";
+import { refreshLibrary } from "@/lib/paper/library-store";
 import { getSettings } from "@/lib/settings/react-store";
 import { joinVaultPath, vaultRelativePath } from "@/lib/vault";
 import type { VaultFileChangedPayload } from "@/lib/vault/fs-watch";
 import { isRemoteVaultHandle } from "@/lib/vault/remote/remote-vault";
-import {
-	getVaultPath,
-	refreshTree,
-	setTreeSelectedPath,
-} from "@/lib/vault/store";
+import { getVaultPath, refreshTree } from "@/lib/vault/store";
 import {
 	applyExternalRenameRepair,
 	externalRenameRepairHadZeroWrites,
@@ -42,18 +40,7 @@ import {
 	trackInternalRenamePaths,
 } from "@/lib/wiki/store";
 import { applyDiskChange, dirtyVaultPaths } from "@/lib/workspace/actions";
-import { dockHandle } from "@/lib/workspace/dock-registry";
-import {
-	getActiveTabId,
-	getTabs,
-	setActiveTabId,
-	setTabs,
-} from "@/lib/workspace/store";
-import {
-	remapPathUnder,
-	remapTabsUnderPath,
-	tabIdForPath,
-} from "@/lib/workspace/tabs";
+import { remapMovedWorkspacePaths } from "@/lib/workspace/navigation";
 
 export async function renameWikiHeadingAction(
 	absPath: string,
@@ -79,7 +66,7 @@ export async function renameWikiHeadingAction(
 			joinVaultPath(root, source),
 		);
 		trackInternalRenamePaths(affectedAbsolute, Date.now() + 2000);
-		await Promise.all(affectedAbsolute.map(applyDiskChange));
+		await Promise.all(affectedAbsolute.map((path) => applyDiskChange(path)));
 		bumpWikiIndexRevision();
 		notifyWikiEmbedTargets(affectedAbsolute);
 		notifySuccess(
@@ -102,47 +89,6 @@ export async function renameWikiHeadingAction(
 		});
 		throw error;
 	}
-}
-
-/** Preserve mounted workspace state when a filesystem path changes identity. */
-export function remapMovedWorkspacePaths(
-	fromAbs: string,
-	toAbs: string,
-	fromRel: string,
-	toRel: string,
-): void {
-	const previousTabs = getTabs();
-	const remappedTabs = remapTabsUnderPath(
-		previousTabs,
-		fromAbs,
-		toAbs,
-		fromRel,
-		toRel,
-	);
-	for (let index = 0; index < previousTabs.length; index++) {
-		const previous = previousTabs[index];
-		const remapped = remappedTabs[index];
-		if (previous && remapped && previous.id !== remapped.id) {
-			dockHandle()?.remapPanel(previous.id, remapped);
-		}
-	}
-	const active = previousTabs.find((tab) => tab.id === getActiveTabId());
-	if (active) {
-		setActiveTabId(tabIdForPath(remapPathUnder(active.path, fromAbs, toAbs)));
-	}
-	remapTabAnnotations(
-		previousTabs.map((tab) => ({
-			fromId: tab.id,
-			toId: tabIdForPath(remapPathUnder(tab.path, fromAbs, toAbs)),
-		})),
-	);
-	setTabs(remappedTabs);
-	setTreeSelectedPath((path) =>
-		path ? remapPathUnder(path, fromAbs, toAbs) : path,
-	);
-	setLibraryScopePath((scope) =>
-		scope ? remapPathUnder(scope, fromRel, toRel) : scope,
-	);
 }
 
 export function syncMovedPaths(
@@ -211,9 +157,34 @@ export async function handleExternalRename(
 	const fromRel = vaultRelativePath(root, rename.from);
 	const toRel = vaultRelativePath(root, rename.to);
 	if (!fromRel || !toRel || fromRel === toRel) {
-		notifyWarning(i18n.t("app:vault.externalRename.unverified"));
+		console.warn(
+			"[wiki] unverified external rename; links left unchanged",
+			rename,
+		);
 		return;
 	}
+	const fromAbs = joinVaultPath(root, fromRel);
+	const toAbs = joinVaultPath(root, toRel);
+
+	// Rewrite catalog path prefixes before the UI remap so paper titles and
+	// metadata follow the filesystem move. Best-effort: if it fails, the
+	// workspace remap below still keeps tabs pointing at the new disk path.
+	if (isUnderPapers(fromAbs) && isUnderPapers(toAbs)) {
+		try {
+			await callApi(() =>
+				commands.paperRepath({ vaultPath: root, fromRel, toRel }),
+			);
+		} catch (error) {
+			console.warn("[wiki] paper_repath failed", error);
+		}
+	}
+
+	const emptyResult: WikiRenameResult = {
+		movedPath: toRel,
+		updatedSources: [],
+		skipped: [],
+		rollback: "not-needed",
+	};
 	try {
 		const preview = await previewExternalRenameRepair(
 			root,
@@ -222,12 +193,19 @@ export async function handleExternalRename(
 			dirtyVaultPaths(root),
 		);
 		if (!externalRenameRepairNeeded(preview)) {
+			// No markdown links need repair, but open tabs / tree selection still
+			// must follow the filesystem move.
+			syncMovedPaths(root, fromAbs, toAbs, fromRel, toRel, emptyResult);
+			await refreshTree(root);
+			await refreshLibrary();
 			setExternalRenameVaultPath(null);
 			setExternalRenamePreview(null);
 			setExternalRenameFailure(null);
 			return;
 		}
 		if (getSettings().autoUpdateInternalLinks === "always") {
+			// applyPendingExternalRenameRepair remaps tabs and refreshes as part
+			// of applying the link repair.
 			try {
 				await applyPendingExternalRenameRepair(preview, root);
 			} catch (error) {
@@ -249,11 +227,21 @@ export async function handleExternalRename(
 			}
 			return;
 		}
+		// Ask mode: keep the workspace in sync immediately, then present the link
+		// repair dialog for the user to confirm.
+		syncMovedPaths(root, fromAbs, toAbs, fromRel, toRel, emptyResult);
+		await refreshTree(root);
+		await refreshLibrary();
 		setExternalRenameVaultPath(root);
 		setExternalRenameFailure(null);
 		setExternalRenamePreview(preview);
 	} catch (error) {
+		// Even if link-repair preview or apply failed, the move already happened
+		// on disk: remap open tabs so they don't point at a stale path.
 		console.warn("[wiki] external rename repair unavailable", error);
+		syncMovedPaths(root, fromAbs, toAbs, fromRel, toRel, emptyResult);
+		await refreshTree(root);
+		await refreshLibrary();
 		setExternalRenameVaultPath(root);
 		setExternalRenamePreview(null);
 		setExternalRenameFailure({

@@ -3,6 +3,7 @@ import type {
 	PaperTreeSortMode,
 } from "@/lib/paper/tree-modes";
 import type { LayoutSettings } from "@/lib/pdf/layout/settings";
+import type { ShortcutOverrides } from "@/lib/settings/shortcut-bindings";
 import type {
 	CommercialTranslateProviderId,
 	TranslateProviderConfig,
@@ -31,34 +32,43 @@ export type ThemePreference = "system" | "light" | "dark";
 
 export type LocalePreference = "system" | "en" | "zh-CN";
 
-/** Sortable / customizable columns in the papers Library table. */
-export type LibraryColumnKey =
+/** Builtin sortable / customizable columns in the papers Library table. */
+export type BuiltinLibraryColumnKey =
 	| "title"
 	| "authors"
-	| "year"
+	| "date"
+	| "addedAt"
 	| "publication"
 	| "tags"
-	| "id";
+	| "id"
+	| "citations";
+
+/** Sortable / customizable columns in the papers Library table, including custom properties. */
+export type LibraryColumnKey = BuiltinLibraryColumnKey | `prop:${string}`;
 
 /** Per-column display preference: order comes from array position. */
 export type LibraryColumnPref = {
 	key: LibraryColumnKey;
 	visible: boolean;
+	/** User-resized width in rem; omitted columns remain adaptive. */
+	widthRem?: number;
 };
 
 /** Canonical column order (also the source of truth for reconciliation). */
 export const LIBRARY_COLUMN_KEYS: LibraryColumnKey[] = [
 	"title",
 	"authors",
-	"year",
+	"date",
 	"publication",
 	"tags",
 	"id",
+	"citations",
+	"addedAt",
 ];
 
-/** Default: every column visible, in canonical order. */
+/** Keep the existing layout; users can enable the added-date column. */
 export const DEFAULT_LIBRARY_COLUMNS: LibraryColumnPref[] =
-	LIBRARY_COLUMN_KEYS.map((key) => ({ key, visible: true }));
+	LIBRARY_COLUMN_KEYS.map((key) => ({ key, visible: key !== "addedAt" }));
 
 /**
  * How Agentero responds to agent permission escalations.
@@ -81,6 +91,41 @@ export const AUTO_UPDATE_INTERNAL_LINKS: AutoUpdateInternalLinks[] = [
 	"ask",
 	"always",
 ];
+
+/** PDF navigation mode; paginated keeps the vertical coordinate system. */
+export type PdfScrollStrategy = "vertical" | "horizontal" | "paginated";
+
+export const PDF_SCROLL_STRATEGIES: readonly PdfScrollStrategy[] = [
+	"vertical",
+	"horizontal",
+	"paginated",
+] as const;
+
+export function isPdfScrollStrategy(v: unknown): v is PdfScrollStrategy {
+	return (
+		typeof v === "string" &&
+		(PDF_SCROLL_STRATEGIES as readonly string[]).includes(v)
+	);
+}
+
+/**
+ * PDF page layout (EmbedPDF spread mode): one page per row (`none`), or
+ * two-page spreads paired from page 1 (`odd`) / after a standalone cover
+ * (`even`).
+ */
+export type PdfSpreadMode = "none" | "odd" | "even";
+
+export const PDF_SPREAD_MODES: readonly PdfSpreadMode[] = [
+	"none",
+	"odd",
+	"even",
+] as const;
+
+export function isPdfSpreadMode(v: unknown): v is PdfSpreadMode {
+	return (
+		typeof v === "string" && (PDF_SPREAD_MODES as readonly string[]).includes(v)
+	);
+}
 
 /**
  * How NOTES.md is initialized when a paper is imported.
@@ -105,12 +150,19 @@ export function isPaperNoteMode(v: unknown): v is PaperNoteMode {
 }
 
 export type AppSettings = {
+	/** Null disables a command; absent ids use their default shortcut. */
+	shortcutOverrides: ShortcutOverrides;
 	// General
-	/**
-	 * Translator Runtime base URL for magic-wand / identifier import.
-	 * Default: hosted poco-ai service.
-	 */
-	translatorBaseUrl: string;
+	/** EasyScholar key for journal ranking and impact-factor lookups. */
+	easyScholarKey: string;
+	/** 知乎开放平台 Access Secret（内置「知乎」Agent 的直答 / 检索凭证）。 */
+	zhihuAccessSecret: string;
+	/** EZProxy/WebVPN prefix for paywalled PDF fallback ("" disables). */
+	institutionProxyPrefix: string;
+	/** Session cookie for institution proxy requests. */
+	institutionProxyCookie: string;
+	/** Gateway type: "auto" | "ezproxy" | "wengine" | "subdomain". */
+	institutionProxyType: string;
 	/** Process-wide HTTP(S)/SOCKS proxy for Host requests and Agent traffic. */
 	networkProxyEnabled: boolean;
 	networkProxyUrl: string;
@@ -127,6 +179,32 @@ export type AppSettings = {
 	/** Default `ask`: external local renames are previewed before Markdown writes. */
 	autoUpdateInternalLinks: AutoUpdateInternalLinks;
 	/**
+	 * Preferred terminal for "Open in Terminal". Empty = system default.
+	 * Unknown or uninstalled ids fall back at launch time.
+	 */
+	terminalApp: string;
+	/**
+	 * PDF reader navigation: vertical/horizontal continuous scrolling or
+	 * one page at a time (`paginated`).
+	 */
+	pdfScrollStrategy: PdfScrollStrategy;
+	/** Enable Vim-style single-key navigation on the PDF reading surface. */
+	pdfVimKeys: boolean;
+	/**
+	 * Master switch for Vim-style single-key navigation: `j/k/h/l` in the
+	 * file tree, dropdown lists and the PDF reader. Off keeps plain typing.
+	 */
+	vimMode: boolean;
+	/** Enable the ephemeral F-key global element hint overlay. */
+	hintModeEnabled: boolean;
+	/** Subtle in-app sound cues for agent attention / turn done / failure. */
+	soundEnabled: boolean;
+	/**
+	 * PDF reader page layout: `none` (default) = one page per row, `odd`/`even`
+	 * = two-page spreads (paired from page 1 / after a standalone cover).
+	 */
+	pdfSpreadMode: PdfSpreadMode;
+	/**
 	 * How NOTES.md is initialized on paper import. `custom` copies the vault
 	 * template `.agentero/templates/NOTES.md`. Default: built-in skeleton.
 	 */
@@ -137,6 +215,17 @@ export type AppSettings = {
 	 * `⌘\` / "Open notes" away.
 	 */
 	autoOpenPaperNotes: boolean;
+	/**
+	 * Adopt bare folders created under `papers/` that hold settled PDFs into
+	 * the library in place (rename to the canonical id, NOTES shell, metadata
+	 * recognition). Default **on**.
+	 */
+	autoIngest: boolean;
+	/**
+	 * When opening a new paper, close the active tab instead of adding another one.
+	 * Default **off**; turn on for a single-paper-at-a-time workflow.
+	 */
+	replaceCurrentTabOnOpenPaper: boolean;
 	/**
 	 * Papers Library table columns: order (array position) + visibility.
 	 * Reconciled against {@link LIBRARY_COLUMN_KEYS}; `title` is always visible.
@@ -154,6 +243,8 @@ export type AppSettings = {
 	 */
 	mcpEnabled: boolean;
 	mcpPort: number;
+	/** Opt-in: expose paper full text via MCP paper_text_get. */
+	mcpExposePaperText: boolean;
 	/**
 	 * OpenAI Secure MCP Tunnel id (`tunnel_` + 32 hex). Empty = not configured.
 	 */
@@ -174,11 +265,6 @@ export type AppSettings = {
 	 */
 	batchImportConcurrency: number;
 	/**
-	 * Prefill the Markdown export dialog's "Agentero watermark" checkbox.
-	 * Default **off**; per-export choice can still override.
-	 */
-	exportWatermarkEnabled: boolean;
-	/**
 	 * Anonymous product analytics (app version + device info) via PostHog.
 	 * Default **on**; takes effect from the next launch.
 	 */
@@ -189,9 +275,8 @@ export type AppSettings = {
 	 */
 	plazaEnabled: boolean;
 	/**
-	 * Plaza source ids hidden from the sidebar and Plaza home page
-	 * (e.g. `"cool-papers"`). Right-click a source row to hide it, the Plaza
-	 * parent row to restore. Empty = show all sources.
+	 * Plaza source ids hidden from the sidebar tree (e.g. `"cool-papers"`).
+	 * Right-click the Plaza parent row to toggle sources. Empty = show all.
 	 */
 	plazaHiddenSources: string[];
 	/**
@@ -215,9 +300,10 @@ export type AppSettings = {
 	locale: LocalePreference;
 	editorFontSize: number;
 	/**
-	 * UI chrome font (sidebars, toolbars, settings). Empty = app default (Geist).
-	 * Also accepts built-in stacks (`system` | `serif` | `mono`) or a system
-	 * family name discovered via `list_system_fonts`.
+	 * UI chrome font (sidebars, toolbars, settings). Empty = app default
+	 * (platform system UI). Also accepts built-in stacks
+	 * (`system` | `geist` | `serif` | `mono`) or a system family name
+	 * discovered via `list_system_fonts`.
 	 */
 	interfaceFontFamily: string;
 	/**
@@ -243,13 +329,25 @@ export type AppSettings = {
 	uiScale: number;
 	/** Show the WYSIWYG formatting toolbar above Markdown/notes editors. */
 	showEditorToolbar: boolean;
+	/**
+	 * Font size of the cited excerpt inside `![[wikilink]]` embeds (px, before
+	 * UI scale): annotation location, quote, and translation, plus a Markdown
+	 * embed's body. The card title stays on the callout scale. Annotation notes
+	 * follow `editorFontSize`. Range 12–20; default 13.
+	 */
+	wikiEmbedFontSize: number;
+	/**
+	 * Max width of the Markdown editor column in CSS px. `0` means the column
+	 * fills the pane. Not multiplied by {@link uiScale}.
+	 */
+	markdownMaxWidth: number;
 	// Agent (local UI prefs; registry lives in Host agents.json)
 	/** Global permission handling applied to every agent run. */
 	agentPermissionMode: AgentPermissionMode;
 	/**
 	 * After magic-wand import / single-paper Download, auto-run paper-reader
 	 * when assets are ready and catalog `is_read` is false.
-	 * Default **off**; Zap still works for manual runs.
+	 * Default **off**; manual runs from the file tree still work.
 	 */
 	autoPaperReader: boolean;
 	/** Language forced onto every agent response and generated notes. */
@@ -266,6 +364,12 @@ export type AppSettings = {
 	 */
 	pdfAsk: PdfAskSettings;
 	/**
+	 * Agent seat + model for the background paper-reader (精读) workflow.
+	 * Independent of Chat's current agent and of `pdfAsk`.
+	 * Empty = follow app default agent / that agent's model pref.
+	 */
+	paperReader: PaperReaderSettings;
+	/**
 	 * OpenAI-compatible embedding endpoint (BYOK) for arxiv daily recommendation
 	 * and other semantic features. All fields empty = feature disabled.
 	 */
@@ -274,7 +378,75 @@ export type AppSettings = {
 	translate: TranslateSettings;
 	/** PDF layout-analysis backend (local ONNX or remote PP-StructureV3). */
 	layout: LayoutSettings;
+	/**
+	 * Config reminders dismissed with "don't remind me again". Ids come from
+	 * {@link CONFIG_REMINDER_IDS}; unknown values are dropped on normalize.
+	 */
+	dismissedReminders: ConfigReminderId[];
+	/**
+	 * Decision-layer provider (System One: TypeSafe jEV / Cloudflare Clef /
+	 * compatible). `provider` selects a preset; base URL + model are editable so
+	 * the OpenAI Decisions API is available via the `openai` preset.
+	 */
+	decision: DecisionSettings;
 };
+
+/**
+ * Decision-layer provider ids. `custom` accepts any System One endpoint.
+ * `openai` targets the public OpenAI Decisions API (`/v1/decisions`).
+ */
+export type DecisionProviderId = "jev" | "clef" | "openai" | "custom";
+
+export const DECISION_PROVIDER_IDS: readonly DecisionProviderId[] = [
+	"jev",
+	"clef",
+	"openai",
+	"custom",
+] as const;
+
+export function isDecisionProviderId(v: unknown): v is DecisionProviderId {
+	return (
+		typeof v === "string" &&
+		(DECISION_PROVIDER_IDS as readonly string[]).includes(v)
+	);
+}
+
+/** Decision-layer provider settings (System One + OpenAI Decisions). */
+export type DecisionSettings = {
+	/** Selected vendor preset. */
+	provider: DecisionProviderId;
+	/** API key; masked (`*`) when echoed back from the Host. */
+	apiKey: string;
+	/** Endpoint. System One: `…/v1/systemone`. OpenAI: `…/v1/decisions`. */
+	baseUrl: string;
+	/** Model id injected into every request, e.g. `jev-latest` or `gpt-6-luna`. */
+	model: string;
+	/** Enable the experimental smart-highlight action in the PDF toolbar. */
+	smartHighlight: boolean;
+	/** In-flight smart-highlight batches. One of 1, 2, 4, 16. */
+	smartHighlightConcurrency: number;
+	/** Seconds for one smart-highlight batch, counted from send. */
+	smartHighlightTimeoutSecs: number;
+};
+
+/**
+ * Config reminders the app may surface once per session; "don't remind again"
+ * persists the id in {@link AppSettings.dismissedReminders}.
+ * - `layout-local-model`: local ONNX layout analysis costs memory / CPU.
+ * - `network-proxy`: a network request failed while no proxy is configured.
+ */
+export const CONFIG_REMINDER_IDS = [
+	"layout-local-model",
+	"network-proxy",
+] as const;
+export type ConfigReminderId = (typeof CONFIG_REMINDER_IDS)[number];
+
+export function isConfigReminderId(value: unknown): value is ConfigReminderId {
+	return (
+		typeof value === "string" &&
+		(CONFIG_REMINDER_IDS as readonly string[]).includes(value)
+	);
+}
 
 /** PDF selection Ask (question popover) agent/model prefs. */
 export type PdfAskSettings = {
@@ -284,8 +456,26 @@ export type PdfAskSettings = {
 	modelId: string;
 };
 
+export type PaperReaderSettings = {
+	/** Empty = follow registry default agent. */
+	agentId: string;
+	/** Empty = follow loadModelPref(agentId). */
+	modelId: string;
+};
+
+/**
+ * Embedding credential source: the built-in provider (Host-injected) or a
+ * custom OpenAI-compatible BYOK endpoint.
+ */
+export type EmbeddingSource = "builtin" | "custom";
+
 /** OpenAI-compatible embedding endpoint (BYOK). All-empty = disabled. */
 export type EmbeddingSettings = {
+	/**
+	 * Credential source. The Host wire type is a plain string (empty = unset);
+	 * `normalizeEmbeddingSettings` narrows it to this union at the boundary.
+	 */
+	source: EmbeddingSource;
 	/** Endpoint base, e.g. `https://api.openai.com/v1`. Empty = unset. */
 	baseUrl: string;
 	/** BYOK secret; masked (`*`) when echoed back from the Host. */

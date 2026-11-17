@@ -5,8 +5,11 @@
 import {
 	type AgentDescriptor,
 	type AgentListResponse,
+	isChatOnlyAgentTemplate,
+	listAgents,
 	loadModelPref,
 } from "@/lib/agent";
+import { loadSettings } from "@/lib/settings";
 import type { TranslateSettings } from "@/lib/translate/types";
 
 export type ResolvedTranslateAgent = {
@@ -51,10 +54,27 @@ export function resolveTranslateAgent(
 	return { agentId, modelId: modelId || undefined };
 }
 
-/** Agents that can actually run (for Settings Select). */
+/**
+ * Agents that can actually run (for Settings Select).
+ *
+ * Built-in chat-only agents (e.g. the Zhihu agent) are excluded: they cannot
+ * read Vault files or run ACP prompts, so they are not valid seats for
+ * translation / PDF-ask.
+ */
 export function listAvailableAgents(
 	registry: AgentListResponse | null | undefined,
 ): AgentDescriptor[] {
 	if (!registry?.agents?.length) return [];
-	return registry.agents.filter((a) => a.available);
+	return registry.agents.filter(
+		(a) => a.available && !isChatOnlyAgentTemplate(a.template),
+	);
+}
+
+/**
+ * Resolve the translate-settings agent seat against the live registry (a
+ * failed registry fetch degrades to settings-only resolution).
+ */
+export async function resolveConfiguredTranslateAgent(): Promise<ResolvedTranslateAgent> {
+	const registry = await listAgents().catch(() => null);
+	return resolveTranslateAgent(loadSettings().translate, registry);
 }

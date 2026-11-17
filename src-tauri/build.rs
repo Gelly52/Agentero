@@ -3,90 +3,79 @@ use std::fs;
 use std::path::PathBuf;
 
 fn main() {
+    // Unit-test binaries link the full Tauri stack, which statically imports
+    // `TaskDialogIndirect` — exported only by comctl32 v6. tauri-build's
+    // manifest resource reaches bin targets only (`rustc-link-arg-bins`), so
+    // without this every `cargo test` binary starts without a manifest, the
+    // loader binds comctl32 v5 and the process dies with
+    // STATUS_ENTRYPOINT_NOT_FOUND before any test runs. /MANIFESTDEPENDENCY
+    // makes the MSVC linker embed the Common-Controls v6 dependency; for bins
+    // it merges into the manifest tauri-build already provided. GNU toolchains
+    // need a different (windres) mechanism and are excluded here.
+    if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows")
+        && env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc")
+    {
+        println!(
+            "cargo::rustc-link-arg=/MANIFESTDEPENDENCY:type='win32' \
+             name='Microsoft.Windows.Common-Controls' version='6.0.0.0' \
+             publicKeyToken='6595b64144ccf1df' language='*' processorArchitecture='*'"
+        );
+    }
     if env::var_os("CARGO_FEATURE_DESKTOP").is_some() {
         tauri_build::build();
     }
-    forward_posthog_key();
-    generate_onboarding_templates();
+    forward_build_env();
 }
 
-/// Bake the PostHog project API key into the binary at compile time.
-/// An explicit `AGENTERO_POSTHOG_KEY` env var wins; otherwise fall back to
-/// the repo-root `.env` (gitignored). Absent both, telemetry compiles out.
-fn forward_posthog_key() {
-    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+/// Variables baked into the binary at compile time and read via `option_env!`.
+const BUILD_ENV_KEYS: &[&str] = &[
+    "AGENTERO_POSTHOG_KEY",
+    "AGENTERO_POSTHOG_SURVEY_ID",
+    "AGENTERO_POSTHOG_SURVEY_KIND_ID",
+    "AGENTERO_POSTHOG_SURVEY_MESSAGE_ID",
+    "AGENTERO_POSTHOG_SURVEY_CONTACT_ID",
+    "AGENTERO_BUILTIN_BASE_URL",
+    "AGENTERO_BUILTIN_API_KEY",
+    "AGENTERO_BUILTIN_TRANSLATE_MODEL",
+    "AGENTERO_BUILTIN_EMBEDDING_MODEL",
+    "AGENTERO_BUILTIN_OCR_MODEL",
+];
+
+/// Forward the build-time variables to `rustc`. An explicit env var wins;
+/// otherwise fall back to the repo-root `.env` (gitignored). Absent both, the
+/// consumer compiles out: telemetry is disabled and the built-in provider
+/// reports itself unavailable.
+///
+/// `rerun-if-env-changed` is what makes this correct — cargo does not otherwise
+/// observe env changes, so a rotated key would silently keep the stale binary.
+fn forward_build_env() {
+    let manifest_dir = PathBuf::from(
+        env::var_os("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR is set by Cargo"),
+    );
     let dotenv = manifest_dir.join("../.env");
-    println!("cargo:rerun-if-env-changed=AGENTERO_POSTHOG_KEY");
+    for key in BUILD_ENV_KEYS {
+        println!("cargo:rerun-if-env-changed={key}");
+    }
     println!("cargo:rerun-if-changed={}", dotenv.display());
-    if env::var("AGENTERO_POSTHOG_KEY").is_ok() {
+    if BUILD_ENV_KEYS.iter().all(|key| env::var(key).is_ok()) {
         return;
     }
     let Ok(content) = fs::read_to_string(&dotenv) else {
         return;
     };
-    for line in content.lines() {
-        let Some(value) = line
-            .trim()
-            .strip_prefix("AGENTERO_POSTHOG_KEY=")
-            .map(str::trim)
-            .filter(|v| !v.is_empty())
-        else {
+    for key in BUILD_ENV_KEYS {
+        if env::var(key).is_ok() {
+            continue;
+        }
+        let prefix = format!("{key}=");
+        let Some(value) = content.lines().find_map(|line| {
+            line.trim()
+                .strip_prefix(prefix.as_str())
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+        }) else {
             continue;
         };
-        println!("cargo:rustc-env=AGENTERO_POSTHOG_KEY={value}");
-        return;
+        println!("cargo:rustc-env={key}={value}");
     }
-}
-
-fn generate_onboarding_templates() {
-    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let notes_root = manifest_dir.join("../templates/vault/notes");
-    let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR is set by Cargo"));
-    let generated = out_dir.join("onboarding_templates.rs");
-
-    println!("cargo:rerun-if-changed={}", notes_root.display());
-
-    let mut entries = Vec::new();
-    let locales = fs::read_dir(&notes_root)
-        .unwrap_or_else(|e| panic!("read onboarding notes directory: {e}"))
-        .filter_map(Result::ok)
-        .filter(|entry| entry.path().is_dir())
-        .collect::<Vec<_>>();
-
-    for locale_dir in locales {
-        let locale = locale_dir.file_name().to_string_lossy().into_owned();
-        let mut files = fs::read_dir(locale_dir.path())
-            .unwrap_or_else(|e| panic!("read onboarding locale {locale}: {e}"))
-            .filter_map(Result::ok)
-            .filter(|entry| {
-                entry.path().is_file() && entry.path().extension().is_some_and(|ext| ext == "md")
-            })
-            .collect::<Vec<_>>();
-        files.sort_by_key(|entry| entry.file_name());
-
-        for file in files {
-            let filename = file.file_name().to_string_lossy().into_owned();
-            // Keep the selected locale in the embedded entry, but flatten the
-            // generated Vault paths so onboarding notes live directly in notes/.
-            let rel = format!("notes/{filename}");
-            let path = file.path();
-            entries.push((locale.clone(), rel, path));
-        }
-    }
-
-    entries.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
-
-    let mut source =
-        String::from("pub(crate) static BUNDLED_ONBOARDING_FILES: &[(&str, &str, &str)] = &[\n");
-    for (locale, rel, path) in entries {
-        source.push_str(&format!(
-            "    ({:?}, {:?}, include_str!({:?})),\n",
-            locale,
-            rel,
-            path.to_string_lossy().to_string()
-        ));
-    }
-    source.push_str("];\n");
-
-    fs::write(generated, source).expect("write generated onboarding templates");
 }

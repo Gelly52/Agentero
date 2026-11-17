@@ -7,7 +7,8 @@
  * the response (with a 200 DPI fallback for the point conversion).
  */
 
-import { invokeApi } from "@/lib/core/ipc";
+import { commands } from "@/lib/core/bindings";
+import { callApi } from "@/lib/core/ipc";
 import { clamp01 } from "@/lib/core/math";
 import { layoutLabelToKind } from "@/lib/pdf/layout/labels";
 import type { PdfLayoutRegion } from "@/lib/pdf/layout/types";
@@ -16,6 +17,8 @@ export type LayoutRemoteBox = {
 	clsId: number;
 	label: string;
 	score: number;
+	text?: string | null;
+	caption?: string | null;
 	/** `[x1, y1, x2, y2]` in rendered-image pixels (top-left origin). */
 	coordinate: [number, number, number, number];
 };
@@ -29,17 +32,6 @@ export type LayoutRemotePageResult = {
 
 export type LayoutRemoteAnalyzePdfResult = {
 	pages: LayoutRemotePageResult[];
-};
-
-/** Progress event emitted by the Host while the job runs. */
-export const LAYOUT_REMOTE_PROGRESS_EVENT = "layout-remote:progress";
-
-export type LayoutRemoteProgressPayload = {
-	phase: string;
-	extractedPages: number | null;
-	totalPages: number | null;
-	/** Present when several API jobs run in parallel; omit on older Hosts. */
-	requestId?: string | null;
 };
 
 /** Match the local PP-DocLayoutV3 plugin threshold. */
@@ -60,15 +52,24 @@ export async function invokeLayoutRemoteAnalyzePdf(args: {
 	apiKey?: string;
 	requestId?: string;
 }): Promise<LayoutRemoteAnalyzePdfResult> {
-	return invokeApi<LayoutRemoteAnalyzePdfResult>("layout_remote_analyze_pdf", {
-		args: {
+	// Wire boxes keep serde `null` on absent score/coordinate numbers and add
+	// `renderedPages`; the converters below treat null like the old payload.
+	return (await callApi(() =>
+		commands.layoutRemoteAnalyzePdf({
 			provider: args.provider,
 			pdfBase64: args.pdfBase64,
 			fileName: args.fileName ?? null,
 			apiKey: args.apiKey ?? null,
 			requestId: args.requestId ?? null,
-		},
-	});
+		}),
+	)) as LayoutRemoteAnalyzePdfResult;
+}
+
+/** Stop waiting for one whole-PDF layout job after the caller aborts it. */
+export async function invokeLayoutRemoteCancel(
+	requestId: string,
+): Promise<boolean> {
+	return callApi(() => commands.layoutRemoteCancel(requestId));
 }
 
 /**
@@ -81,13 +82,13 @@ export async function invokeLayoutRemoteProbe(args: {
 	imageBase64: string;
 	apiKey?: string;
 }): Promise<{ jobId: string }> {
-	return invokeApi<{ jobId: string }>("layout_remote_probe", {
-		args: {
+	return callApi(() =>
+		commands.layoutRemoteProbe({
 			provider: args.provider,
 			imageBase64: args.imageBase64,
 			apiKey: args.apiKey ?? null,
-		},
-	});
+		}),
+	);
 }
 
 /** Tiny white JPEG for the settings connectivity probe. */
@@ -143,6 +144,10 @@ export function paddleBoxesToRegions(args: {
 			kind,
 			label: box.label,
 			score: clamp01(box.score),
+			...(box.text?.trim() ? { text: box.text.trim() } : {}),
+			...(box.caption?.trim() || (kind === "figure_title" && box.text?.trim())
+				? { title: (box.caption || box.text)?.trim() }
+				: {}),
 			// Assigned after the whole page set is collected (top-to-bottom).
 			readingOrder: regions.length,
 			rect: { x, y, w: w * scaleX, h: h * scaleY },

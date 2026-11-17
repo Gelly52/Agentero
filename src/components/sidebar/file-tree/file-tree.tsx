@@ -7,11 +7,12 @@ import {
 	useRef,
 } from "react";
 import { useTranslation } from "react-i18next";
-import { FileTree as AiFileTree } from "@/components/ai-elements/file-tree";
+import { FileTree as AiFileTree } from "@/components/sidebar/file-tree/file-tree-primitives";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { useSettings } from "@/hooks/use-app-stores";
 import { cn } from "@/lib/core/utils";
 import type {
+	PaperLibraryRow,
 	PaperMetadata,
 	PaperTreeLabelMode,
 	PaperTreeSortMode,
@@ -24,6 +25,8 @@ import {
 import type { FileNode } from "@/lib/vault";
 import { useMovePicker } from "./hooks/use-move-picker";
 import { usePaperRowActions } from "./hooks/use-paper-row-actions";
+import { useSkillLabels } from "./hooks/use-skill-labels";
+import { useTexCompile } from "./hooks/use-tex-compile";
 import { useTreeContextMenu } from "./hooks/use-tree-context-menu";
 import { useTreeDragDrop } from "./hooks/use-tree-drag-drop";
 import { useTreeExpansion } from "./hooks/use-tree-expansion";
@@ -32,18 +35,18 @@ import { useTreeReveal } from "./hooks/use-tree-reveal";
 import { useTreeSelection } from "./hooks/use-tree-selection";
 import { MovePickerPopover } from "./move-picker-popover";
 import { TreeContextMenuPortal } from "./tree-context-menu";
-import { pathKey } from "./tree-helpers";
+import { isVirtualTreePath, pathKey } from "./tree-helpers";
 import { TreeCreateInput } from "./tree-inputs";
 import {
-	LibraryRow,
 	LoadingRows,
 	PlazaRow,
 	PlazaSourceRow,
 	TrashRow,
+	treeRowIndentStyle,
 } from "./tree-rows";
 import { TreeRowsViewport } from "./tree-rows-viewport";
-import { TreeSelectionBar } from "./tree-selection-bar";
 import type { TreeCreateDraft, TreeCreateKind, TreeRenameDraft } from "./types";
+import { buildZoteroCollectionReferences } from "./zotero-collection-references";
 
 type FileTreeProps = {
 	nodes: FileNode[];
@@ -69,14 +72,18 @@ type FileTreeProps = {
 	onSelectLibrary?: () => void;
 	/** Virtual trash node → recycle bin view in center pane. */
 	onSelectTrash?: () => void;
-	/** Virtual 广场 node → discovery source overview in center pane. */
-	onSelectPlaza?: () => void;
 	/** Virtual 广场 child node → that source's page in center pane. */
 	onSelectPlazaSource?: (source: PlazaSource) => void;
+	/** Catalog papers used to add Zotero multi-collection references in-place. */
+	zoteroCollectionPapers?: PaperLibraryRow[];
+	/** Open the real paper selected through that virtual collection view. */
+	onOpenZoteroCollectionPaper?: (relPath: string) => void;
 	/** Empty recycle bin (confirm + purge). From trash node context menu. */
 	onEmptyTrash?: () => void | Promise<void>;
 	/** Export library bibliography (Library node context menu). */
 	onExportLibrary?: () => void | Promise<void>;
+	onRescanLibrary?: () => void | Promise<void>;
+	libraryRescanning?: boolean;
 	/** True while export (or other library IO) is in progress — disables menu item. */
 	libraryExportBusy?: boolean;
 	/** Find new papers citing the library (Library node context menu). */
@@ -123,6 +130,8 @@ type FileTreeProps = {
 	onDropMove?: (paths: string[], targetPath: string) => void;
 	onCutPaths?: (paths: string[]) => void;
 	onPasteInto?: (targetPath: string) => void;
+	/** Report the semantic multi-selection count to the fixed sidebar header. */
+	onSelectionChange?: (count: number) => void;
 	/** Absolute paths currently staged by Cut (for row dimming). */
 	cutPaths?: string[];
 	/**
@@ -152,6 +161,12 @@ export type FileTreeHandle = {
 	cutSelected: () => void;
 	/** Paste cut items into the currently selected path. */
 	pasteIntoSelected: () => void;
+	/** Clear the transient multi-selection mode. */
+	clearSelection: () => void;
+	/** Open the move picker for the current multi-selection. */
+	moveSelected: (anchor: { x: number; y: number }) => void;
+	/** Move the current multi-selection to the recycle bin. */
+	deleteSelected: () => void;
 };
 
 /**
@@ -176,10 +191,13 @@ export const FileTree = memo(
 			onSelectFile,
 			onSelectLibrary,
 			onSelectTrash,
-			onSelectPlaza,
 			onSelectPlazaSource,
+			zoteroCollectionPapers = [],
+			onOpenZoteroCollectionPaper,
 			onEmptyTrash,
 			onExportLibrary,
+			onRescanLibrary,
+			libraryRescanning = false,
 			libraryExportBusy = false,
 			onDiscoverCiting,
 			citingScanBusy = false,
@@ -198,6 +216,7 @@ export const FileTree = memo(
 			onDropMove,
 			onCutPaths,
 			onPasteInto,
+			onSelectionChange,
 			cutPaths = [],
 			onDropLocalPdfs,
 			onLoadDirChildren,
@@ -209,7 +228,7 @@ export const FileTree = memo(
 		const plazaEnabled = useSettings((s) => s.plazaEnabled);
 		const plazaHiddenSources = useSettings((s) => s.plazaHiddenSources);
 		const containerRef = useRef<HTMLDivElement>(null);
-
+		const skillLabels = useSkillLabels(vaultPath, nodes);
 		const {
 			byPath,
 			byPathKey,
@@ -223,7 +242,17 @@ export const FileTree = memo(
 			paperMetaByRelPath,
 			paperTreeLabelMode,
 			paperTreeSortMode,
+			skillLabels,
 		});
+		const zoteroCollectionReferences = useMemo(
+			() =>
+				buildZoteroCollectionReferences({
+					papers: zoteroCollectionPapers,
+					vaultPath,
+					byPathKey,
+				}),
+			[zoteroCollectionPapers, vaultPath, byPathKey],
+		);
 
 		const expansion = useTreeExpansion({
 			nodes,
@@ -240,6 +269,7 @@ export const FileTree = memo(
 			vaultPath,
 			plazaEnabled,
 			plazaHiddenSources,
+			zoteroCollectionReferences,
 		});
 
 		const selection = useTreeSelection({
@@ -252,14 +282,25 @@ export const FileTree = memo(
 			onSelectFile,
 			onSelectLibrary,
 			onSelectTrash,
-			onSelectPlaza,
 			onSelectPlazaSource,
+			onOpenZoteroCollectionPaper,
 			onTogglePath: expansion.togglePath,
 			onDeletePath,
 			onDeletePaths,
 			onCutPaths,
 			onPasteInto,
+			onSelectionChange,
 		});
+
+		const handleRenamePath = useCallback(
+			(path: string) => {
+				if (!onStartRename || createDraft || renameDraft) return false;
+				if (isVirtualTreePath(path)) return false;
+				onStartRename(path);
+				return true;
+			},
+			[createDraft, onStartRename, renameDraft],
+		);
 
 		const { treeScrollRef, rowVirtualizer } = useTreeReveal({
 			treeSelectedPath,
@@ -285,6 +326,8 @@ export const FileTree = memo(
 			onReadPaper,
 		});
 
+		const texCompile = useTexCompile();
+
 		const movePicker = useMovePicker({
 			containerRef,
 			onMoveTo,
@@ -300,6 +343,7 @@ export const FileTree = memo(
 			useTreeContextMenu({
 				nodes,
 				vaultPath,
+				paperMetaByRelPath,
 				byPath,
 				cutPaths,
 				cutPathKeys,
@@ -308,9 +352,15 @@ export const FileTree = memo(
 				libraryExportBusy,
 				citingScanBusy,
 				pathsForAction: selection.pathsForAction,
+				prepareContextSelection: selection.prepareContextSelection,
 				openMovePicker: movePicker.openPicker,
 				onExportLibrary,
+				onRescanLibrary,
+				libraryRescanning,
 				onDiscoverCiting,
+				onDownloadAllMissing: paperActions.showLibraryDownload
+					? paperActions.downloadAllMissing
+					: undefined,
 				onEmptyTrash,
 				onOpenPaperNotes,
 				onEditPaperMeta,
@@ -321,6 +371,7 @@ export const FileTree = memo(
 				onCutPaths,
 				onPasteInto,
 				onMoveTo,
+				skillLabels,
 			});
 
 		const { collapsePaths, collapseToDefault } = expansion;
@@ -333,6 +384,12 @@ export const FileTree = memo(
 						: [];
 			collapsePaths(candidates);
 		}, [selection.selected, selectedPath, collapsePaths]);
+		const moveSelected = useCallback(
+			(anchor: { x: number; y: number }) => {
+				movePicker.openPicker(selection.orderedSelected(), anchor);
+			},
+			[movePicker.openPicker, selection.orderedSelected],
+		);
 
 		useImperativeHandle(
 			ref,
@@ -341,23 +398,21 @@ export const FileTree = memo(
 				collapseToDefault,
 				cutSelected: selection.cutSelected,
 				pasteIntoSelected: selection.pasteIntoSelected,
+				clearSelection: selection.clearSelection,
+				moveSelected,
+				deleteSelected: selection.runBatchDelete,
 			}),
 			[
 				collapseSelected,
 				collapseToDefault,
 				selection.cutSelected,
 				selection.pasteIntoSelected,
+				selection.clearSelection,
+				moveSelected,
+				selection.runBatchDelete,
 			],
 		);
 
-		const libraryRow = (
-			<LibraryRow
-				showDownload={paperActions.showLibraryDownload}
-				busy={paperActions.libraryBusy}
-				downloadingAll={paperActions.downloadingAll}
-				onDownloadAll={paperActions.downloadAllMissing}
-			/>
-		);
 		const trashRow = <TrashRow />;
 		const plazaExpanded = expansion.expanded.has(PLAZA_VIRTUAL_PATH);
 		const plazaRows = plazaEnabled ? (
@@ -365,9 +420,11 @@ export const FileTree = memo(
 				<PlazaRow expanded={plazaExpanded} />
 				{plazaExpanded
 					? visiblePlazaSources(plazaHiddenSources).map((source) => (
-							<div key={source.id} className="pl-3">
-								<PlazaSourceRow source={source} />
-							</div>
+							<PlazaSourceRow
+								key={source.id}
+								source={source}
+								style={treeRowIndentStyle(1)}
+							/>
 						))
 					: null}
 			</>
@@ -386,24 +443,14 @@ export const FileTree = memo(
 			<TooltipProvider delayDuration={300}>
 				<div
 					ref={containerRef}
+					// Scopes the global ⌘X / ⌘V tree shortcuts to this surface
+					// (see use-app-shortcuts) so viewers keep native cut/paste.
+					data-file-tree=""
 					className={cn(
 						"relative flex min-h-0 flex-1 flex-col select-none text-sm",
 						className,
 					)}
 				>
-					{selection.selected.size > 0 ? (
-						<TreeSelectionBar
-							count={selection.selected.size}
-							onMove={
-								onMoveTo
-									? (anchor) =>
-											movePicker.openPicker(selection.orderedSelected(), anchor)
-									: undefined
-							}
-							onDelete={selection.runBatchDelete}
-							onClear={selection.clearSelection}
-						/>
-					) : null}
 					<MovePickerPopover
 						picker={movePicker}
 						vaultPath={vaultPath}
@@ -411,20 +458,20 @@ export const FileTree = memo(
 					/>
 					<div
 						ref={treeScrollRef}
-						className="agentero-scroll min-h-0 flex-1 overflow-y-auto py-1"
+						className="agentero-scroll min-h-0 flex-1 overflow-y-auto px-2 py-1 [scrollbar-gutter:stable]"
 					>
 						{nodes.length === 0 && !createDraft ? (
 							<>
-								{/* Virtual library + trash + 广场 always available (empty vault or no vault yet) */}
+								{/* Trash + 广场 always available (empty vault or no vault yet). */}
 								<AiFileTree
 									selectedPath={treeSelectedPath}
 									selectedPaths={selection.selected}
 									expanded={expansion.expanded}
-									onExpandedChange={expansion.setExpanded}
+									onExpandedChange={expansion.setExpandedFromTree}
 									onContextMenuPath={handleContextMenuPath}
+									onRenamePath={handleRenamePath}
 									onSelectRow={selection.handleSelectRow}
 								>
-									{libraryRow}
 									{trashRow}
 									{plazaRows}
 								</AiFileTree>
@@ -441,8 +488,9 @@ export const FileTree = memo(
 								selectedPath={treeSelectedPath}
 								selectedPaths={selection.selected}
 								expanded={expansion.expanded}
-								onExpandedChange={expansion.setExpanded}
+								onExpandedChange={expansion.setExpandedFromTree}
 								onContextMenuPath={handleContextMenuPath}
+								onRenamePath={handleRenamePath}
 								onSelectRow={selection.handleSelectRow}
 								dropTargetPath={dragDrop.dropTarget}
 								onRowDragStart={dragDrop.handleRowDragStart}
@@ -453,7 +501,6 @@ export const FileTree = memo(
 								<TreeRowsViewport
 									flatRows={flatRows}
 									rowVirtualizer={rowVirtualizer}
-									libraryRow={libraryRow}
 									trashRow={trashRow}
 									createRow={createRow}
 									renameDraft={renameDraft}
@@ -466,6 +513,9 @@ export const FileTree = memo(
 									paperMetaByRelPath={paperMetaByRelPath}
 									paperTreeLabelMode={paperTreeLabelMode}
 									paperActions={paperActions}
+									texCompile={texCompile}
+									vaultPath={vaultPath}
+									skillLabels={skillLabels}
 								/>
 							</AiFileTree>
 						)}

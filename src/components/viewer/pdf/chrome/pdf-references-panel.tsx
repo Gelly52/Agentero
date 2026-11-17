@@ -1,4 +1,7 @@
+import { memo } from "react";
 import { ReferencesPanel } from "@/components/viewer/panels/references-panel";
+import { PDF_SIDE_PANEL } from "@/components/viewer/pdf/chrome/pdf-chrome-surface";
+import { cn } from "@/lib/core/utils";
 
 type PdfReferencesPanelProps = {
 	vaultPath: string | null;
@@ -7,7 +10,7 @@ type PdfReferencesPanelProps = {
 };
 
 /** Left-side citation panel. The toggle button lives in PdfLeftToolbar. */
-export function PdfReferencesPanel({
+export const PdfReferencesPanel = memo(function PdfReferencesPanel({
 	vaultPath,
 	paperPath,
 	showReferences,
@@ -15,7 +18,7 @@ export function PdfReferencesPanel({
 	if (!showReferences || !paperPath) return null;
 
 	return (
-		<aside className="agentero-scroll absolute inset-y-0 left-0 z-20 w-80 border-r bg-background/95 pt-11 pb-2 backdrop-blur-sm">
+		<aside data-pdf-chrome className={cn("agentero-scroll", PDF_SIDE_PANEL)}>
 			<ReferencesPanel
 				vaultPath={vaultPath}
 				paperPath={paperPath}
@@ -24,4 +27,4 @@ export function PdfReferencesPanel({
 			/>
 		</aside>
 	);
-}
+});

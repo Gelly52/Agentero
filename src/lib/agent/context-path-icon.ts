@@ -1,13 +1,19 @@
 import type { LucideIcon } from "lucide-react";
 import {
+	BookMarked,
 	FileCode2,
 	FileImage,
 	FileJson,
 	FileText,
 	FileType2,
 	Folder,
+	Rss,
 	ScrollText,
+	Sigma,
+	Table,
+	Telescope,
 } from "lucide-react";
+import { plazaMentionSource } from "@/lib/agent/plaza-mention";
 import {
 	formatPaperTreeLabel,
 	type PaperTreeLabelMode,
@@ -185,6 +191,11 @@ export function contextPathIcon(
 ): LucideIcon {
 	const opts = options ?? {};
 
+	// Virtual plaza mentions mirror the plaza source icons (telescope / rss).
+	const plazaSource = plazaMentionSource(path);
+	if (plazaSource === "feed") return Rss;
+	if (plazaSource === "arxiv-rec") return Telescope;
+
 	if (isPaperContextPath(path, opts.paperPaths)) {
 		return ScrollText;
 	}
@@ -192,8 +203,11 @@ export function contextPathIcon(
 		return Folder;
 	}
 	const base = normalizeContextPath(path).split("/").pop()?.toLowerCase() ?? "";
+	if (base.endsWith(".table.json")) return Table;
 	if (/\.pdf$/i.test(base)) return FileType2;
 	if (/\.(png|jpe?g|gif|webp|bmp|svg|avif|ico)$/i.test(base)) return FileImage;
+	if (/\.tex$/i.test(base)) return Sigma;
+	if (/\.bib$/i.test(base)) return BookMarked;
 	if (/\.json$/i.test(base)) return FileJson;
 	if (/\.(ts|tsx|js|jsx|rs|toml|py|go|java|c|cpp|h|hpp)$/i.test(base)) {
 		return FileCode2;

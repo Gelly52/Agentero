@@ -6,18 +6,29 @@ import { useStore } from "zustand";
 import type { AgentStepHandle } from "@/components/onboarding/steps/agent-step";
 import { AgentStep } from "@/components/onboarding/steps/agent-step";
 import { LayoutStep } from "@/components/onboarding/steps/layout-step";
+import { ProxyStep } from "@/components/onboarding/steps/proxy-step";
 import { ThemeStep } from "@/components/onboarding/steps/theme-step";
 import { TranslateStep } from "@/components/onboarding/steps/translate-step";
 import { VaultChoiceStep } from "@/components/onboarding/steps/vault-choice-step";
 import { WelcomeStep } from "@/components/onboarding/steps/welcome-step";
 import { ThemeModeSwitch } from "@/components/onboarding/theme-mode-switch";
 import { Button } from "@/components/ui/button";
+import {
+	Dialog,
+	DialogContent,
+	DialogDescription,
+	DialogFooter,
+	DialogHeader,
+	DialogTitle,
+} from "@/components/ui/dialog";
 import { useSettings, useVaultStore } from "@/hooks/use-app-stores";
+import { perfActive } from "@/lib/core/perf";
 import { isMobileApp, isTauri } from "@/lib/core/tauri";
 import { cn } from "@/lib/core/utils";
 import { listenOnboardingRequest } from "@/lib/onboarding/api";
 import { patchSettings } from "@/lib/settings/react-store";
-import { createNewVault, migrateZoteroFromWelcome } from "@/lib/vault/actions";
+import { setZoteroOpen } from "@/lib/shell/ui-store";
+import { createNewVault } from "@/lib/vault/actions";
 import { vaultStore } from "@/lib/vault/store";
 import type { OnboardingStepId } from "./flow";
 import { onboardingFlow } from "./flow";
@@ -59,6 +70,7 @@ export function OnboardingRoot() {
 	const recentVaults = useVaultStore((s) => s.recentVaults);
 	const open = useStore(onboardingStore, (s) => s.open);
 	const forceOpen = useStore(onboardingStore, (s) => s.forceOpen);
+	const [zoteroOfferOpen, setZoteroOfferOpen] = useState(false);
 
 	// Settings → main event: force the wizard open on demand.
 	useEffect(() => {
@@ -80,6 +92,7 @@ export function OnboardingRoot() {
 		() =>
 			isTauri() &&
 			!isMobileApp() &&
+			!perfActive() &&
 			!settings.onboardingDone &&
 			!vaultPath &&
 			recentVaults.length === 0,
@@ -100,18 +113,36 @@ export function OnboardingRoot() {
 		if (vaultPath) closeOnboarding();
 	}, [vaultPath]);
 
-	if (!open) return null;
+	if (!open && !zoteroOfferOpen) return null;
 
-	return <OnboardingDialog />;
+	return (
+		<>
+			{open ? (
+				<OnboardingDialog onVaultCreated={() => setZoteroOfferOpen(true)} />
+			) : null}
+			<ZoteroImportOfferDialog
+				open={zoteroOfferOpen}
+				onOpenChange={setZoteroOfferOpen}
+				onImport={() => {
+					setZoteroOfferOpen(false);
+					closeOnboarding();
+					setZoteroOpen(true);
+				}}
+				onLater={() => {
+					setZoteroOfferOpen(false);
+					patchSettings({ onboardingDone: true });
+				}}
+			/>
+		</>
+	);
 }
 
-function OnboardingDialog() {
+function OnboardingDialog({ onVaultCreated }: { onVaultCreated: () => void }) {
 	const { t } = useTranslation("onboarding");
 	const stepper = useOnboardingStepper();
 	const settings = useSettings((s) => s);
 	const patch = patchSettings;
 	const agentStepRef = useRef<AgentStepHandle>(null);
-
 	/** Per-step "choice made" gate for the footer Next button. */
 	const [gate, setGate] = useState<{
 		id: OnboardingStepId;
@@ -123,7 +154,10 @@ function OnboardingDialog() {
 		);
 	}, []);
 
-	const stepLabels = onboardingFlow.steps.map((step) => t(`steps.${step.id}`));
+	const stepLabels = stepper.steps.map((step) => t(`steps.${step.id}`));
+	const dotIndex = stepper.steps.findIndex(
+		(step) => step.id === stepper.current.id,
+	);
 
 	const gated = ["translate", "layout"].includes(stepper.current.id);
 	const canNext = gated
@@ -143,6 +177,10 @@ function OnboardingDialog() {
 		void stepper.next();
 	};
 
+	const onBack = () => {
+		void stepper.prev();
+	};
+
 	const finish = () => {
 		patch({ onboardingDone: true });
 		void import("@/lib/activity").then(({ track }) => {
@@ -154,16 +192,8 @@ function OnboardingDialog() {
 	const onCreateVault = () => {
 		void (async () => {
 			await createNewVault();
-			// Only finish once the vault is actually active; cancelling the
-			// picker leaves the wizard open.
-			if (vaultStore.getState().vaultPath) finish();
-		})();
-	};
-
-	const onImportZotero = () => {
-		void (async () => {
-			await migrateZoteroFromWelcome();
-			if (vaultStore.getState().vaultPath) finish();
+			// The vault must exist before the user can choose a Zotero source.
+			if (vaultStore.getState().vaultPath) onVaultCreated();
 		})();
 	};
 
@@ -173,6 +203,8 @@ function OnboardingDialog() {
 				return <WelcomeStep />;
 			case "theme":
 				return <ThemeStep settings={settings} patch={patch} />;
+			case "proxy":
+				return <ProxyStep settings={settings} patch={patch} />;
 			case "agent":
 				return <AgentStep ref={agentStepRef} />;
 			case "translate":
@@ -194,12 +226,7 @@ function OnboardingDialog() {
 					/>
 				);
 			case "vault":
-				return (
-					<VaultChoiceStep
-						onCreate={onCreateVault}
-						onImportZotero={onImportZotero}
-					/>
-				);
+				return <VaultChoiceStep onCreate={onCreateVault} />;
 		}
 	};
 
@@ -207,12 +234,14 @@ function OnboardingDialog() {
 		switch (stepper.current.id) {
 			case "theme":
 				return { title: t("theme.title"), desc: t("theme.desc") };
+			case "proxy":
+				return { title: t("proxy.title"), desc: t("proxy.desc") };
 			case "agent":
 				return { title: t("agent.title"), desc: t("agent.desc") };
 			case "translate":
 				return { title: t("translate.title"), desc: t("translate.desc") };
 			case "layout":
-				return { title: t("layout.title"), desc: t("layout.desc") };
+				return { title: t("layout.title"), desc: undefined };
 			case "vault":
 				return { title: t("vault.title"), desc: t("vault.desc") };
 			default:
@@ -223,7 +252,7 @@ function OnboardingDialog() {
 	const stepDesc = currentCopy?.desc;
 
 	return (
-		<div className="fixed inset-0 z-40 flex items-center justify-center bg-background p-6">
+		<div className="fixed inset-0 z-40 flex select-none items-center justify-center bg-background p-6">
 			<div
 				aria-hidden
 				className="pointer-events-none absolute inset-0 overflow-hidden"
@@ -232,7 +261,7 @@ function OnboardingDialog() {
 				<div className="absolute -right-24 -bottom-32 size-96 rounded-full bg-primary/10 blur-3xl" />
 			</div>
 
-			<div className="relative flex w-full max-w-xl flex-col overflow-hidden rounded-2xl border bg-card shadow-2xl">
+			<div className="relative flex w-full max-w-xl flex-col overflow-hidden rounded-2xl border bg-card shadow-dialog">
 				{/* Header: current step title + per-step action */}
 				<div className="flex items-start justify-between gap-3 px-6 pt-5">
 					<div className="min-w-0 max-w-md">
@@ -266,13 +295,7 @@ function OnboardingDialog() {
 					) : null}
 				</div>
 
-				<div
-					className={cn(
-						"px-6 py-5",
-						stepper.current.id !== "agent" &&
-							"agentero-scroll max-h-[24rem] overflow-y-auto",
-					)}
-				>
+				<div className="agentero-scroll max-h-[24rem] overflow-y-auto px-6 py-5">
 					<AnimatePresence mode="wait" initial={false}>
 						<motion.div
 							key={stepper.current.id}
@@ -291,17 +314,13 @@ function OnboardingDialog() {
 					{stepper.isFirst ? (
 						<div className="w-20" aria-hidden />
 					) : (
-						<Button
-							type="button"
-							variant="ghost"
-							onClick={() => void stepper.prev()}
-						>
+						<Button type="button" variant="ghost" onClick={onBack}>
 							{t("actions.back")}
 						</Button>
 					)}
 					{stepper.isFirst ? null : (
 						<div className="absolute left-1/2 flex -translate-x-1/2 items-center">
-							<FlowDots index={stepper.index} labels={stepLabels} />
+							<FlowDots index={dotIndex} labels={stepLabels} />
 						</div>
 					)}
 					<Button type="button" disabled={!canNext} onClick={onNext}>
@@ -311,5 +330,37 @@ function OnboardingDialog() {
 				</div>
 			</div>
 		</div>
+	);
+}
+
+function ZoteroImportOfferDialog({
+	open,
+	onOpenChange,
+	onImport,
+	onLater,
+}: {
+	open: boolean;
+	onOpenChange: (open: boolean) => void;
+	onImport: () => void;
+	onLater: () => void;
+}) {
+	const { t } = useTranslation("onboarding");
+	return (
+		<Dialog open={open} onOpenChange={onOpenChange}>
+			<DialogContent>
+				<DialogHeader>
+					<DialogTitle>{t("vault.zoteroOfferTitle")}</DialogTitle>
+					<DialogDescription>{t("vault.zoteroOfferDesc")}</DialogDescription>
+				</DialogHeader>
+				<DialogFooter>
+					<Button type="button" variant="ghost" onClick={onLater}>
+						{t("vault.zoteroNo")}
+					</Button>
+					<Button type="button" onClick={onImport}>
+						{t("vault.zotero")}
+					</Button>
+				</DialogFooter>
+			</DialogContent>
+		</Dialog>
 	);
 }

@@ -2,6 +2,7 @@
 
 import {
 	Code2,
+	Columns3,
 	ExternalLink,
 	Heading1,
 	Heading2,
@@ -13,6 +14,7 @@ import {
 	type LucideIcon,
 	MessageSquareWarning,
 	Quote,
+	Table2,
 	Workflow,
 } from "lucide-react";
 import { useEditorRef } from "platejs/react";
@@ -57,6 +59,7 @@ type SlashCommandMenuProps = {
 };
 
 const COMMAND_ICONS: Record<SlashCommandId, LucideIcon> = {
+	researchTable: Table2,
 	heading1: Heading1,
 	heading2: Heading2,
 	heading3: Heading3,
@@ -69,6 +72,7 @@ const COMMAND_ICONS: Record<SlashCommandId, LucideIcon> = {
 	internalLink: Link2,
 	externalLink: ExternalLink,
 	callout: MessageSquareWarning,
+	columns: Columns3,
 };
 
 export function SlashCommandMenu({
@@ -142,7 +146,7 @@ export function SlashCommandMenu({
 	return (
 		<ViewportFloating
 			point={{ x: draft.left, y: draft.top }}
-			className="z-50 w-64 overflow-hidden rounded-md border bg-popover text-popover-foreground shadow-md"
+			className="z-50 w-64 overflow-hidden rounded-lg border bg-popover text-popover-foreground shadow-overlay ring-1 ring-foreground/10"
 			data-editor-completion="slash"
 		>
 			<div

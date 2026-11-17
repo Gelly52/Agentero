@@ -3,8 +3,9 @@
  * Install may use a local/dev binary or download the same app version from GitHub Releases.
  */
 
-import { invoke } from "@tauri-apps/api/core";
-import { type ApiResult, invokeApi } from "@/lib/core/ipc";
+import { commands, type UiRequestPayload } from "@/lib/core/bindings";
+import { callApi } from "@/lib/core/ipc";
+import { logger } from "@/lib/core/logger";
 import { isTauri } from "@/lib/core/tauri";
 
 export type CliInstallStatus = {
@@ -18,6 +19,8 @@ export type CliInstallStatus = {
 	releasePageUrl: string;
 	canInstall: boolean;
 	installed: boolean;
+	/** Startup may install when true. Explicit uninstall sets this to false. */
+	autoInstallEnabled: boolean;
 	installPath: string | null;
 	shimCurrent: boolean;
 	preferredBinDir: string;
@@ -35,28 +38,108 @@ export type CliInstallResult = {
 };
 
 export function fetchCliInstallStatus(): Promise<CliInstallStatus> {
-	return invokeApi<CliInstallStatus>("cli_install_status", undefined, {
+	return callApi(() => commands.cliInstallStatus(), {
 		fallback: "Failed to read CLI install status",
 	});
 }
 
-export function installCliCommand(): Promise<CliInstallResult> {
-	return invokeApi<CliInstallResult>("cli_install_command", undefined, {
+export function installCliCommand(
+	automatic = false,
+): Promise<CliInstallResult> {
+	return callApi(() => commands.cliInstallCommand(automatic), {
 		fallback: "Failed to install CLI command",
 	});
 }
 
 export function uninstallCliCommand(): Promise<CliInstallResult> {
-	return invokeApi<CliInstallResult>("cli_uninstall_command", undefined, {
+	return callApi(() => commands.cliUninstallCommand(), {
 		fallback: "Failed to remove CLI command",
+	});
+}
+
+export type CliSyncOutcome = "synced" | "skipped";
+
+/**
+ * Install or re-align the CLI shim with the running app version.
+ *
+ * The Host downloads and verifies the CLI against the compiled-in app version,
+ * so the old process cannot pre-install the next CLI during an app update.
+ * The fresh app installs on startup unless the CLI already matches or the user
+ * explicitly uninstalled it. Never throws; callers can retry a transient
+ * release-asset or network failure and surface a final failure with a toast.
+ */
+export async function syncCliWithApp(): Promise<CliSyncOutcome | "failed"> {
+	if (!isTauri() || import.meta.env.DEV) return "skipped";
+	let status: CliInstallStatus;
+	try {
+		status = await fetchCliInstallStatus();
+	} catch (error) {
+		logger.warn("cli_sync status_read_failed", { error: String(error) });
+		return "skipped";
+	}
+	if (!status.autoInstallEnabled || status.shimCurrent || !status.canInstall) {
+		return "skipped";
+	}
+	logger.info("op start cli_sync", {
+		from: status.cliVersion ?? "?",
+		to: status.appVersion,
+	});
+	try {
+		const result = await installCliCommand(true);
+		if (result.action === "skipped") return "skipped";
+		logger.info("op end cli_sync ok=true", {
+			version: result.status.cliVersion ?? "?",
+			action: result.action,
+		});
+		return "synced";
+	} catch (error) {
+		logger.warn("op end cli_sync ok=false", { error: String(error) });
+		return "failed";
+	}
+}
+
+export type FinderServiceStatus = {
+	/** Quick Action integration exists only on macOS */
+	supported: boolean;
+	installed: boolean;
+	installPath: string | null;
+	appBundlePath: string | null;
+	/** installed && baked-in bundle matches the current app bundle */
+	current: boolean;
+	message: string | null;
+};
+
+export function fetchFinderServiceStatus(): Promise<FinderServiceStatus> {
+	return callApi(() => commands.finderServiceStatus(), {
+		fallback: "Failed to read Finder service status",
+	});
+}
+
+export function installFinderService(): Promise<FinderServiceStatus> {
+	return callApi(() => commands.finderServiceInstall(), {
+		fallback: "Failed to install Finder service",
+	});
+}
+
+export function uninstallFinderService(): Promise<FinderServiceStatus> {
+	return callApi(() => commands.finderServiceUninstall(), {
+		fallback: "Failed to remove Finder service",
 	});
 }
 
 /** Consume Host-queued vault path from a cold-start deep link (null if none). */
 export async function takePendingVaultOpen(): Promise<string | null> {
 	if (!isTauri()) return null;
-	const res = await invoke<ApiResult<string | null>>("vault_open_take_pending");
+	const res = await commands.vaultOpenTakePending();
 	if (!res.ok) return null;
 	// `data: null` means no pending path (not a failure).
+	return res.data ?? null;
+}
+
+/** Consume a Host-queued workspace UI request from a cold start (null if none). */
+export async function takePendingUiRequest(): Promise<UiRequestPayload | null> {
+	if (!isTauri()) return null;
+	const res = await commands.uiRequestTakePending();
+	if (!res.ok) return null;
 	return res.data ?? null;
 }

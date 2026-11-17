@@ -1,6 +1,6 @@
 /**
  * Layout-analysis cluster for the PDF viewer: region buckets, the analysis
- * run, the Figures-panel handlers, the visual-draft card state and the
+ * run, the Figures-panel handlers, the region-crop screen anchor and the
  * bulk-translate job.
  *
  * Grouped because they form one capability around `layoutAnalysisStore` +
@@ -15,7 +15,7 @@ import type { PdfEngine } from "@embedpdf/models";
 import type { useDocumentManagerCapability } from "@embedpdf/plugin-document-manager/react";
 import type { useLayoutAnalysisCapability } from "@embedpdf/plugin-layout-analysis/react";
 import type { useScroll } from "@embedpdf/plugin-scroll/react";
-import { type RefObject, useCallback, useMemo } from "react";
+import { type RefObject, useCallback } from "react";
 import type { PdfLayoutRegions } from "@/components/viewer/pdf/hooks/use-pdf-layout-regions";
 import { usePdfLayoutRegions } from "@/components/viewer/pdf/hooks/use-pdf-layout-regions";
 import { usePdfLayoutRun } from "@/components/viewer/pdf/hooks/use-pdf-layout-run";
@@ -23,7 +23,6 @@ import { usePdfLayoutTranslate } from "@/components/viewer/pdf/hooks/use-pdf-lay
 import { usePdfVisualDraft } from "@/components/viewer/pdf/hooks/use-pdf-visual-draft";
 import { renderPdfRegionPromptImage } from "@/components/viewer/pdf/region-crop";
 import type { PromptImage } from "@/lib/agent/api";
-import type { PdfAskNormalizedRect } from "@/lib/pdf/ask/types";
 import { type PdfLayoutRegion, setFocusedLayoutRegion } from "@/lib/pdf/layout";
 
 type LayoutCapability = ReturnType<
@@ -38,6 +37,7 @@ type ScrollCapability = ReturnType<typeof useScroll>["provides"];
 
 export type UsePdfLayoutClusterOptions = {
 	docId: string;
+	translationPane?: boolean;
 	totalPages: number;
 	/** Workspace active tab; only the active viewer auto-runs the analysis. */
 	isActive: boolean;
@@ -49,6 +49,8 @@ export type UsePdfLayoutClusterOptions = {
 	paperKey: string | null;
 	/** Vault root passed to the Agent as its cwd. */
 	vaultPath: string | null;
+	/** Viewer PDF bytes; hashed into the reflow IR cache key. */
+	pdfBytes?: ArrayBuffer | null;
 	/** Layout capability value gates the auto-run effect; the ref is never a dep. */
 	layoutCap: LayoutCapability;
 	layoutCapRef: RefObject<LayoutCapability>;
@@ -61,12 +63,13 @@ export type UsePdfLayoutClusterOptions = {
 	scrollRef: RefObject<ScrollCapability>;
 	/** Viewer host element, for the visual-draft card anchor. */
 	hostRef: RefObject<HTMLDivElement | null>;
+	/** True for remote papers with no local sidecar; disables layout analysis. */
+	isRemotePaper?: boolean;
+	/** True for PDFs outside papers/ (plain viewer): no layout analysis. */
+	plainViewer?: boolean;
 };
 
-export type PdfLayoutCluster = Omit<
-	PdfLayoutRegions,
-	"layoutDocRegions" | "layoutRawRegions"
-> &
+export type PdfLayoutCluster = PdfLayoutRegions &
 	ReturnType<typeof usePdfLayoutRun> &
 	ReturnType<typeof usePdfVisualDraft> &
 	ReturnType<typeof usePdfLayoutTranslate> & {
@@ -78,18 +81,18 @@ export type PdfLayoutCluster = Omit<
 		handleRenderLayoutThumb: (
 			region: PdfLayoutRegion,
 		) => Promise<PromptImage | null>;
-		/** On-page draft frame while the visual draft card is open. */
-		visualDraftRegion: { page: number; region: PdfAskNormalizedRect } | null;
 	};
 
 export function usePdfLayoutCluster({
 	docId,
+	translationPane = false,
 	totalPages,
 	isActive,
 	paperAbsPath,
 	paperRelPath,
 	paperKey,
 	vaultPath,
+	pdfBytes,
 	layoutCap,
 	layoutCapRef,
 	docCap,
@@ -97,11 +100,14 @@ export function usePdfLayoutCluster({
 	engineRef,
 	scrollRef,
 	hostRef,
+	isRemotePaper = false,
+	plainViewer = false,
 }: UsePdfLayoutClusterOptions): PdfLayoutCluster {
 	// Four hooks: region buckets, the analysis run, hover (sole owner of the two
 	// mutually exclusive hover cards) and the bulk-translate job.
 	const {
 		layoutOverlayVisible,
+		layoutDocRegions,
 		layoutRawRegions,
 		hoverableRegionsByPage,
 		rawRegionsByPage,
@@ -117,9 +123,13 @@ export function usePdfLayoutCluster({
 		layoutCapRef,
 		docCap,
 		docCapRef,
+		isRemotePaper,
+		plainViewer,
+		translationPane,
 	});
 
 	const handleAnalyzeLayout = useCallback(() => {
+		if (isRemotePaper || plainViewer) return;
 		startLayoutAnalysisRef.current({
 			force: false,
 			openFigures: true,
@@ -127,7 +137,7 @@ export function usePdfLayoutCluster({
 			asBackgroundTask: true,
 			notifyOnError: true,
 		});
-	}, [startLayoutAnalysisRef]);
+	}, [isRemotePaper, plainViewer, startLayoutAnalysisRef]);
 	// biome-ignore lint/correctness/useExhaustiveDependencies: scrollRef is an injected stable ref; EmbedPDF returns a fresh scope object per render, so only the ref may be read here.
 	const handleJumpToLayoutRegion = useCallback(
 		(region: PdfLayoutRegion) => {
@@ -135,7 +145,11 @@ export function usePdfLayoutCluster({
 				pageNumber: region.pageIndex + 1,
 				behavior: "instant",
 			});
-			setFocusedLayoutRegion(docId, region.id);
+			setFocusedLayoutRegion(docId, region.id, {
+				pageIndex: region.pageIndex,
+				bbox: region.bbox,
+				kind: region.kind,
+			});
 		},
 		[docId],
 	);
@@ -165,60 +179,76 @@ export function usePdfLayoutCluster({
 		[docId],
 	);
 
-	const {
-		visualDraftEditor,
-		openVisualDraftEditor,
-		closeVisualDraftEditor,
-		screenPointForRegion,
-	} = usePdfVisualDraft({ hostRef });
+	const { screenPointForRegion } = usePdfVisualDraft({ hostRef });
 
 	const {
+		reflowBusy,
+		reflowReady,
+		reflowOutput,
+		exportTranslatedPdf,
 		layoutTranslateItemsByPage,
 		layoutTranslatePageStateByPage,
 		layoutTranslateRunning,
+		layoutTranslatePreparing,
+		layoutTranslateWaiting,
+		layoutTranslateQueued,
 		layoutTranslateActive,
 		layoutTranslateLabel,
+		layoutTranslatePendingRequired,
+		layoutTranslateFromCache,
+		layoutTranslateStatus,
+		layoutTranslatePartial,
+		layoutTranslateProgress,
+		layoutTranslatePageCounts,
 		toggleLayoutTranslate,
 		togglePageLayoutTranslate,
 	} = usePdfLayoutTranslate({
+		reflowContext: () => {
+			const engine = engineRef.current,
+				document = docCapRef.current?.getDocument(docId);
+			return engine && document ? { engine, document } : null;
+		},
 		docId,
 		layoutRawRegions,
+		translationPane,
 		paperAbsPath,
+		paperRelPath,
 		paperKey,
 		vaultPath,
+		pdfBytes,
 	});
 
-	const visualDraftRegion = useMemo(
-		() =>
-			visualDraftEditor
-				? {
-						page: visualDraftEditor.page,
-						region: visualDraftEditor.region,
-					}
-				: null,
-		[visualDraftEditor],
-	);
-
 	return {
+		reflowBusy,
+		reflowReady,
+		reflowOutput,
+		exportTranslatedPdf,
 		layoutOverlayVisible,
+		layoutRawRegions,
 		hoverableRegionsByPage,
 		rawRegionsByPage,
 		startLayoutAnalysisRef,
+		layoutDocRegions,
 		layoutTaskRef,
 		handleAnalyzeLayout,
 		handleJumpToLayoutRegion,
 		handleRenderLayoutThumb,
-		visualDraftEditor,
-		openVisualDraftEditor,
-		closeVisualDraftEditor,
 		screenPointForRegion,
 		layoutTranslateItemsByPage,
 		layoutTranslatePageStateByPage,
 		layoutTranslateRunning,
+		layoutTranslatePreparing,
+		layoutTranslateWaiting,
+		layoutTranslateQueued,
 		layoutTranslateActive,
 		layoutTranslateLabel,
+		layoutTranslatePendingRequired,
+		layoutTranslateFromCache,
+		layoutTranslateStatus,
+		layoutTranslatePartial,
+		layoutTranslateProgress,
+		layoutTranslatePageCounts,
 		toggleLayoutTranslate,
 		togglePageLayoutTranslate,
-		visualDraftRegion,
 	};
 }

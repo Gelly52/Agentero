@@ -5,8 +5,44 @@
 import { X } from "lucide-react";
 import type { MouseEvent as ReactMouseEvent, ReactNode } from "react";
 import { cn } from "@/lib/core/utils";
+import { EASY_SCHOLAR_TAG_PREFIX, isEasyScholarTag } from "@/lib/easyscholar";
 import type { PaperTag } from "@/lib/paper/types";
+import { formatVenueTag, isSubmittedTagName } from "@/lib/paper/venue-tag";
 import { tagChipStyle, tagSwatchStyle } from "@/lib/ui/tag-colors";
+
+function parseEasyScholarTag(
+	name: string,
+): { key: string; value: string } | null {
+	if (!isEasyScholarTag(name)) return null;
+	const rest = name.slice(EASY_SCHOLAR_TAG_PREFIX.length);
+	const idx = rest.indexOf("=");
+	if (idx === -1) return { key: rest, value: "" };
+	return { key: rest.slice(0, idx), value: rest.slice(idx + 1) };
+}
+
+/** Render a short, human-readable label without the namespace prefix. */
+function formatEasyScholarTag(name: string): string {
+	const parsed = parseEasyScholarTag(name);
+	if (!parsed) return name;
+	const { key, value } = parsed;
+	switch (key) {
+		case "journal":
+			return value;
+		case "if":
+			return `IF ${value}`;
+		case "if5":
+			return `IF5 ${value}`;
+		case "jci":
+			return `JCI ${value}`;
+		case "rank": {
+			const sep = value.indexOf("=");
+			if (sep === -1) return value;
+			return `${value.slice(0, sep)}:${value.slice(sep + 1)}`;
+		}
+		default:
+			return `${key}=${value}`;
+	}
+}
 
 type PaperTagChipProps = {
 	tag: PaperTag;
@@ -29,7 +65,7 @@ export function PaperTagChip({
 }: PaperTagChipProps) {
 	const colored = tagChipStyle(tag.color);
 	const classNames = cn(
-		"inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[10px] leading-none",
+		"inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-caption leading-none",
 		colored ? "font-medium" : "bg-muted text-muted-foreground",
 		onClick &&
 			"cursor-pointer transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring",
@@ -39,6 +75,15 @@ export function PaperTagChip({
 				: "hover:bg-muted-foreground/20 hover:text-foreground"),
 		className,
 	);
+	const isEasyScholar = isEasyScholarTag(tag.name);
+	const isVenue = isSubmittedTagName(tag.name);
+	const displayName = isEasyScholar
+		? formatEasyScholarTag(tag.name)
+		: isVenue
+			? formatVenueTag(tag.name)
+			: tag.name;
+	const displayTitle =
+		title ?? (isEasyScholar || isVenue ? tag.name : undefined);
 	const body = (
 		<>
 			{tag.color ? (
@@ -48,7 +93,7 @@ export function PaperTagChip({
 					aria-hidden
 				/>
 			) : null}
-			{tag.name}
+			{displayName}
 			{trailing}
 		</>
 	);
@@ -59,7 +104,7 @@ export function PaperTagChip({
 				type="button"
 				className={classNames}
 				style={colored}
-				title={title}
+				title={displayTitle}
 				aria-label={ariaLabel}
 				onClick={onClick}
 			>
@@ -69,7 +114,7 @@ export function PaperTagChip({
 	}
 
 	return (
-		<span className={classNames} style={colored} title={title}>
+		<span className={classNames} style={colored} title={displayTitle}>
 			{body}
 		</span>
 	);

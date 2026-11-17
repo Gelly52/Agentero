@@ -1,23 +1,26 @@
 {
+	"navigator": { "hintTargets": "{{count}} 个键盘目标" },
 	"labels": {
 		"agent": "Agent",
 		"notes": "笔记",
-		"untitled": "未命名"
+		"untitled": "未命名",
+		"remoteArxiv": "远程 arXiv"
 	},
 	"commandPalette": {
 		"title": "快速打开",
-		"placeholder": "搜索论文与笔记正文…",
+		"placeholder": "搜索论文、笔记和表格…",
 		"commandsTitle": "命令",
 		"commandsPlaceholder": "输入命令名称…",
 		"commands": "命令",
 		"commandsEmpty": "输入以筛选命令（快速打开中也可用 > 前缀）",
 		"papers": "论文",
 		"recent": "最近论文",
+		"aliases": "别名",
 		"contents": "正文匹配",
 		"searching": "搜索中…",
 		"noResults": "无匹配",
 		"noVault": "请先打开知识库再搜索",
-		"empty": "输入以搜索论文与笔记正文"
+		"empty": "输入以搜索论文、笔记和表格"
 	},
 	"commands": {
 		"catApp": "应用",
@@ -25,6 +28,9 @@
 		"catVault": "Vault",
 		"catLibrary": "论文库",
 		"catTab": "标签",
+		"catPdf": "PDF",
+		"catEditor": "编辑器",
+		"toggleMarkdownSource": "切换 Markdown 源码",
 		"settingsOpen": "打开设置",
 		"settingsClose": "关闭设置",
 		"vaultOpen": "打开 Vault…",
@@ -46,6 +52,9 @@
 		"tabSplitPane": "向右分栏",
 		"tabNext": "下一标签",
 		"tabPrev": "上一标签",
+		"tabNextInGroup": "组内下一个标签页",
+		"tabPrevInGroup": "组内上一个标签页",
+		"exportAnnotatedPdf": "导出带批注的 PDF",
 		"wandOpen": "魔棒（按标识符入库）"
 	},
 	"titlebar": {
@@ -53,12 +62,16 @@
 		"hideLeftSidebar": "隐藏左侧边栏",
 		"showSidebarHint": "显示侧边栏 ({{shortcut}})",
 		"hideSidebarHint": "隐藏侧边栏 ({{shortcut}})",
-		"agentPanel": "Agent 面板",
 		"annotationsPanel": "批注",
 		"showRightSidebar": "显示右侧边栏",
 		"hideRightSidebar": "隐藏右侧边栏",
 		"showRightSidebarHint": "显示右侧边栏 ({{shortcut}})",
 		"hideRightSidebarHint": "隐藏右侧边栏 ({{shortcut}})",
+		"layout": "布局",
+		"layoutModes": "窗口布局",
+		"layoutAgent": "Agent",
+		"layoutNotes": "笔记",
+		"layoutReading": "阅读",
 		"settings": "设置",
 		"settingsHint": "设置 ({{shortcut}})",
 		"menuSettings": "设置…",
@@ -73,14 +86,22 @@
 	"diskConflict": {
 		"title": "“{{name}}” 已被外部修改（已保留你的未存改动）",
 		"reload": "载入磁盘版",
-		"saveBlocked": "“{{name}}” 已被外部修改——为避免丢稿，本次未写入。请先载入磁盘版，再重新编辑。"
+		"keepDraft": "保留草稿",
+		"saveBlocked": "“{{name}}” 已被外部修改——为避免丢稿，本次未写入。请先载入磁盘版，再重新编辑。",
+		"splitTitle": "这份笔记已被修改",
+		"splitDetail": "未保存的草稿还在。载入磁盘新版会丢掉草稿；保留草稿会用它覆盖磁盘上的新版本。"
 	},
 	"tabs": {
 		"strip": "已打开的文档",
+		"more": "更多标签页",
 		"close": "关闭 {{title}}",
 		"showHtml": "显示 HTML 版本",
 		"showPdf": "显示 PDF 版本",
-		"closeSplit": "关闭分屏 · {{title}}",
+		"openTexPdf": "打开 PDF",
+		"texCompiling": "正在编译…",
+		"contextCopyPath": "复制路径",
+		"copiedPath": "已复制路径",
+		"copyPathFailed": "复制路径失败",
 		"contextClose": "关闭",
 		"contextOpenNotes": "打开笔记",
 		"contextMoveToNewWindow": "移动至新窗口",
@@ -102,11 +123,7 @@
 			"blue": "蓝",
 			"indigo": "靛",
 			"purple": "紫"
-		},
-		"splitDropHint": "松开放到分屏",
-		"splitNotAllowed": "此项无法在分屏中打开。",
-		"emptyTitle": "未打开任何文档",
-		"emptyHint": "从侧边栏选择文件或论文即可在标签中打开。"
+		}
 	},
 	"windows": {
 		"loading": "加载中…",
@@ -121,12 +138,14 @@
 	"errors": {
 		"openVaultDesktopOnly": "打开知识库需要 Tauri 桌面应用（pnpm tauri dev）。",
 		"cannotPreview": "无法预览此文件类型：{{name}}",
+		"pdfReadFailed": "读取 PDF 失败：{{name}}",
 		"openVaultForLinks": "请先打开知识库，再导航知识库相对链接。",
 		"openVaultForGraph": "请先打开知识库，再导航图谱链接。",
 		"openVaultForCreate": "请先打开知识库，再创建双链目标。",
 		"wikiLinkAmbiguous": "双链目标不明确：{{target}}。请选择更具体的路径。",
 		"wikiLinkInvalidFragment": "目标文件存在，但标题或块引用不可用：{{target}}。",
-		"dropPdfNeedsVault": "请先打开知识库，再拖入 PDF 导入。"
+		"dropPdfNeedsVault": "请先打开知识库，再拖入 PDF 导入。",
+		"remotePaperUnavailable": "该远程论文预览已不再可用。"
 	},
 	"vault": {
 		"openDesktopOnly": "打开知识库仅在 Tauri 应用中可用。",
@@ -147,25 +166,24 @@
 			"repair": "修复双链",
 			"cancel": "保持链接不变",
 			"repaired": "已更新 {{count}} 个 Markdown 文件中的链接。",
-			"notRepaired": "已检测到外部改名，但无法安全建立修复计划，因此链接保持不变。",
-			"unverified": "文件监听器未提供完整的改名前后路径对，因此链接保持不变。",
 			"vaultChanged": "外部改名修复执行前，当前知识库已切换。",
 			"failed": "无法修复外部改名后的双链。"
 		},
 		"createDesktopOnly": "创建知识库仅在 Tauri 应用中可用。",
 		"dialogTitle": "选择 Agentero 知识库文件夹",
 		"createDialogTitle": "选择新建 Agentero 知识库的文件夹",
+		"zoteroVaultDialogTitle": "第 1 步：选择新的 Agentero 知识库文件夹",
 		"createFailed": "创建知识库失败。",
 		"readDesktopOnly": "读取本地文件需要 Tauri 应用。",
 		"writeDesktopOnly": "写入本地文件需要 Tauri 应用。",
 		"noVaultName": "未打开知识库",
 		"noVaultOpenTitle": "未打开知识库",
-		"noVaultOpenDescription": "打开或创建一个知识库文件夹以查看文件和笔记。",
 		"recentTitle": "最近",
 		"recentEmpty": "暂无最近使用的知识库。",
 		"removeRecent": "从最近列表移除 {{name}}",
 		"recentMissing": "文件夹已不存在：{{path}}",
 		"openPathMissing": "无法打开 Vault — 文件夹不存在：{{path}}",
+		"restoredVaultMissing": "上次的知识库已不存在，请重新打开：{{path}}",
 		"switchVault": "切换知识库",
 		"openVaultButton": "打开知识库…",
 		"openRemoteVaultButton": "打开远程…",
@@ -182,7 +200,6 @@
 		"remoteBadge": "远程",
 		"remoteNoFinder": "远程知识库无法在访达中显示。",
 		"remoteNoTerminal": "远程知识库无法在终端中打开。",
-		"remoteDeleteDirect": "远程删除将直接移除服务器上的文件（无回收站）。",
 		"runTauriPrefix": "运行",
 		"runTauriSuffix": "以打开知识库。",
 		"skillsSeeded": "已安装 {{count}} 个新技能：{{names}}",
@@ -211,35 +228,38 @@
 	},
 	"tasks": {
 		"title": "后台任务",
-		"toggle": "显示或隐藏后台任务",
-		"collapse": "收起",
 		"clearFinished": "清除已完成",
 		"cancel": "取消",
 		"cancelled": "已取消",
+		"failed": "任务失败",
 		"empty": "暂无任务",
 		"idle": "已完成",
 		"activeCount": "{{count}} 个进行中",
 		"downloadPaper": "下载论文资源",
-		"downloadAll": "下载缺失资源",
-		"downloadProgress": "{{current}} / {{total}}",
 		"downloadPhasePdf": "PDF",
 		"downloadPhaseTex": "TeX 源码",
+		"downloadPhaseAssets": "下载",
 		"downloadPhaseParse": "正在解析 PDF",
 		"downloadPhaseAsset": "资源",
 		"downloadPhaseLayoutModel": "版面模型",
 		"layoutModelDownload": "下载版面模型",
 		"layoutModelDetail": "魔搭 → HuggingFace · PP-DocLayoutV3",
 		"layoutAnalysis": "解析插图、表格、文字",
-		"layoutAnalysisDetail": "正在检测插图、表格与文字…",
+		"layoutTranslate": "翻译全文",
+		"layoutTranslateComplete": "补全译文",
 		"pdfParse": "解析 PDF 正文",
-		"pdfParseDetail": "正在生成可读论文正文…",
 		"parseRefs": "解析参考文献",
+		"openLayoutSettings": "打开解析设置",
+		"openTranslateSettings": "打开翻译设置",
+		"latexCompile": "编译 LaTeX",
+		"jevSmartHighlights": "jEV 智能高亮",
 		"downloadBytes": "{{phase}} · {{downloaded}} / {{total}}",
 		"downloadBytesUnknown": "{{phase}} · {{downloaded}}",
 		"batchProgress": "{{phase}} · {{current}} / {{total}}",
-		"downloadRefreshing": "正在刷新论文库… · {{path}}",
 		"lookupImport": "添加论文",
-		"lookupFetching": "正在拉取元数据与资源… · {{id}}",
+		"lookupFetching": "正在拉取元数据与资源…",
+		"skillLookup": "查找 Skill",
+		"skillLookupFetching": "正在查找可安装的 Skill…",
 		"libraryImport": "导入文献库",
 		"importPdf": "导入 PDF",
 		"recognizeMeta": "识别论文元数据",
@@ -256,5 +276,18 @@
 		"connector": "正在保存 Connector 附件",
 		"connectorComplete": "Connector 附件已就绪",
 		"connectorFailed": "Connector 附件失败"
+	},
+	"reminders": {
+		"dismiss": "不再提醒",
+		"layoutLocalModel": {
+			"title": "版面分析使用本地模型",
+			"description": "插图、表格、公式由本机模型检测，会额外占用内存与 CPU，内存较小的机器可能变慢。可在设置中改用云端服务商。",
+			"openSettings": "打开版面解析设置"
+		},
+		"networkProxy": {
+			"title": "网络请求失败",
+			"description": "如果访问受限，可在设置中配置代理后重试。",
+			"openSettings": "打开网络设置"
+		}
 	}
 }

@@ -1,23 +1,18 @@
-import wikiLink from "@flowershow/remark-wiki-link";
 import {
 	BaseFootnoteDefinitionPlugin,
 	BaseFootnoteReferencePlugin,
 } from "@platejs/footnote";
-import { MarkdownPlugin, remarkMdx, remarkMention } from "@platejs/markdown";
+import { MarkdownPlugin } from "@platejs/markdown";
 import { KEYS } from "platejs";
-import remarkEmoji from "remark-emoji";
-import remarkGfm from "remark-gfm";
-import remarkMath from "remark-math";
 import { MarkdownPastePlugin } from "@/components/editor/plugins/markdown-paste-plugin";
-import {
-	obsidianCalloutRules,
-	remarkObsidianCallout,
-} from "@/lib/markdown/callout";
-import { htmlRules, remarkPreserveHtml } from "@/lib/markdown/html";
-import {
-	remarkWikiLinkLiteralPaths,
-	wikiLinkRules,
-} from "@/lib/wiki/wikilink-model";
+import { obsidianCalloutRules } from "@/lib/markdown/callout";
+import { columnsRules } from "@/lib/markdown/columns";
+import { htmlRules } from "@/lib/markdown/html";
+import { imageGroupRules } from "@/lib/markdown/image-group";
+import { MARKDOWN_REMARK_PLUGINS } from "@/lib/markdown/remark-plugins";
+import { paragraphMarkdownRule } from "@/lib/markdown/serialize";
+import { researchTableRules } from "@/lib/research-table/markdown";
+import { wikiLinkRules } from "@/lib/wiki/wikilink-model";
 
 export const MarkdownKit = [
 	BaseFootnoteReferencePlugin.configure({
@@ -43,20 +38,16 @@ export const MarkdownKit = [
 	MarkdownPlugin.configure({
 		options: {
 			plainMarks: [KEYS.suggestion, KEYS.comment],
-			remarkPlugins: [
-				remarkMath,
-				remarkGfm,
-				[wikiLink, { aliasDivider: "|" }],
-				// After flowershow: keep vault `_` paths literal (no `\_` on save).
-				remarkWikiLinkLiteralPaths,
-				// biome-ignore lint/suspicious/noExplicitAny: remark-emoji's plugin type is incompatible with Plate's remark plugin type
-				remarkEmoji as any,
-				remarkMdx,
-				remarkMention,
-				remarkObsidianCallout,
-				remarkPreserveHtml,
-			],
-			rules: { ...wikiLinkRules, ...obsidianCalloutRules, ...htmlRules },
+			remarkPlugins: MARKDOWN_REMARK_PLUGINS,
+			rules: {
+				p: paragraphMarkdownRule,
+				...researchTableRules,
+				...wikiLinkRules,
+				...obsidianCalloutRules,
+				...imageGroupRules,
+				...columnsRules,
+				...htmlRules,
+			},
 		},
 	}),
 	MarkdownPastePlugin,

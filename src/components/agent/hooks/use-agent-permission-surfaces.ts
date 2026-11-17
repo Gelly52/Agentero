@@ -1,8 +1,12 @@
 /**
  * Interactive ACP surfaces: permission requests (ask mode), Codex
  * request_user_input elicitation, Grok ask_user_question, and the
- * tool-shaped ask promoted by the runtime. Each registers in the overlay
- * stack so Esc dismisses (and cancels) the topmost one.
+ * tool-shaped ask promoted by the runtime.
+ *
+ * The permission dialog is modal and blocks global shortcuts. The docked
+ * ask-user forms register on the overlay stack as non-modal so Esc can still
+ * dismiss them via {@link closeTopOverlay}, but they do not steal shortcut
+ * focus from the rest of the app.
  */
 import { type Dispatch, type SetStateAction, useRef, useState } from "react";
 import { useOverlayRegistration } from "@/hooks/use-overlay-registration";
@@ -15,11 +19,17 @@ import {
 	respondElicitation,
 	respondPermission,
 } from "@/lib/agent";
+import { useAgentSessionScope } from "@/lib/agent/agent-session-store";
 import type { ToolAskUserRequest } from "@/lib/agent/chat-state";
+import { claimInteractiveRequest } from "@/lib/agent/interactive-claims";
+import { events } from "@/lib/core/bindings";
+import { playCue } from "@/lib/ui/sound";
 
 export type UseAgentPermissionSurfacesOptions = {
 	toolAskUserRequest: ToolAskUserRequest | null;
 	setToolAskUserRequest: Dispatch<SetStateAction<ToolAskUserRequest | null>>;
+	/** Whether this surface owns the session that raised a request. */
+	ownsSession: (sessionId: string) => boolean;
 };
 
 export type AgentPermissionSurfaces = {
@@ -34,7 +44,12 @@ export type AgentPermissionSurfaces = {
 export function useAgentPermissionSurfaces({
 	toolAskUserRequest,
 	setToolAskUserRequest,
+	ownsSession,
 }: UseAgentPermissionSurfacesOptions): AgentPermissionSurfaces {
+	const { scopeId } = useAgentSessionScope();
+	// Overlay ids are keyed per chat surface: two mounted panels (rail + Zen
+	// slot) must not replace each other's stack entry.
+	const overlayId = (name: string) => (scopeId ? `${name}:${scopeId}` : name);
 	// Forward ACP permission requests (ask mode) to the user for an explicit decision.
 	const [permissionRequest, setPermissionRequest] =
 		useState<PermissionRequest | null>(null);
@@ -48,17 +63,22 @@ export function useAgentPermissionSurfaces({
 
 	const permissionRequestRef = useRef(permissionRequest);
 	permissionRequestRef.current = permissionRequest;
-	useOverlayRegistration("agent-permission", permissionRequest !== null, () => {
-		const req = permissionRequestRef.current;
-		if (!req) return;
-		void respondPermission(req.requestId, null);
-		setPermissionRequest(null);
-	});
+	useOverlayRegistration(
+		overlayId("agent-permission"),
+		permissionRequest !== null,
+		() => {
+			const req = permissionRequestRef.current;
+			if (!req) return;
+			void respondPermission(req.requestId, null);
+			setPermissionRequest(null);
+		},
+		{ modal: false },
+	);
 
 	const elicitationRequestRef = useRef(elicitationRequest);
 	elicitationRequestRef.current = elicitationRequest;
 	useOverlayRegistration(
-		"agent-elicitation",
+		overlayId("agent-elicitation"),
 		elicitationRequest !== null,
 		() => {
 			const req = elicitationRequestRef.current;
@@ -69,42 +89,58 @@ export function useAgentPermissionSurfaces({
 			});
 			setElicitationRequest(null);
 		},
+		{ modal: false },
 	);
 
 	const askUserRequestRef = useRef(askUserRequest);
 	askUserRequestRef.current = askUserRequest;
-	useOverlayRegistration("agent-ask-user", askUserRequest !== null, () => {
-		const req = askUserRequestRef.current;
-		if (!req) return;
-		void respondAskUser({
-			requestId: req.requestId,
-			action: "cancel",
-		});
-		setAskUserRequest(null);
-	});
+	useOverlayRegistration(
+		overlayId("agent-ask-user"),
+		askUserRequest !== null,
+		() => {
+			const req = askUserRequestRef.current;
+			if (!req) return;
+			void respondAskUser({
+				requestId: req.requestId,
+				action: "cancel",
+			});
+			setAskUserRequest(null);
+		},
+		{ modal: false },
+	);
 
 	const toolAskUserRequestRef = useRef(toolAskUserRequest);
 	toolAskUserRequestRef.current = toolAskUserRequest;
 	useOverlayRegistration(
-		"agent-tool-ask-user",
+		overlayId("agent-tool-ask-user"),
 		toolAskUserRequest !== null,
 		() => {
 			setToolAskUserRequest(null);
 		},
+		{ modal: false },
 	);
 
-	useTauriEvent<PermissionRequest>("agent:permission-request", (payload) =>
-		setPermissionRequest(payload),
-	);
+	useTauriEvent(events.agentPermissionRequest, (payload) => {
+		if (!ownsSession(payload.sessionId)) return;
+		if (!claimInteractiveRequest(payload.requestId)) return;
+		playCue("attention");
+		setPermissionRequest(payload);
+	});
 
-	useTauriEvent<ElicitationRequest>("agent:elicitation-request", (payload) => {
+	useTauriEvent(events.agentElicitationRequest, (payload) => {
+		if (!ownsSession(payload.sessionId)) return;
+		if (!claimInteractiveRequest(payload.requestId)) return;
 		// Prefer host elicitation over tool-card promote.
+		playCue("attention");
 		setToolAskUserRequest(null);
 		setElicitationRequest(payload);
 	});
 
-	useTauriEvent<AskUserRequest>("agent:ask-user-request", (payload) => {
+	useTauriEvent(events.agentAskUserRequest, (payload) => {
+		if (!ownsSession(payload.sessionId)) return;
+		if (!claimInteractiveRequest(payload.requestId)) return;
 		// Grok ext is the authoritative respond path; drop tool-promote duplicate.
+		playCue("attention");
 		setToolAskUserRequest(null);
 		setAskUserRequest(payload);
 	});

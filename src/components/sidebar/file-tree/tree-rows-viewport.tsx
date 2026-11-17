@@ -3,20 +3,27 @@
  * to its renderer (virtual rows, inline drafts, paper leaves, files/folders).
  */
 import type { Virtualizer } from "@tanstack/react-virtual";
-import { FolderIcon } from "lucide-react";
+import { Bot, FolderIcon, ScrollText, Sparkles } from "lucide-react";
 import type { ReactNode } from "react";
+import { TREE_ROW_INDENT_STEP_PX } from "@/components/sidebar/tree-row-styles";
 import { contextPathIcon } from "@/lib/agent/context-path-icon";
 import {
 	formatPaperTreeLabel,
 	type PaperMetadata,
 	type PaperTreeLabelMode,
 	paperAssetDownloadReasons,
-	paperHasVisibleAttachments,
+	paperHasVisibleChildren,
 	paperNeedsRead,
 } from "@/lib/paper";
 import { PLAZA_VIRTUAL_PATH } from "@/lib/plaza";
 import type { FileNode } from "@/lib/vault";
+import {
+	isVaultAgentRoot,
+	isVaultSkillDirectory,
+	type SkillTreeLabel,
+} from "@/lib/vault/agent-tree";
 import type { PaperRowActions } from "./hooks/use-paper-row-actions";
+import type { TexCompileActions } from "./hooks/use-tex-compile";
 import { pathKey } from "./tree-helpers";
 import { TreeRenameInput } from "./tree-inputs";
 import {
@@ -24,6 +31,8 @@ import {
 	PaperTreeRow,
 	PlazaRow,
 	PlazaSourceRow,
+	treeRowIndentStyle,
+	ZoteroCollectionReferenceRow,
 } from "./tree-rows";
 import type { FlatRow, TreeRenameDraft } from "./types";
 
@@ -35,6 +44,9 @@ type RowContext = {
 	paperMetaByRelPath?: ReadonlyMap<string, PaperMetadata>;
 	paperTreeLabelMode: PaperTreeLabelMode;
 	paperActions: PaperRowActions;
+	texCompile?: TexCompileActions;
+	vaultPath?: string | null;
+	skillLabels?: ReadonlyMap<string, SkillTreeLabel>;
 	renameDraft?: TreeRenameDraft | null;
 	onConfirmRename?: (path: string, newName: string) => void | Promise<void>;
 	onCancelRename?: () => void;
@@ -43,16 +55,17 @@ type RowContext = {
 export type TreeRowsViewportProps = RowContext & {
 	flatRows: FlatRow[];
 	rowVirtualizer: Virtualizer<HTMLDivElement, Element>;
-	libraryRow: ReactNode;
 	trashRow: ReactNode;
 	createRow: ReactNode;
 };
 
 function PaperLeafRow({
 	node,
+	depth,
 	ctx,
 }: {
 	node: FileNode;
+	depth: number;
 	ctx: RowContext;
 }): ReactNode {
 	const { paperActions: actions } = ctx;
@@ -68,6 +81,7 @@ function PaperLeafRow({
 	return (
 		<PaperTreeRow
 			node={node}
+			depth={depth}
 			isCut={ctx.cutPathKeys.has(pathKey(node.path))}
 			label={formatPaperTreeLabel(ctx.paperTreeLabelMode, meta, node.name)}
 			downloadReasons={downloadReasons}
@@ -80,7 +94,7 @@ function PaperLeafRow({
 				actions.downloadingAll ||
 				Boolean(actions.readingPath)
 			}
-			expandable={paperHasVisibleAttachments(node)}
+			expandable={paperHasVisibleChildren(node)}
 			expanded={ctx.expanded.has(node.path)}
 			onDownload={showDownload ? () => actions.downloadPaper(node) : undefined}
 			onRead={showRead ? () => actions.readPaper(node) : undefined}
@@ -91,13 +105,21 @@ function PaperLeafRow({
 function RenameRow({
 	node,
 	ctx,
+	isPaper,
 }: {
 	node: FileNode;
 	ctx: RowContext;
+	isPaper?: boolean;
 }): ReactNode {
 	if (!ctx.renameDraft) return null;
 	let icon: ReactNode;
-	if (node.kind === "directory") {
+	if (isPaper) {
+		icon = <ScrollText className="size-4 shrink-0 text-muted-foreground" />;
+	} else if (isVaultAgentRoot(ctx.vaultPath, node.path)) {
+		icon = <Bot className="size-4 shrink-0 text-muted-foreground" />;
+	} else if (isVaultSkillDirectory(ctx.vaultPath, node.path)) {
+		icon = <Sparkles className="size-4 shrink-0 text-muted-foreground" />;
+	} else if (node.kind === "directory") {
 		icon = <FolderIcon className="size-4 text-blue-500" />;
 	} else {
 		const Icon = contextPathIcon(node.name);
@@ -115,27 +137,55 @@ function RenameRow({
 	);
 }
 
-function renderRow(row: FlatRow, props: TreeRowsViewportProps): ReactNode {
-	if (row.kind === "library") return props.libraryRow;
+function renderRow(
+	row: FlatRow,
+	props: TreeRowsViewportProps,
+	depth: number,
+): ReactNode {
 	if (row.kind === "trash") return props.trashRow;
 	if (row.kind === "plaza")
 		return <PlazaRow expanded={props.expanded.has(PLAZA_VIRTUAL_PATH)} />;
-	if (row.kind === "plazaSource") return <PlazaSourceRow source={row.source} />;
-	if (row.kind === "create") return props.createRow;
-	// Paper folders are leaves and keep their action buttons while renaming.
-	if (props.renameDraft?.path === row.node.path) {
-		return row.paperLeaf ? null : <RenameRow node={row.node} ctx={props} />;
+	if (row.kind === "plazaSource")
+		return (
+			<PlazaSourceRow source={row.source} style={treeRowIndentStyle(depth)} />
+		);
+	if (row.kind === "zoteroCollectionReference") {
+		return (
+			<ZoteroCollectionReferenceRow
+				path={row.path}
+				label={row.paper.title || row.paper.id}
+				depth={depth}
+			/>
+		);
 	}
-	if (row.paperLeaf) return <PaperLeafRow node={row.node} ctx={props} />;
+	if (row.kind === "create")
+		return (
+			<div style={{ paddingLeft: depth * TREE_ROW_INDENT_STEP_PX }}>
+				{props.createRow}
+			</div>
+		);
+	if (props.renameDraft?.path === row.node.path) {
+		return (
+			<div style={{ paddingLeft: depth * TREE_ROW_INDENT_STEP_PX }}>
+				<RenameRow node={row.node} ctx={props} isPaper={row.paperLeaf} />
+			</div>
+		);
+	}
+	if (row.paperLeaf)
+		return <PaperLeafRow node={row.node} depth={depth} ctx={props} />;
 	return (
 		<NodeTreeRow
 			node={row.node}
+			depth={depth}
 			isCut={props.cutPathKeys.has(pathKey(row.node.path))}
 			pendingLoad={
 				Boolean(row.node.childrenPending) ||
 				props.loadingDirs.has(row.node.path)
 			}
 			expanded={props.expanded.has(row.node.path)}
+			texCompile={props.texCompile}
+			vaultPath={props.vaultPath}
+			skillLabels={props.skillLabels}
 		/>
 	);
 }
@@ -151,7 +201,7 @@ export function TreeRowsViewport(props: TreeRowsViewportProps) {
 				const row = flatRows[vi.index];
 				if (!row) return null;
 				const depth =
-					row.kind === "library" || row.kind === "trash" || row.kind === "plaza"
+					row.kind === "trash" || row.kind === "plaza"
 						? 0
 						: row.kind === "plazaSource"
 							? 1
@@ -161,13 +211,15 @@ export function TreeRowsViewport(props: TreeRowsViewportProps) {
 						key={row.key}
 						data-index={vi.index}
 						ref={rowVirtualizer.measureElement}
-						className="absolute top-0 left-0 w-full"
+						className="absolute left-0 w-full"
 						style={{
-							transform: `translateY(${vi.start}px)`,
-							paddingLeft: depth * 12,
+							// Prefer `top` over `transform: translateY(...)`. Per-row
+							// compositor layers go blank in WKWebView (Tauri macOS)
+							// after paper open / tree refresh until the next scroll.
+							top: vi.start,
 						}}
 					>
-						{renderRow(row, props)}
+						{renderRow(row, props, depth)}
 					</div>
 				);
 			})}

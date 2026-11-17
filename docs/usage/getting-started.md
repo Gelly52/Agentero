@@ -9,7 +9,7 @@
 | 平台 | 最低要求 |
 |---|---|
 | macOS | 12.0+ |
-| Windows | 发布页 x64 安装包 |
+| Windows | 发布页 x64（`x86_64`）或 ARM64（`arm64`）安装包 |
 | Linux | Ubuntu **22.04+**（需 **webkit2gtk 4.1**，包名常见 `libwebkit2gtk-4.1-0`） |
 
 Linux 桌面包在 Ubuntu 22.04 上构建。更旧的发行版（如 Ubuntu 20.04，仅有 webkit2gtk 4.0）请先升级系统。
@@ -70,7 +70,7 @@ ResearchVault/
 如果已有目录中的文件没有立即出现在 Library：
 
 1. 打开 Library（左侧虚拟节点，或关光文档后回到全库）。
-2. 点击 **Rescan**。
+2. 右键左侧 **papers/** 论文库节点，选择 **重新扫描 papers/**（Rescan papers/）；空库时也可点击中央的扫描按钮。
 3. 等待扫描完成后重新查看论文列表。
 
 有 Zotero 文库时，欢迎页也可选择 **从 Zotero 迁移**（迁移前会先创建 Vault）。详见 [导入和管理论文](import-papers.md)。
@@ -95,7 +95,7 @@ ResearchVault/
 2. Library 能显示论文或空状态。
 3. 能新建一个 Markdown 文件并保存。
 4. 若有 PDF，打开后可翻页和 `⌘F` 搜索。
-5. `⌘P` / `⌘K` 能打开快速打开面板。
+5. `⌘P` 能打开快速打开面板；划词后 `⌘K` 快速对话、`⇧⌘L` 加入 Agent 对话，`⌘L` 切换右栏。组合可在「设置 → 快捷键」修改。
 
 ## 数据位置和备份
 
@@ -110,6 +110,14 @@ ResearchVault/
 | `~/.local/share/agentero/usage.sqlite` | 本机使用记录（不在 Vault 内；设置 → 通用 → 隐私可关或清除） |
 
 建议定期备份整个 Vault。若使用 Git，优先提交 Markdown、JSON、TeX 和其它源文件；`catalog.sqlite` 也应随 Vault 一起备份，以保留 Library 元数据。
+
+## 自动更新失败
+
+设置中点击更新时若弹出 **「无法安装更新，请重试」**（英文 **Couldn't install the update. Try again**），通常是下载安装包时网络不通或代理不稳导致：
+
+1. **换一个代理节点**后重试；确认当前网络能访问 GitHub Releases。
+2. 检查 **Settings → General → Network proxy** 的代理配置是否正确。
+3. 若仍失败，可直接到 [发布页](https://github.com/poco-ai/agentero/releases) 手动下载最新安装包。
 
 ## 下一步
 

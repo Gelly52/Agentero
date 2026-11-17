@@ -1,7 +1,8 @@
 import { BookOpen, ChevronRight } from "lucide-react";
 import { useMemo } from "react";
 import { useTranslation } from "react-i18next";
-import { Shimmer } from "@/components/ai-elements/shimmer";
+import { PaperTitle } from "@/components/paper/paper-title";
+import { Shimmer } from "@/components/ui/shimmer";
 import { cn } from "@/lib/core/utils";
 import type { PaperMetadata } from "@/lib/paper/types";
 
@@ -29,7 +30,7 @@ export function MobileLibraryPage({
 		);
 	}, [papers, query]);
 	return (
-		<section className="flex h-full min-h-0 flex-col">
+		<section className="flex h-full min-h-0 select-none flex-col">
 			<div className="agentero-scroll flex-1">
 				{loading && papers.length === 0 ? (
 					<div className="grid h-full place-items-center px-6">
@@ -53,7 +54,7 @@ export function MobileLibraryPage({
 										</div>
 										<span className="min-w-0 flex-1">
 											<span className="line-clamp-2 block font-medium text-base leading-6">
-												{paper.title}
+												<PaperTitle text={paper.title} />
 											</span>
 											<span className="mt-1 block truncate text-muted-foreground text-sm">
 												{paper.authors.join(", ")}

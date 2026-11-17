@@ -14,10 +14,11 @@
  */
 
 import i18n from "@/i18n";
-import { enqueueBackgroundTask } from "@/lib/core/background-tasks";
+import { commands } from "@/lib/core/bindings";
 import { errorText } from "@/lib/core/error";
-import { invokeApi } from "@/lib/core/ipc";
+import { callApiResult } from "@/lib/core/ipc";
 import { notifyError, notifySuccess, notifyWarning } from "@/lib/core/notify";
+import { enqueueTaskSettled, type TaskExecutorContext } from "@/lib/core/tasks";
 import { lookupSubmit } from "@/lib/paper/import-actions";
 import { currentLookupParentDir } from "@/lib/paper/library-actions";
 import { refreshLibrary } from "@/lib/paper/library-store";
@@ -33,19 +34,8 @@ export type PlazaImportRequest = {
 	title: string | null;
 };
 
-type PaperCommitResult = {
-	/** A genuine failure throws through `invokeApi`; these are the only states. */
-	status: "created" | "deduped" | "skipped";
-	id: string;
-	path: string;
-	title: string;
-	pdf: boolean;
-	/** Non-fatal asset problems, e.g. the publisher PDF could not be fetched. */
-	assetMessages: string[];
-};
-
 /**
- * The 魔棒 import runs inside a background task that `lookupSubmit` does not
+ * The 魔棒 import settles through `onComplete`, which this frame does not
  * await, so a failure in there never reaches our `catch`. Settle regardless
  * after this long so the row cannot stay stuck pending; the tasks panel still
  * reports the real error. A retry is harmless — the Host dedupes by id.
@@ -61,8 +51,25 @@ function isArxivRow(request: PlazaImportRequest): boolean {
 	}
 }
 
+/** paper id from a `paperswithcode.co/paper/<id>` row (arXiv id or catalog id). */
+function pwcPaperId(request: PlazaImportRequest): string | null {
+	try {
+		const url = new URL(request.url);
+		if (url.hostname !== "paperswithcode.co") return null;
+		const match = /^\/paper\/([^/?#]+)/.exec(url.pathname);
+		if (!match) return null;
+		const id = decodeURIComponent(match[1]).trim();
+		return id || null;
+	} catch {
+		return null;
+	}
+}
+
 /** arXiv rows: reuse 魔棒 so `arxiv_id` and the LaTeX source come along. */
-function importViaLookup(request: PlazaImportRequest): Promise<boolean> {
+function importViaLookup(
+	request: PlazaImportRequest,
+	parentDir: string,
+): Promise<boolean> {
 	return new Promise<boolean>((resolve) => {
 		let settled = false;
 		const timer = setTimeout(() => settle(false), SETTLE_TIMEOUT_MS);
@@ -73,6 +80,7 @@ function importViaLookup(request: PlazaImportRequest): Promise<boolean> {
 			resolve(ok);
 		}
 		void lookupSubmit([request.url], {
+			parentDir,
 			onComplete: (result) => settle(result.imported.length > 0),
 		}).catch((error) => {
 			notifyError(errorText(error));
@@ -85,29 +93,94 @@ function importViaLookup(request: PlazaImportRequest): Promise<boolean> {
 async function importViaPage(
 	request: PlazaImportRequest,
 	vaultPath: string,
+	parentDir: string,
 ): Promise<boolean> {
-	const label = request.title?.trim() || request.id;
-	const result = await enqueueBackgroundTask(
-		{
-			kind: "lookup",
-			title: i18n.t("app:plazaImport.taskTitle"),
-			detail: label,
+	await enqueueTaskSettled({
+		kind: "import",
+		vaultPath,
+		path: parentDir,
+		lane: "normal",
+		params: {
+			mode: "plaza",
+			id: request.id,
+			title: request.title,
+			branch: request.branch || "venue",
+			parentDir,
 		},
-		({ id }) =>
-			invokeApi<PaperCommitResult>(
-				"paper_coolpapers_import",
-				{
-					args: {
-						vaultPath,
-						parentDir: currentLookupParentDir(),
-						branch: request.branch || "venue",
-						id: request.id,
-						taskId: id,
-					},
-				},
-				{ fallback: i18n.t("app:plazaImport.failed") },
-			),
-	);
+	});
+	return true;
+}
+
+/** Papers with Code rows resolve their catalog page on the Host side. */
+async function importViaPwc(
+	paperId: string,
+	request: PlazaImportRequest,
+	vaultPath: string,
+	parentDir: string,
+): Promise<boolean> {
+	await enqueueTaskSettled({
+		kind: "import",
+		vaultPath,
+		path: parentDir,
+		lane: "normal",
+		params: {
+			mode: "plaza",
+			source: "pwc",
+			id: paperId,
+			title: request.title,
+			parentDir,
+		},
+	});
+	return true;
+}
+
+type PlazaJobParams = {
+	id?: string;
+	title?: string | null;
+	branch?: string;
+	source?: string;
+	parentDir?: string;
+};
+
+function plazaJobParams(params: unknown): PlazaJobParams {
+	return (params && typeof params === "object" ? params : {}) as PlazaJobParams;
+}
+
+/** Executor body of a 广场 (`mode: "plaza"`) import job. */
+export async function runPlazaImportJob(
+	ctx: TaskExecutorContext,
+): Promise<void> {
+	const vaultPath = ctx.vaultPath;
+	const params = plazaJobParams(ctx.params);
+	const id = params.id?.trim() ?? "";
+	if (!id) throw new Error("plaza import job is missing its source id");
+	const label = params.title?.trim() || id;
+	const parentDir = params.parentDir?.trim() || currentLookupParentDir();
+	const result =
+		params.source === "pwc"
+			? await callApiResult(
+					() =>
+						commands.paperPwcImport({
+							vaultPath,
+							parentDir,
+							paperId: id,
+							// The job id doubles as the Host progress + cancel task id.
+							taskId: ctx.jobId,
+						}),
+					{ fallback: i18n.t("app:plazaImport.failed") },
+				)
+			: await callApiResult(
+					() =>
+						commands.paperCoolpapersImport({
+							vaultPath,
+							parentDir,
+							branch: params.branch || "venue",
+							id,
+							// The job id doubles as the Host progress + cancel task id.
+							taskId: ctx.jobId,
+						}),
+					{ fallback: i18n.t("app:plazaImport.failed") },
+				);
 
 	await refreshTree(vaultPath);
 	await refreshLibrary();
@@ -118,12 +191,11 @@ async function importViaPage(
 		// The unit is in the library; only the PDF is missing. Say so instead of
 		// reporting a clean success the user would later find untrue.
 		else notifyWarning(i18n.t("app:plazaImport.importedNoPdf", { name }));
-		return true;
+		return;
 	}
 	notifyWarning(
 		i18n.t("app:plazaImport.duplicate", { name: result.title || label }),
 	);
-	return true;
 }
 
 /**
@@ -131,9 +203,13 @@ async function importViaPage(
  *
  * Does not open the imported paper — that would pull the user out of the
  * browsing panel, which is the wrong trade while importing several in a row.
+ *
+ * `parentDir` is the folder picked in the plaza import menu; omitted, the
+ * current tree selection decides, as before.
  */
 export async function importPlazaPaper(
 	request: PlazaImportRequest,
+	parentDir?: string,
 ): Promise<boolean> {
 	const vaultPath = getVaultPath();
 	if (!vaultPath) {
@@ -145,10 +221,13 @@ export async function importPlazaPaper(
 		return false;
 	}
 
+	const target = parentDir?.trim() || currentLookupParentDir();
 	try {
+		const pwcId = pwcPaperId(request);
+		if (pwcId) return await importViaPwc(pwcId, request, vaultPath, target);
 		return isArxivRow(request)
-			? await importViaLookup(request)
-			: await importViaPage(request, vaultPath);
+			? await importViaLookup(request, target)
+			: await importViaPage(request, vaultPath, target);
 	} catch (error) {
 		notifyError(errorText(error));
 		return false;

@@ -1,6 +1,6 @@
 # 移动端前端与 iOS 远程连接
 
-> 状态：**M1 已实现，M2 已提交 TestFlight（内测中）**。当前移动端已包含二维码/配对链接连接、连接状态恢复、论文库搜索、PDF 分块缓存、NOTES 编辑、桌面 Agent 流式输出与权限应答、ACP Agent 切换、历史会话恢复和移动端侧栏；多主机/LAN 回退仍在后续范围。面向用户的操作说明见 [移动端](../usage/mobile.md)。
+> 状态：**M1 已实现，M2 已提交 TestFlight（内测）**；iOS 发布已冻结（2026-10-16）：不再随 tag 自动构建上传，需要时手动触发 `ios-testflight.yml`。当前移动端已包含二维码/配对链接连接、连接状态恢复、论文库搜索、PDF 分块缓存、NOTES 编辑、桌面 Agent 流式输出与权限应答、ACP Agent 切换、历史会话恢复和移动端侧栏；多主机/LAN 回退仍在后续范围。面向用户的操作说明见 [移动端](../usage/mobile.md)。
 > 决策：iOS **不做本地 Vault**，App 是桌面端的纯远程客户端 —— 扫码配对后经 **relay + 端到端加密** 连接电脑上的 Agentero，读写电脑上的库，并驱动电脑上的 BYOA Agent。
 > Android：已初始化 Tauri Android 目标（`src-tauri/gen/android`，包名 `com.poco_ai.agentero`）。定位与 iOS 相同——纯远程客户端，`src/main.tsx` 经 `isMobileApp()`（`src/lib/core/tauri.ts`，iOS/Android UA 检测）加载同一移动壳；liteparse、菜单事件等桌面能力用 `cfg(not(any(target_os = "ios", target_os = "android")))` 一并排除。本地调试：`pnpm tauri android dev` / `pnpm tauri android build --apk`（需 ANDROID_HOME + NDK）。发布：`.github/workflows/release.yml` 的 `android` job（与 `installers`/`cli` 并行，同一 draft release）在 tag 推送时构建签名 APK `Agentero_<版本>_aarch64.apk`；需 `ANDROID_KEYSTORE*` secrets，缺失则跳过该 job 而不阻塞桌面发布。
 
@@ -117,14 +117,14 @@ QR = App URL + fragment 中的 offer；解析入口 `parseConnectionOfferFromUrl
 ```
 
 - **桌面 Bridge**（新 feature `src-tauri/src/features/bridge/`）：桌面 App 内的连接端点，不是独立进程。开关在 Settings → 远程访问（默认关）。开启后向 relay 建立控制通道，并为每个已配对设备的连接建数据通道。
-- **Relay**：**自建**（决策已定，见 §3.1）。当前采用 [`poco-ai/paseo-relay`](https://github.com/poco-ai/paseo-relay) 的 Apache-2.0 Paseo-compatible fork，部署于 `relay.philfan.cn`；拓扑沿用 `serverId` 路由 + 纯密文转发，Agentero 的 Bridge/E2EE 仍独立实现。
+- **Relay**：**自建**（决策已定，见 §3.1）。当前采用 [`poco-ai/paseo-relay`](https://github.com/poco-ai/paseo-relay) 的 Apache-2.0 Paseo-compatible fork，部署于 `relay.agentero.app`；拓扑沿用 `serverId` 路由 + 纯密文转发，Agentero 的 Bridge/E2EE 仍独立实现。
 - **iOS App**：Tauri 2 iOS 壳 + 复用现有 React 前端；不注册任何本地 Vault 命令，所有数据经 Bridge RPC。
 
 ### 3.1 Relay 服务（自建）
 
 relay 解决的唯一问题：手机在外网、电脑在 NAT 后面，双方都无法主动连对方 —— relay 是公网**会合点**。它不存数据、不解密、无数据库；因为上层已 E2EE，relay 只见 IP / 时间 / 包大小。本质是一个按 `serverId` 配对两条 WebSocket 的交换机。
 
-**技术选型**：采用 Elixir/OTP + Bandit + Syn 的现成实现，维护于 [`poco-ai/paseo-relay`](https://github.com/poco-ai/paseo-relay)，作为独立服务运行在 `relay.philfan.cn`。这样先验证真实 WebSocket、跨节点 ownership 和部署适配器；后续如需要 Cloudflare Workers + Durable Objects，再将同一公开协议实现为另一个部署适配器，不改变 Bridge 接口。Relay 不解析上层协议，只处理 query 参数、控制消息和帧转发。
+**技术选型**：采用 Elixir/OTP + Bandit + Syn 的现成实现，维护于 [`poco-ai/paseo-relay`](https://github.com/poco-ai/paseo-relay)，作为独立服务运行在 `relay.agentero.app`。这样先验证真实 WebSocket、跨节点 ownership 和部署适配器；后续如需要 Cloudflare Workers + Durable Objects，再将同一公开协议实现为另一个部署适配器，不改变 Bridge 接口。Relay 不解析上层协议，只处理 query 参数、控制消息和帧转发。
 
 **路由与角色**（Paseo Relay v2）：
 
@@ -135,12 +135,13 @@ GET /ws?v=2&serverId=<agt_…>&role=client                       → client（re
 ```
 
 - client 接入 → Relay 分配 `connectionId`，经 server-control 下发 `{type:"connected",connectionId}`；Bridge 建对应 server-data 通道后按 connectionId 一对一转发；
+- `e2ee_hello.key` 使用标准、带 `=` 填充的 Base64（客户端发送、桌面 Host 解析保持一致）；二维码 offer 与设备身份字段仍使用 base64url。Relay 会以 `1008 Invalid handshake key` 拒绝不符合编码要求的握手；传输层保留非正常关闭的状态码与原因。
 - 断开时 Relay 向对端发 `{type:"disconnected",connectionId}`；Bridge 控制通道重连后经 `{type:"sync",connectionIds:[…]}` 对账；
 - Bridge 控制通道每 10s 应用层 ping，30s 无响应视为掉线；client 侧指数退避重连（1s→30s，带抖动）。
 
 **relay 自身不做认证**（照 paseo）：`serverId` 是路由键不是秘密，安全性完全由 Bridge 侧的 E2EE + 设备验签兜底（§5.3）。relay 只做**滥用防护**：每 serverId 并发 client 上限、每 IP 建连速率限制、单帧大小上限、空闲会话回收。
 
-**运维与自托管**：当前公网入口为 `wss://relay.philfan.cn/ws`，其 `GET /health` 用于存活检查，`GET /ready` 用于就绪检查。TLS 终止层必须支持 WebSocket Upgrade 且保留 query 参数；入口层负责按 IP 限制新建连接速率与帧大小。协议与 Relay 源码开源；设置界面不展示 relay 地址（默认端点内置），自托管用户可经 `bridge_start` 的 `relayEndpoint` 参数替换。offer 里携带 `relay.endpoint`，所以换 relay 只需重新出二维码。日志只记连接元数据（serverId 前缀哈希、时长、字节数），不记内容，不记完整 IP。
+**运维与自托管**：当前公网入口为 `wss://relay.agentero.app/ws`，其 `GET /health` 用于存活检查，`GET /ready` 用于就绪检查。TLS 终止层必须支持 WebSocket Upgrade 且保留 query 参数；入口层负责按 IP 限制新建连接速率与帧大小。协议与 Relay 源码开源；设置界面不展示 relay 地址（默认端点内置），自托管用户可经 `bridge_start` 的 `relayEndpoint` 参数替换。offer 里携带 `relay.endpoint`，所以换 relay 只需重新出二维码。日志只记连接元数据（serverId 前缀哈希、时长、字节数），不记内容，不记完整 IP。
 
 ---
 
@@ -181,7 +182,7 @@ Bridge 服务的是**桌面当前打开的 Vault**（多窗口时取发起开关
   "v": 1,
   "serverId": "agt_…",
   "hostPublicKeyB64": "…",         // Bridge 静态公钥
-  "relay": { "endpoint": "relay.philfan.cn:443" },
+  "relay": { "endpoint": "relay.agentero.app:443" },
   "hostName": "Phil 的 MacBook Pro", // 展示用
   "pin": false                       // 预留：true 时要求确认码
 }
@@ -239,7 +240,7 @@ relay 不可达时（自托管用户 / 断网内网）：offer 的 `relay.endpoi
 
 ### 6.2 RPC 方法 = 现有 Tauri 命令面
 
-Bridge 不发明新领域 API：`method` 直接映射到现有 `#[tauri::command]` 背后的领域函数（`features/catalog/papers.rs`、`features/vault/tree.rs`、`features/search/mod.rs` 均以 `&Path` 为根、不依赖 Tauri State，天然可复用）。白名单制：
+Bridge 不发明新领域 API：`method` 直接映射到现有 `#[tauri::command]` 背后的领域函数（`features/paper/catalog/papers.rs`、`features/vault/tree.rs`、`features/markdown/search/mod.rs` 均以 `&Path` 为根、不依赖 Tauri State，天然可复用）。白名单制：
 
 | 组 | 方法（首批） |
 |---|---|
@@ -374,15 +375,15 @@ Agent **只在桌面**运行：iOS 发 `agent_run_once` RPC → 桌面走完全�
 
 | 阶段 | 内容 | 验收 |
 |---|---|---|
-| M0 Relay | [`poco-ai/paseo-relay`](https://github.com/poco-ai/paseo-relay)：Paseo-compatible 三角色路由与部署适配器，公网入口 `relay.philfan.cn` | `GET /health`、`GET /ready` 通过；两个 WebSocket 客户端经 relay 互通；断线重连与 sync 对账通过 |
-| M1 Bridge 内核 | `features/bridge/`：身份/密钥、v2 `server` 控制+数据通道、E2EE、设备配对与验签、RPC 白名单映射；Settings 开关 + 二维码 | **已完成**：已对 `wss://relay.philfan.cn/ws` 完成加密双向帧联调，Bridge 单元测试覆盖协议、加密、认证与 Agent 会话过滤 |
+| M0 Relay | [`poco-ai/paseo-relay`](https://github.com/poco-ai/paseo-relay)：Paseo-compatible 三角色路由与部署适配器，公网入口 `relay.agentero.app` | `GET /health`、`GET /ready` 通过；两个 WebSocket 客户端经 relay 互通；断线重连与 sync 对账通过 |
+| M1 Bridge 内核 | `features/bridge/`：身份/密钥、v2 `server` 控制+数据通道、E2EE、设备配对与验签、RPC 白名单映射；Settings 开关 + 二维码 | **已完成**：已对 `wss://relay.agentero.app/ws` 完成加密双向帧联调，Bridge 单元测试覆盖协议、加密、认证与 Agent 会话过滤 |
 | M2 iOS MVP | 扫码配对 + Library / 阅读（PDF+NOTES）/ Agent 对话 + 权限应答 | **功能已实现**：扫码/粘贴链接、Library 搜索、NOTES 编辑、Agent 切换、流式输出与权限应答、PDF 分块缓存、会话恢复（`agent_list_sessions` / `agent_load_session` 已入 Bridge 白名单，iOS 回前台自动补齐时间线）；下一步进入 TestFlight 内测 |
 | M3 打磨 | NOTES 编辑（含保存冲突检查）、标签/已读、wiki backlinks、多主机切换、iPad 双栏 | — |
 | P2 之后 | APNs 推送、LAN 直连兜底（含 Tailscale 手动地址）、headless `agentero bridge serve`、`remote:` Vault 透传 | — |
 
 ## 12. 开放问题
 
-- Relay 域名已定为 `relay.philfan.cn`；免费额度耗尽后的成本分担、定价与限额策略未定；
+- Relay 域名已定为 `relay.agentero.app`；免费额度耗尽后的成本分担、定价与限额策略未定；
 - 协议 schema 的单一来源：Rust 定义 + 生成 TS 类型（`ts-rs`/specta），避免手写两份；
 - iOS 端 Markdown 编辑器裁剪范围（桌面 CodeMirror 栈在移动端的可用性）；
 - 多设备同时在线的写并发（MVP：允许多设备连接，写入走桌面现有保存冲突检查即可）。

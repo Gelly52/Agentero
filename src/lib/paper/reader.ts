@@ -8,7 +8,6 @@
  * prompt can disagree about whether `$` / `/` activates anything.
  */
 
-import { invoke } from "@tauri-apps/api/core";
 import i18n from "@/i18n";
 import {
 	type AgentFailedEvent,
@@ -16,6 +15,7 @@ import {
 	type AgentPlanEvent,
 	type AgentResultPayload,
 	type AgentToolEvent,
+	listAgents,
 	listenAgentCompleted,
 	listenAgentFailed,
 	listenAgentPlan,
@@ -23,35 +23,37 @@ import {
 	type RunOnceAccepted,
 	runOnce,
 } from "@/lib/agent";
-import {
-	enqueueBackgroundTask,
-	updateBackgroundTask,
-} from "@/lib/core/background-tasks";
+import { updateBackgroundTask } from "@/lib/core/background-tasks";
+import { commands } from "@/lib/core/bindings";
 import { errorText } from "@/lib/core/error";
+import { runLocalActivity } from "@/lib/core/tasks";
 import { isTauri } from "@/lib/core/tauri";
 import { setPaperIsRead } from "@/lib/paper/api";
 import { loadPaperMetadata } from "@/lib/paper/load-meta";
+import { paperTaskLabel } from "@/lib/paper/task-label";
 import { loadSettings } from "@/lib/settings";
+import { resolveTranslateAgent } from "@/lib/translate";
 import { joinVaultPath } from "@/lib/vault";
 
 const PAPER_READER_SKILL_ID = "paper-reader";
 
-/** Prevent concurrent reads of the same paper (auto + Zap). */
+/** Prevent concurrent reads of the same paper (auto + manual). */
 const inflightReads = new Set<string>();
 
 /**
  * Language line for paper-reader NOTES.md body, based on the resolved App
  * locale (`i18n.language` after settings load: `en` | `zh-CN`).
- * Fixed skill section headings stay English; only the body language changes.
+ * Fixed skill section headings come from the Chinese paper-reader skill; only
+ * the body language changes.
  */
 export function paperReaderLanguageInstruction(
 	language: string = i18n.language,
 ): string {
 	const lang = (language || "en").toLowerCase();
 	if (lang.startsWith("zh")) {
-		return "Write the NOTES.md body in Chinese (Simplified). Keep the fixed English section headings from the skill (e.g. ## Method).";
+		return "Write the NOTES.md body in Chinese (Simplified). Keep the fixed Chinese section headings from the skill (e.g. ## 方法).";
 	}
-	return "Write the NOTES.md body in English.";
+	return "Write the NOTES.md body in English. Keep the fixed Chinese section headings from the skill (e.g. ## 方法).";
 }
 
 /**
@@ -69,8 +71,24 @@ export function buildPaperReaderUserPrompt(
 		"Prefer TeX under source/, else PAPER.md, else local PDF.",
 		`Write structured lecture notes into \`${paperRel}/NOTES.md\`.`,
 		paperReaderLanguageInstruction(language),
-		"Keep [[wikilinks]]. End with ## Sources listing Vault-relative paths you read.",
+		"Keep valid [[wikilinks]]. Use inline PDF fragment links or notes wikilinks for citations; do not add a trailing ## Sources block.",
 	].join("\n");
+}
+
+/**
+ * Agent seat for the background paper-reader run: the `paperReader` settings
+ * seat (empty = default Agent + the model last picked for it).
+ *
+ * ACP sessions otherwise start on whatever model the Agent CLI defaults to
+ * (for OpenCode that is a free Zen model), so the workflow has to pin the model
+ * explicitly — same fallback the chat composer and the other seats resolve.
+ */
+async function resolvePaperReaderSeat(): Promise<{
+	agentId?: string;
+	modelId?: string;
+}> {
+	const registry = await listAgents().catch(() => null);
+	return resolveTranslateAgent(loadSettings().paperReader, registry);
 }
 
 function planDetail(entries: AgentPlanEntry[]): string {
@@ -185,29 +203,32 @@ export async function runPaperReaderWorkflow(opts: {
 	inflightReads.add(paperRel);
 
 	try {
-		await enqueueBackgroundTask(
+		await runLocalActivity(
 			{
 				kind: "paperRead",
 				title: i18n.t("app:tasks.paperRead"),
-				detail: paperRel,
+				detail: paperTaskLabel(paperRel),
 			},
 			async ({ id, signal, setDetail }) => {
 				setDetail(i18n.t("app:tasks.paperReadStarting"));
 
 				const userPrompt = buildPaperReaderUserPrompt(paperRel);
+				const seat = await resolvePaperReaderSeat();
 
 				const accepted: RunOnceAccepted = await runOnce({
+					agentId: seat.agentId,
+					modelId: seat.modelId,
 					vaultPath: opts.vaultRoot,
 					workflow: "paper_reader",
 					target: paperRel,
 					prompt: userPrompt,
 					skillIds: [PAPER_READER_SKILL_ID],
-					autoApprove: true,
+					permissionMode: "auto",
 					// Background workflow — never surface in Agent chat history.
 					hideFromChatHistory: true,
 				});
 				const cancelAgent = () => {
-					void invoke("agent_cancel_run", { sessionId: accepted.sessionId });
+					void commands.agentCancelRun(accepted.sessionId);
 				};
 				if (signal.aborted) {
 					cancelAgent();
@@ -246,7 +267,7 @@ export function paperAssetsReadyForReader(flags: {
  * (shows left-bottom progress). Returns true when a run started.
  *
  * Default setting is **off**. Does not throw on skip; rethrows agent/workflow
- * failures so callers can surface errors. Manual Zap always uses
+ * failures so callers can surface errors. Manual runs always use
  * {@link runPaperReaderWorkflow} directly.
  */
 export async function maybeAutoRunPaperReader(opts: {

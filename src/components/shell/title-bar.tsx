@@ -2,7 +2,10 @@ import { PanelLeft, Settings } from "lucide-react";
 import { memo } from "react";
 import { useTranslation } from "react-i18next";
 import { AgentLogo } from "@/components/agent/agent-logo";
+import { LayoutMenu } from "@/components/shell/layout-menu";
+import { TrafficLightSpacer } from "@/components/shell/traffic-light-spacer";
 import { UpdateIndicator } from "@/components/shell/update-indicator";
+import { WindowHeader } from "@/components/shell/window-header";
 import { Button } from "@/components/ui/button";
 import {
 	ContextMenu,
@@ -23,27 +26,23 @@ import {
 	TooltipProvider,
 	TooltipTrigger,
 } from "@/components/ui/tooltip";
+import { useShortcutLabel } from "@/hooks/use-shortcut-label";
 import { useAgentChromeStore } from "@/lib/agent/agent-chrome-store";
 import { cn } from "@/lib/core/utils";
 import { moveFeatureToWindow } from "@/lib/shell/leaf";
 import { openSettingsWindow } from "@/lib/shell/settings-window";
-import { formatShortcutById } from "@/lib/shell/shortcuts";
+import type { LayoutMode } from "@/lib/shell/ui-store";
 import { openPalette } from "@/lib/shell/ui-store";
-
-/** Platform-formatted shortcut chips for title bar tooltips (⌥⌘… on macOS, Ctrl+… elsewhere). */
-const SIDEBAR_SHORTCUT = formatShortcutById("toggleSidebar");
-const CHAT_SHORTCUT = formatShortcutById("toggleChat");
-const SETTINGS_SHORTCUT = formatShortcutById("settings");
-const QUICK_OPEN_SHORTCUT = formatShortcutById("quickOpen");
-const COMMAND_PALETTE_SHORTCUT = formatShortcutById("commandPalette");
 
 type TitleBarProps = {
 	isMacDesktop: boolean;
 	showSettingsGear: boolean;
 	sidebarCollapsed: boolean;
 	rightSidebarOpen: boolean;
+	layoutMode: LayoutMode;
 	onToggleSidebar: () => void;
 	onToggleAgent: () => void;
+	onApplyLayoutMode: (mode: Exclude<LayoutMode, "custom">) => void;
 	onOpenSettings: () => void;
 };
 
@@ -56,27 +55,25 @@ export const TitleBar = memo(function TitleBar({
 	showSettingsGear,
 	sidebarCollapsed,
 	rightSidebarOpen,
+	layoutMode,
 	onToggleSidebar,
 	onToggleAgent,
+	onApplyLayoutMode,
 	onOpenSettings,
 }: TitleBarProps) {
 	const { t } = useTranslation(["app"]);
+	const SIDEBAR_SHORTCUT = useShortcutLabel("toggleSidebar");
+	const CHAT_SHORTCUT = useShortcutLabel("toggleChat");
+	const SETTINGS_SHORTCUT = useShortcutLabel("settings");
+	const QUICK_OPEN_SHORTCUT = useShortcutLabel("quickOpen");
+	const COMMAND_PALETTE_SHORTCUT = useShortcutLabel("commandPalette");
 	const agentTemplate = useAgentChromeStore((s) => s.template);
 
 	return (
-		<header
-			data-titlebar
-			className="flex h-8 shrink-0 items-center border-b select-none"
-		>
-			{/*
-			  Traffic lights: x=14, three ~14px buttons + gaps → ends ~68px.
-			  Keep extra gap so the sidebar toggle never hugs the lights.
-			*/}
+		<WindowHeader>
+			{/* Collapses in native fullscreen, where macOS hides the lights. */}
 			{isMacDesktop ? (
-				<div
-					className="w-[92px] shrink-0 self-stretch"
-					data-tauri-drag-region
-				/>
+				<TrafficLightSpacer />
 			) : (
 				<div className="w-2 shrink-0 self-stretch" data-tauri-drag-region />
 			)}
@@ -85,10 +82,11 @@ export const TitleBar = memo(function TitleBar({
 					<Tooltip>
 						<TooltipTrigger asChild>
 							<Button
-								type="button"
 								variant="ghost"
-								size="icon-xs"
+								size="icon-sm"
 								data-tb-sidebar
+								data-hint
+								data-hint-priority="1"
 								aria-label={
 									sidebarCollapsed
 										? t("titlebar.showLeftSidebar")
@@ -115,6 +113,7 @@ export const TitleBar = memo(function TitleBar({
 				<div className="min-w-0 flex-1 self-stretch" data-tauri-drag-region />
 				<div className="flex shrink-0 items-center gap-0.5 pr-2">
 					<UpdateIndicator />
+					<LayoutMenu value={layoutMode} onValueChange={onApplyLayoutMode} />
 					<ContextMenu>
 						<Tooltip>
 							<TooltipTrigger asChild>
@@ -122,8 +121,10 @@ export const TitleBar = memo(function TitleBar({
 									<Button
 										type="button"
 										variant="ghost"
-										size="icon-xs"
+										size="icon-sm"
 										data-tb-agent
+										data-hint
+										data-hint-priority="1"
 										aria-label={
 											rightSidebarOpen
 												? t("titlebar.hideRightSidebar")
@@ -164,15 +165,13 @@ export const TitleBar = memo(function TitleBar({
 							</ContextMenuItem>
 						</ContextMenuContent>
 					</ContextMenu>
-				</div>
-				{/*
+					{/*
 				  Windows / Linux have no native menu bar, so the gear doubles as a
 				  compact app menu: settings entries plus the palette actions that
 				  otherwise only exist as keyboard shortcuts (discoverability).
 				  Caption buttons are drawn by the OS.
 				*/}
-				{showSettingsGear ? (
-					<div className="flex shrink-0 items-center gap-0.5 pl-1">
+					{showSettingsGear ? (
 						<DropdownMenu>
 							<Tooltip>
 								<TooltipTrigger asChild>
@@ -180,16 +179,10 @@ export const TitleBar = memo(function TitleBar({
 										<Button
 											type="button"
 											variant="ghost"
-											size="icon-xs"
-											className="group"
+											size="icon-sm"
 											aria-label={t("titlebar.settings")}
 										>
-											<Settings
-												className={cn(
-													"size-3.5",
-													"transition-transform duration-200 ease-out group-hover:rotate-90",
-												)}
-											/>
+											<Settings className="size-3.5" />
 										</Button>
 									</DropdownMenuTrigger>
 								</TooltipTrigger>
@@ -230,9 +223,9 @@ export const TitleBar = memo(function TitleBar({
 								</DropdownMenuItem>
 							</DropdownMenuContent>
 						</DropdownMenu>
-					</div>
-				) : null}
+					) : null}
+				</div>
 			</TooltipProvider>
-		</header>
+		</WindowHeader>
 	);
 });

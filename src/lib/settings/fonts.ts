@@ -2,18 +2,24 @@
  * Font settings helpers (interface / text / mono), CSS stacks, and system-font listing.
  *
  * Values are free-form strings:
- * - `""` / `"default"` → app default for that role
- * - `"system"` | `"serif"` | `"mono"` → built-in CSS stacks
+ * - `""` / `"default"` → app default (system UI stack) for that role
+ * - `"system"` | `"geist"` | `"serif"` | `"mono"` → built-in CSS stacks
  * - any other string → a system font family name (quoted + role fallback)
+ *
+ * Windows: keep Segoe UI + Microsoft YaHei early in the sans stack, and
+ * Consolas / Cascadia in mono. Prefer rem-based size tokens over raw `px`
+ * so 125% / non-integer DPR does not drift chrome metrics.
  */
 
-import { invokeApi } from "@/lib/core/ipc";
+import { commands } from "@/lib/core/bindings";
+import { callApi } from "@/lib/core/ipc";
 import { isTauri } from "@/lib/core/tauri";
 
 /** Built-in non-system tokens shown at the top of the font picker. */
 export const FONT_STACK_PRESETS = [
 	"default",
 	"system",
+	"geist",
 	"serif",
 	"mono",
 ] as const;
@@ -21,17 +27,23 @@ export type FontStackPreset = (typeof FONT_STACK_PRESETS)[number];
 
 export type FontRole = "interface" | "text" | "mono";
 
-export const DEFAULT_SANS_STACK =
-	'"Geist Variable", system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei UI", "Microsoft YaHei", "Noto Sans SC", sans-serif';
-
+/**
+ * Platform UI sans: SF Pro on Apple, Segoe UI on Windows, with CJK fallbacks.
+ * Missing faces are skipped per glyph, so Mac still lands on PingFang and
+ * Windows on YaHei without OS-specific CSS.
+ */
 export const SYSTEM_SANS_STACK =
-	'system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei UI", "Microsoft YaHei", "Noto Sans SC", sans-serif';
+	'system-ui, "Segoe UI", -apple-system, BlinkMacSystemFont, Roboto, "Helvetica Neue", Arial, "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei UI", "Microsoft YaHei", "Noto Sans SC", sans-serif';
+
+/** Optional packaged face for users who prefer the previous default look. */
+export const GEIST_SANS_STACK =
+	'"Geist Variable", system-ui, "Segoe UI", -apple-system, BlinkMacSystemFont, "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei UI", "Microsoft YaHei", "Noto Sans SC", sans-serif';
 
 export const SERIF_STACK =
 	'ui-serif, "Iowan Old Style", "Palatino Linotype", Palatino, Georgia, "Songti SC", "Noto Serif CJK SC", "Noto Serif SC", serif';
 
 export const MONO_STACK =
-	'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace';
+	'ui-monospace, SFMono-Regular, Menlo, Monaco, "Cascadia Mono", Consolas, "Liberation Mono", "Courier New", monospace';
 
 export function isFontStackPreset(v: string): v is FontStackPreset {
 	return (FONT_STACK_PRESETS as readonly string[]).includes(v);
@@ -49,7 +61,7 @@ export function normalizeFontFamilyValue(raw: unknown): string {
 /**
  * Resolve a stored font value to a CSS `font-family` list.
  * Returns `undefined` when the role should keep the stylesheet default
- * (Geist for interface/text; theme mono for mono).
+ * (system UI for interface/text; theme mono for mono).
  */
 export function resolveFontFamilyCss(
 	value: string,
@@ -60,16 +72,12 @@ export function resolveFontFamilyCss(
 		return undefined;
 	}
 	if (v === "system") return SYSTEM_SANS_STACK;
+	if (v === "geist") return GEIST_SANS_STACK;
 	if (v === "serif") return SERIF_STACK;
 	if (v === "mono") return MONO_STACK;
 
 	const escaped = v.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
-	const fallback =
-		role === "mono"
-			? MONO_STACK
-			: role === "text"
-				? SYSTEM_SANS_STACK
-				: SYSTEM_SANS_STACK;
+	const fallback = role === "mono" ? MONO_STACK : SYSTEM_SANS_STACK;
 	return `"${escaped}", ${fallback}`;
 }
 
@@ -127,14 +135,6 @@ export function applyDocumentChrome(opts: {
 	applyChromeFontCss(opts.interfaceFontFamily, opts.monoFontFamily);
 }
 
-/** Display label key suffix for presets; system fonts use the raw name. */
-export function fontFamilyDisplayKey(value: string): string {
-	const v = value.trim();
-	if (!v || v === "default") return "default";
-	if (isFontStackPreset(v)) return v;
-	return "custom";
-}
-
 // --- System font listing (Host-backed, cached) --------------------------------
 
 let systemFontsCache: string[] | null = null;
@@ -158,7 +158,7 @@ export async function listSystemFonts(): Promise<string[]> {
 async function loadSystemFonts(): Promise<string[]> {
 	if (!isTauri()) return [];
 	try {
-		const fonts = await invokeApi<string[]>("list_system_fonts", undefined, {
+		const fonts = await callApi(() => commands.listSystemFonts(), {
 			fallback: "Failed to list system fonts",
 		});
 		if (!Array.isArray(fonts)) return [];
@@ -169,10 +169,4 @@ async function loadSystemFonts(): Promise<string[]> {
 	} catch {
 		return [];
 	}
-}
-
-/** Drop the cache (e.g. after rare “refresh fonts” actions). */
-export function invalidateSystemFontsCache(): void {
-	systemFontsCache = null;
-	systemFontsPromise = null;
 }

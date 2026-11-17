@@ -11,7 +11,9 @@
 | macOS / Linux | `~/.local/share/agentero/usage.sqlite` |
 | Windows | `%APPDATA%\agentero\usage.sqlite`（`dirs::data_dir`） |
 
-代码：`src-tauri/src/features/usage/`。前端入口 `src/lib/activity/track.ts`（`track()` 缓冲批量上报）。
+代码：存储层 `crates/agentero-core/src/usage/`（tauri 无关，桌面端使用）；Tauri commands `src-tauri/src/core/usage/commands.rs`。前端入口 `src/lib/activity/track.ts`（`track()` 缓冲批量上报）。CLI 不再暴露 usage 命令。
+
+路径前缀筛选与移动后的 `usage_events` / `usage_daily` 路径同步，统一使用转义后的 SQL pattern：`%`、`_`、`!` 视为字面路径字符，只有末尾用于子路径的 `%` 是通配符；保留 `/` 边界、Windows 分隔符归一与既有 LIKE 大小写规则。
 
 ## 开关
 
@@ -128,22 +130,11 @@ PRIMARY KEY (day, vault, kind, paper_path, facet)
 | Command | 说明 |
 |---|---|
 | `activity_record_events` | 批量写入（前端缓冲后调用） |
-| `usage_list` | 按 vault / kind / path（含 paper_path）/ since 倒序列出 |
-| `usage_summary` | 按 kind 计数 |
 | `usage_clear` | 清空全部或指定 vault |
 
 ## CLI
 
-```bash
-agentero usage which --json
-agentero usage timeline --days 30 --json
-agentero usage summary --days 30 --json
-agentero usage timeline --kind paper.open --path papers/xxx --json
-agentero usage clear -y          # 当前 --vault
-agentero usage clear --all -y    # 本机全部
-```
-
-未加 `--all-vaults` 时 timeline / summary 过滤当前 Vault。
+CLI 不再暴露 `usage` 命令；清除请通过桌面端设置或 Host API 进行。
 
 ## 前端漏斗
 
@@ -157,4 +148,4 @@ agentero usage clear --all -y    # 本机全部
 ## 隐私
 
 - 本地可含路径与搜索词；不上传。
-- PostHog 仍只走 `features/telemetry` 的匿名启动/退出，本库不直接出站。投影只用 `kind` + `facet` + 桶，不用 `path` / `extra.q`。
+- PostHog 仍只走 `core/telemetry` 的匿名启动/退出，本库不直接出站。投影只用 `kind` + `facet` + 桶，不用 `path` / `extra.q`。

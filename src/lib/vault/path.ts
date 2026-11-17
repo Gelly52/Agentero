@@ -43,6 +43,52 @@ export function isValidVaultEntryName(name: string): boolean {
 	return true;
 }
 
+/**
+ * True when a basename carries a file extension.
+ * Dotfiles (`.env`) and trailing dots count as extensionless.
+ */
+export function hasVaultFileExtension(name: string): boolean {
+	const dot = name.lastIndexOf(".");
+	return dot > 0 && dot < name.length - 1;
+}
+
+export type VaultRenamePlan = {
+	/** Vault-relative path the renamed entry lands on. */
+	toRel: string;
+	/** True when a file becomes a folder (see {@link planVaultRename}). */
+	folderize: boolean;
+	/** New folder path when `folderize` is true. */
+	folderRel?: string;
+};
+
+/**
+ * Plan an in-tree rename.
+ *
+ * Renaming a file to an extensionless name turns it into a folder (#759):
+ * the typed name becomes the folder and the file keeps its original
+ * extension(s) inside it (`notes/foo.md` → `notes/bar/bar.md`). Folders and
+ * names that carry an extension stay a plain rename.
+ */
+export function planVaultRename(args: {
+	parentRel: string;
+	currentName: string;
+	nextName: string;
+	kind: FileNode["kind"];
+}): VaultRenamePlan {
+	const { parentRel, currentName, nextName, kind } = args;
+	const join = (rel: string) => (parentRel ? `${parentRel}/${rel}` : rel);
+	if (kind === "directory" || hasVaultFileExtension(nextName)) {
+		return { toRel: join(nextName), folderize: false };
+	}
+	const dot = currentName.indexOf(".");
+	const suffix = dot > 0 ? currentName.slice(dot) : "";
+	return {
+		toRel: join(`${nextName}/${nextName}${suffix}`),
+		folderize: true,
+		folderRel: join(nextName),
+	};
+}
+
 export function vaultDisplayName(rootPath: string | null): string {
 	if (!rootPath) return i18n.t("app:vault.noVaultName");
 	if (isRemoteVaultHandle(rootPath)) {
@@ -141,6 +187,13 @@ export function paperRelFromNotes(
 	if (abs === root) return "";
 	if (abs.startsWith(`${root}/`)) return abs.slice(root.length + 1);
 	return abs;
+}
+
+/** Is `parentPath` (absolute, vault-rooted) inside the `papers/` folder? */
+export function isPapersParent(parentPath: string, vaultRoot: string): boolean {
+	const rel = vaultRelativePath(vaultRoot, parentPath);
+	if (!rel) return false;
+	return rel === "papers" || rel.startsWith("papers/");
 }
 
 export { basenameOf } from "@/lib/core/path";

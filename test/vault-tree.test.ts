@@ -4,6 +4,7 @@ import {
 	collectMarkdownRelPaths,
 	collectTreeRefreshTargets,
 	collectWikiTargetRelPaths,
+	compareVaultTreeNodes,
 	type FileNode,
 	isEagerTreeRel,
 	isMarkdownPath,
@@ -186,6 +187,24 @@ describe("isPathMissingError", () => {
 	});
 });
 
+describe("compareVaultTreeNodes", () => {
+	it("sorts directories first and numeric prefixes naturally", () => {
+		const nodes = [
+			file("/v/10-note.md"),
+			dir("/v/10-topic", []),
+			file("/v/9-note.md"),
+			dir("/v/9-topic", []),
+		];
+
+		expect([...nodes].sort(compareVaultTreeNodes).map((n) => n.name)).toEqual([
+			"9-topic",
+			"10-topic",
+			"9-note.md",
+			"10-note.md",
+		]);
+	});
+});
+
 describe("removeTreeNode", () => {
 	it("drops the target and its descendants", () => {
 		const next = removeTreeNode(tree, "/v/papers/x");
@@ -294,6 +313,36 @@ describe("collectTreeRefreshTargets", () => {
 });
 
 describe("paperAssetDownloadReasons", () => {
+	it("keeps missing arXiv source visible after OCR and ignores stale catalog labels", () => {
+		const paper = dir(
+			"/v/papers/x",
+			[file("/v/papers/x/a.pdf"), file("/v/papers/x/PAPER.md")],
+			{ needsSource: true, hasTex: false },
+		);
+		expect(paperAssetDownloadReasons(paper, { body_source: "ocr" })).toEqual([
+			"noSource",
+		]);
+		const missing = dir("/v/papers/x", [file("/v/papers/x/a.pdf")], {
+			hasTex: false,
+		});
+		expect(
+			paperAssetDownloadReasons(missing, { body_source: "latex" }),
+		).toEqual(["noBody"]);
+	});
+
+	it("does not mistake a source figure PDF or nested Markdown for primary assets", () => {
+		const paper = dir("/v/papers/x", [
+			dir(
+				"/v/papers/x/source",
+				[
+					file("/v/papers/x/source/figure.pdf"),
+					file("/v/papers/x/source/PAPER.md"),
+				],
+				{ hasTex: false },
+			),
+		]);
+		expect(paperAssetDownloadReasons(paper)).toEqual(["noPdf", "noBody"]);
+	});
 	it("trusts hasTex on a lazy source/ shell (no listed .tex children)", () => {
 		const paper = dir("/v/papers/x", [
 			file("/v/papers/x/metadata.json"),

@@ -7,24 +7,49 @@ import {
 	type Dispatch,
 	type KeyboardEvent,
 	type DragEvent as ReactDragEvent,
+	type RefObject,
 	type SetStateAction,
 	useCallback,
 	useEffect,
 	useMemo,
+	useRef,
 	useState,
 } from "react";
+import type { ComposerInlineInputHandle } from "@/components/agent/composer/composer-inline-input";
 import type { AgentPanelRefs } from "@/components/agent/hooks/use-agent-panel-context";
+import { useChatInputTarget } from "@/components/agent/hooks/use-chat-input-target";
+import { usePlazaMentionSource } from "@/components/agent/hooks/use-plaza-mention-source";
 import {
 	useSelectionStore,
 	useVisualContextStore,
 } from "@/hooks/use-app-stores";
 import type { useSessionComposerState } from "@/hooks/use-session-composer-state";
 import type { AgentSkill } from "@/lib/agent";
+import { useAgentSessionScope } from "@/lib/agent/agent-session-store";
 import type { ChatLine } from "@/lib/agent/chat-state";
+import {
+	appendMissingInlineTokens,
+	encodeCommandToken,
+	encodeMentionToken,
+	encodeSelectionToken,
+	encodeSkillToken,
+	encodeVisualToken,
+	extractMentionPaths,
+	extractSelectionTokens,
+	extractSkillIds,
+	extractVisualIds,
+	insertTokensAt,
+	plainTriggerSuffix,
+	referenceInsertionOffset,
+	removeVisualToken,
+	replaceSelectionToken,
+	replaceTrailingTriggerWithToken,
+} from "@/lib/agent/composer-inline-tokens";
 import {
 	subscribePendingAgentComposerPrompt,
 	takePendingAgentComposerPrompt,
 } from "@/lib/agent/composer-seed";
+import { composerScopeKey } from "@/lib/agent/composer-state";
 import {
 	listenAgentAttachContext,
 	subscribePendingAgentContextPaths,
@@ -42,25 +67,40 @@ import {
 	mentionPathHasChildren,
 	pushRecentMentionPath,
 } from "@/lib/agent/mention";
+import { isPlazaCollectionPath } from "@/lib/agent/plaza-mention";
 import { stripPromptEnvelopeForDisplay } from "@/lib/agent/prompt-display";
-import type { SelectionContext } from "@/lib/agent/selection-store";
+import {
+	removeSelection,
+	type SelectionContext,
+} from "@/lib/agent/selection-store";
 import {
 	type AcpCommand,
-	filterSlashCommands,
+	acpCommandInvocation,
+	buildSlashOptions,
 } from "@/lib/agent/slash-commands";
-import type { PdfVisualDraft } from "@/lib/agent/visual-context-store";
+import {
+	forgetVisualInsertRequests,
+	type PdfVisualDraft,
+	pendingVisualInsertIds,
+	removeVisualDraft,
+} from "@/lib/agent/visual-context-store";
+import {
+	planVisualMarkerSync,
+	type VisualMarkerBaseline,
+} from "@/lib/agent/visual-marker-sync";
 import {
 	dataTransferLooksLikeImages,
+	dataTransferLooksLikePdfs,
 	dataTransferLooksLikeVaultMove,
 	dataTransferTypes,
 } from "@/lib/core/file-accept";
 import { isImeKeyboardEvent } from "@/lib/core/ime";
 import { toSafeDisposer } from "@/lib/core/tauri-events";
+import { draggedFeedMentionPath, isFeedItemDrag } from "@/lib/plaza/feed-drag";
 import {
 	collectUserPromptTexts,
 	nextHistoryIndexOnDown,
 	nextHistoryIndexOnUp,
-	placeCaretAtEnd,
 	shouldNavigateHistoryDown,
 	shouldNavigateHistoryUp,
 } from "@/lib/ui/prompt-recall";
@@ -89,6 +129,8 @@ export type UseAgentComposerOptions = {
 	skills: AgentSkill[];
 	acpCommandsByAgent: Record<string, AcpCommand[]>;
 	selectedAgentId: string | null;
+	/** Active composer session. Visual markers are diffed inside this identity. */
+	sessionId: string;
 	lines: ChatLine[];
 	activeTabIsRunning: boolean;
 	cancelCurrentRun: () => Promise<void>;
@@ -105,7 +147,6 @@ export type AgentComposer = {
 	setSlashActiveIndex: Dispatch<SetStateAction<number>>;
 	currentFileLabel: string;
 	mentionChipPaths: string[];
-	selectionChips: SelectionContext[];
 	visualDrafts: PdfVisualDraft[];
 	removeContextPath: (path: string) => void;
 	selectedSkills: AgentSkill[];
@@ -119,17 +160,20 @@ export type AgentComposer = {
 	showSkillMenu: boolean;
 	skillOptions: AgentSkill[];
 	attachSkill: (skill: AgentSkill) => void;
+	removeSkill: (skillId: string) => void;
 	showSlashMenu: boolean;
 	slashOptions: AcpCommand[];
 	attachSlashCommand: (command: AcpCommand) => void;
 	attachContextPaths: (rawPaths: string[]) => void;
 	handleComposerDragOver: (e: ReactDragEvent) => void;
 	handleComposerDrop: (e: ReactDragEvent) => void;
-	handleComposerMenuKeyDown: (
-		event: KeyboardEvent<HTMLTextAreaElement>,
-	) => void;
+	handleComposerMenuKeyDown: (event: KeyboardEvent<HTMLElement>) => void;
 	onComposerTextChangeFromUser: (text: string) => void;
+	/** Ref to the inline input, used to insert selections at the caret. */
+	composerInputRef: RefObject<ComposerInlineInputHandle | null>;
 };
+
+const EMPTY_VISUAL_DRAFTS: PdfVisualDraft[] = [];
 
 export function useAgentComposer({
 	refs: {
@@ -140,11 +184,14 @@ export function useAgentComposer({
 	},
 	composer: {
 		text: composerText,
+		mentionedPaths,
 		selectedSkillIds,
 		setText: setComposerText,
 		setIncludeSelectedFile,
 		setMentionedPaths,
 		setSelectedSkillIds,
+		snapshot: snapshotComposer,
+		composerIdentity,
 	},
 	vaultPath,
 	vaultMarkdownPaths,
@@ -160,10 +207,16 @@ export function useAgentComposer({
 	skills,
 	acpCommandsByAgent,
 	selectedAgentId,
+	sessionId,
 	lines,
 	activeTabIsRunning,
 	cancelCurrentRun,
 }: UseAgentComposerOptions): AgentComposer {
+	const { scopeId } = useAgentSessionScope();
+	// PDF visual drafts follow the rail composer only.
+	const railScope = scopeId === null;
+	/** Pinned selections / Add to chat / seeds go to the visible chat surface. */
+	const inputTarget = useChatInputTarget();
 	const [composerMenuDismissed, setComposerMenuDismissed] = useState(false);
 	const [mentionActiveIndex, setMentionActiveIndex] = useState(0);
 	const [skillActiveIndex, setSkillActiveIndex] = useState(0);
@@ -171,6 +224,7 @@ export function useAgentComposer({
 
 	// Doctor / Settings may seed the composer via a cross-window event.
 	useEffect(() => {
+		if (!inputTarget) return;
 		const apply = (text: string) => {
 			const next = text.trim();
 			if (!next) return;
@@ -180,7 +234,7 @@ export function useAgentComposer({
 		const pending = takePendingAgentComposerPrompt();
 		if (pending) apply(pending);
 		return subscribePendingAgentComposerPrompt(apply);
-	}, [setComposerText]);
+	}, [inputTarget, setComposerText]);
 
 	/** Same paper label mode as the file tree (settings); title fallback if meta missing. */
 	const currentFileLabel = useMemo(() => {
@@ -207,32 +261,178 @@ export function useAgentComposer({
 		[contextPaths, selectedVaultPath],
 	);
 
-	// Editor/PDF selection chips: pinned first, live selection last (Cursor-style).
-	const activeSelection = useSelectionStore((s) => s.active);
-	const pinnedSelections = useSelectionStore((s) => s.pinned);
-	const selectionChips = useMemo(
-		() =>
-			activeSelection
-				? [...pinnedSelections, activeSelection]
-				: pinnedSelections,
-		[activeSelection, pinnedSelections],
-	);
-	const visualDrafts = useVisualContextStore((s) => s.drafts);
+	// Ref exposed to AgentComposer so it can be wired to ComposerInlineInput.
+	const composerInputRef = useRef<ComposerInlineInputHandle>(null);
 
-	const mentionMatch = composerText.match(/(^|\s)@([^\s]*)$/);
+	// Only explicitly pinned selections (Add to chat / ⇧⌘L) enter the draft.
+	// Live drag-selection stays in the store until pinActiveSelection freezes it.
+	// Every mounted surface observes the pins; only the input target inserts them
+	// (and removes them from the store) — so exactly one composer consumes each.
+	const pinnedSelections = useSelectionStore((s) => s.pinned);
+
+	// Pin quotes at the caret the composer last reported. Appending at the
+	// string end lands after the contenteditable's trailing break, which
+	// paints the reference on its own line.
+	const prevPinnedRef = useRef<SelectionContext[]>([]);
+	useEffect(() => {
+		// Not the visible chat surface: leave the pin for the owner to consume.
+		if (!inputTarget) return;
+		const prev = prevPinnedRef.current;
+		const inserted: SelectionContext[] = [];
+		for (const sel of pinnedSelections) {
+			if (!prev.some((p) => p.id === sel.id)) {
+				inserted.push(sel);
+			}
+		}
+		if (inserted.length > 0) {
+			const caret = composerInputRef.current?.getCaretOffset() ?? null;
+			setComposerText((current) => {
+				const existing = new Set(
+					extractSelectionTokens(current).map((selection) => selection.id),
+				);
+				let next = current;
+				for (const selection of inserted) {
+					if (existing.has(selection.id)) {
+						next = replaceSelectionToken(next, selection);
+					}
+				}
+				const tokens = inserted
+					.filter((selection) => !existing.has(selection.id))
+					.map(encodeSelectionToken)
+					.join("");
+				if (!tokens) return next;
+				const result = insertTokensAt(
+					next,
+					referenceInsertionOffset(next, caret),
+					tokens,
+				);
+				composerInputRef.current?.setPendingCaret(result.caret, result.text);
+				return result.text;
+			});
+			for (const sel of inserted) {
+				removeSelection(sel.id);
+			}
+		}
+		prevPinnedRef.current = pinnedSelections;
+	}, [inputTarget, pinnedSelections, setComposerText]);
+
+	const railVisualDrafts = useVisualContextStore((s) => s.drafts);
+	const visualDrafts = railScope ? railVisualDrafts : EMPTY_VISUAL_DRAFTS;
+	const visualSyncRef = useRef<VisualMarkerBaseline | null>(null);
+	// Keep this session's visual drafts and inline markers in step.
+	// Switching sessions shows that session's own bucket; it does not delete
+	// or rewrite another session's unsent block. An explicit add inserts into
+	// the composer that is open.
+	useEffect(() => {
+		if (!railScope) return;
+		const liveIdentity = composerIdentity();
+		const liveText = snapshotComposer().text;
+		if (
+			liveText !== composerText ||
+			liveIdentity.sessionId !== sessionId ||
+			liveIdentity.scopeKey !==
+				composerScopeKey(vaultPath, selectedAgentId, scopeId)
+		) {
+			return;
+		}
+		const identity = `${liveIdentity.scopeKey ?? ""}\n${liveIdentity.sessionId}`;
+		const textIds = extractVisualIds(composerText);
+		const storeIds = visualDrafts.map((draft) => draft.id);
+		const requestedIds = pendingVisualInsertIds(identity).filter((id) =>
+			storeIds.includes(id),
+		);
+		const plan = planVisualMarkerSync({
+			identity,
+			textIds,
+			storeIds,
+			prev: visualSyncRef.current,
+			requestedIds,
+		});
+		visualSyncRef.current = { identity, textIds, storeIds };
+
+		for (const id of plan.removeDraftIds) removeVisualDraft(id);
+
+		if (plan.insertDraftIds.length > 0) {
+			const caret = composerInputRef.current?.getCaretOffset() ?? null;
+			setComposerText((current) => {
+				const have = new Set(extractVisualIds(current));
+				const tokens = plan.insertDraftIds
+					.filter((id) => !have.has(id))
+					.map((id) => encodeVisualToken(id))
+					.join("");
+				if (!tokens) return current;
+				const result = insertTokensAt(
+					current,
+					referenceInsertionOffset(current, caret),
+					tokens,
+				);
+				composerInputRef.current?.setPendingCaret(result.caret, result.text);
+				return result.text;
+			});
+		}
+
+		if (plan.stripMarkerIds.length > 0) {
+			setComposerText((current) => {
+				const next = plan.stripMarkerIds.reduce(
+					(text, id) => removeVisualToken(text, id),
+					current,
+				);
+				return next === current ? current : next;
+			});
+		}
+		const removed = new Set(plan.removeDraftIds);
+		forgetVisualInsertRequests(
+			identity,
+			textIds,
+			storeIds.filter((id) => !removed.has(id)),
+		);
+	}, [
+		composerIdentity,
+		composerText,
+		railScope,
+		scopeId,
+		selectedAgentId,
+		sessionId,
+		setComposerText,
+		snapshotComposer,
+		vaultPath,
+		visualDrafts,
+	]);
+
+	// Markers count as atoms so `$` / `@` inside `{{s:…}}` / `{{m:…}}` stay inert.
+	const triggerText = plainTriggerSuffix(composerText);
+	const mentionMatch = triggerText.match(/(^|\s|\uFFFC)@([^\s]*)$/);
 	/** Raw @query (preserve case for display; matching is case-insensitive). */
 	const mentionQueryRaw = mentionMatch?.[2] ?? "";
 	const mentionQuery = mentionQueryRaw.toLocaleLowerCase();
 
-	const mentionCandidates = useMemo(
-		() =>
-			buildMentionCandidatePaths({
-				markdownPaths: vaultMarkdownPaths,
-				directoryPaths: vaultDirectoryPaths,
-				paperPaths: vaultPaperPaths,
-			}),
-		[vaultDirectoryPaths, vaultMarkdownPaths, vaultPaperPaths],
-	);
+	const plazaMentionEntries = usePlazaMentionSource(vaultPath);
+
+	const mentionCandidates = useMemo(() => {
+		const vaultPaths = buildMentionCandidatePaths({
+			markdownPaths: vaultMarkdownPaths,
+			directoryPaths: vaultDirectoryPaths,
+			paperPaths: vaultPaperPaths,
+		});
+		// Plaza entries are virtual leaves (arXiv Daily / Feeds); they surface
+		// on typed title queries or as recents, never in the shallow tree.
+		return [...vaultPaths, ...plazaMentionEntries.map((entry) => entry.path)];
+	}, [
+		plazaMentionEntries,
+		vaultDirectoryPaths,
+		vaultMarkdownPaths,
+		vaultPaperPaths,
+	]);
+
+	/** Vault paper titles + plaza titles/sources, both searchable via `@`. */
+	const mentionSearchLabels = useMemo(() => {
+		if (plazaMentionEntries.length === 0) return mentionLabelsByPath;
+		const map = new Map(mentionLabelsByPath);
+		for (const entry of plazaMentionEntries) {
+			map.set(entry.path, `${entry.title} ${entry.sourceLabel}`);
+		}
+		return map;
+	}, [mentionLabelsByPath, plazaMentionEntries]);
 
 	const [recentMentionPaths, setRecentMentionPaths] = useState<string[]>(() => {
 		try {
@@ -275,6 +475,14 @@ export function useAgentComposer({
 		}
 	}, [composerMenuDismissed, mentionMatch]);
 
+	/** Whole-list entries (the arXiv Daily collection) stay visible at `@`. */
+	const pinnedMentionPaths = useMemo(() => {
+		const pinned = plazaMentionEntries
+			.map((entry) => entry.path)
+			.filter(isPlazaCollectionPath);
+		return pinned.length ? pinned : null;
+	}, [plazaMentionEntries]);
+
 	const mentionOptions = useMemo(() => {
 		if (!mentionMatch) return [];
 		return filterMentionOptions({
@@ -282,17 +490,19 @@ export function useAgentComposer({
 			query: mentionQuery,
 			exclude: contextPaths,
 			recent: recentMentionPaths,
-			labelsByPath: mentionLabelsByPath,
+			labelsByPath: mentionSearchLabels,
 			browseRoot: mentionBrowseRoot,
+			pinned: pinnedMentionPaths,
 			limit: 8,
 		});
 	}, [
 		contextPaths,
 		mentionBrowseRoot,
 		mentionCandidates,
-		mentionLabelsByPath,
 		mentionMatch,
 		mentionQuery,
+		mentionSearchLabels,
+		pinnedMentionPaths,
 		recentMentionPaths,
 	]);
 
@@ -310,7 +520,7 @@ export function useAgentComposer({
 		setMentionActiveIndex(0);
 	}, []);
 
-	const skillMatch = composerText.match(/(^|\s)\$([^\s]*)$/);
+	const skillMatch = triggerText.match(/(^|\s|\uFFFC)\$([^\s]*)$/);
 	const skillQuery = skillMatch?.[2]?.toLocaleLowerCase() ?? "";
 	const skillOptions = useMemo(() => {
 		if (!skillMatch) return [];
@@ -324,13 +534,15 @@ export function useAgentComposer({
 			.slice(0, 6);
 	}, [selectedSkillIds, skillMatch, skillQuery, skills]);
 
-	const slashMatch = composerText.match(/(^|\s)\/([^\s]*)$/);
+	const slashMatch = triggerText.match(/(^|\s|\uFFFC)\/([^\s]*)$/);
 	const slashQuery = slashMatch?.[2]?.toLocaleLowerCase() ?? "";
 	const slashCommands = acpCommandsByAgent[selectedAgentId ?? ""] ?? [];
 	const slashOptions = useMemo(() => {
 		if (!slashMatch) return [];
-		return filterSlashCommands(slashCommands, slashQuery);
-	}, [slashCommands, slashMatch, slashQuery]);
+		return buildSlashOptions(slashCommands, skills, slashQuery, {
+			selectedSkillIds: new Set(selectedSkillIds),
+		});
+	}, [slashCommands, slashMatch, slashQuery, selectedSkillIds, skills]);
 
 	const showMentionMenu =
 		!composerMenuDismissed &&
@@ -371,14 +583,13 @@ export function useAgentComposer({
 		[selectedSkillIds, skills],
 	);
 
-	/** Add Vault-relative path(s) as removable context chips (same as @mention). */
+	/** Insert @mention token(s) at the trailing trigger / end of the draft. */
 	const attachContextPaths = useCallback(
 		(rawPaths: string[]) => {
 			const normalized = rawPaths
 				.map((p) => toVaultRelative(vaultPath, p.trim()))
 				.filter((p) => p.length > 0);
 			if (!normalized.length) return;
-			setMentionedPaths((prev) => [...new Set([...prev, ...normalized])]);
 			// Remember for empty-`@` recent hints (per Vault).
 			try {
 				const storage =
@@ -392,10 +603,16 @@ export function useAgentComposer({
 				// ignore quota / private mode
 			}
 			setComposerMenuDismissed(true);
-			// Clear an in-progress @ query so the menu closes after attach.
-			setComposerText((prev) =>
-				prev.replace(/(^|\s)@[^\s]*$/, (_match, prefix: string) => `${prefix}`),
-			);
+			setComposerText((prev) => {
+				let next = prev;
+				for (const path of normalized) {
+					const token = encodeMentionToken(path);
+					if (next.includes(token)) continue;
+					next = replaceTrailingTriggerWithToken(next, "mention", token);
+				}
+				setMentionedPaths(extractMentionPaths(next));
+				return next;
+			});
 		},
 		[setComposerText, setMentionedPaths, vaultPath],
 	);
@@ -413,24 +630,57 @@ export function useAgentComposer({
 			setIncludeSelectedFile(false);
 			return;
 		}
-		setMentionedPaths((prev) => prev.filter((item) => item !== path));
+		const token = encodeMentionToken(path);
+		setComposerText((prev) => {
+			const next = prev
+				.split(token)
+				.join("")
+				.replace(/[ \t]{2,}/g, " ");
+			setMentionedPaths(extractMentionPaths(next));
+			return next;
+		});
 	};
+
+	// Legacy drafts: paths/skills in state but not yet embedded as inline tokens.
+	useEffect(() => {
+		const next = appendMissingInlineTokens(
+			composerText,
+			mentionedPaths,
+			selectedSkillIds,
+		);
+		if (next === composerText) return;
+		setComposerText(next);
+		setMentionedPaths(extractMentionPaths(next));
+		setSelectedSkillIds(extractSkillIds(next));
+	}, [
+		composerText,
+		mentionedPaths,
+		selectedSkillIds,
+		setComposerText,
+		setMentionedPaths,
+		setSelectedSkillIds,
+	]);
 
 	// File tree "Add to chat" → drop paths as context chips (same as @-mention).
 	// Handles same-window (module pub/sub) and the singleton feature window
 	// (Tauri event). Consumes one pending batch on mount.
 	useEffect(() => {
+		if (!inputTarget) return;
+		const consume = (paths: string[]) => {
+			// Clear the stash so another surface switching target later cannot
+			// re-attach a batch this composer already took.
+			takePendingAgentContextPaths();
+			attachContextPaths(paths);
+		};
 		const pending = takePendingAgentContextPaths();
 		if (pending) attachContextPaths(pending);
-		const unsubscribe = subscribePendingAgentContextPaths(attachContextPaths);
-		const unlisten = toSafeDisposer(
-			listenAgentAttachContext(attachContextPaths),
-		);
+		const unsubscribe = subscribePendingAgentContextPaths(consume);
+		const unlisten = toSafeDisposer(listenAgentAttachContext(consume));
 		return () => {
 			unsubscribe();
 			unlisten();
 		};
-	}, [attachContextPaths]);
+	}, [attachContextPaths, inputTarget]);
 
 	/**
 	 * Drag from file tree sets `text/plain` vault paths (newline-separated).
@@ -439,6 +689,13 @@ export function useAgentComposer({
 	 * (those are FileUIPart blobs; ACP context is path-based).
 	 */
 	const handleComposerDragOver = useCallback((e: ReactDragEvent) => {
+		// Plaza feed cards carry a mention path, never a Vault path; taking the
+		// drop here turns the card into the same chip "add to chat" produces.
+		if (isFeedItemDrag(e.dataTransfer)) {
+			e.preventDefault();
+			e.dataTransfer.dropEffect = "copy";
+			return;
+		}
 		const types = dataTransferTypes(e.dataTransfer);
 		if (!types.length) return;
 		const hasText = types.includes("text/plain") || types.includes("Text");
@@ -456,6 +713,21 @@ export function useAgentComposer({
 
 	const handleComposerDrop = useCallback(
 		(e: ReactDragEvent) => {
+			const feedPath = draggedFeedMentionPath(e.dataTransfer);
+			if (feedPath) {
+				e.preventDefault();
+				e.stopPropagation();
+				attachContextPaths([feedPath]);
+				return;
+			}
+			// PDF drops belong to the app-wide importer, even when the composer
+			// receives a text/plain path alongside the file payload.
+			if (
+				!dataTransferLooksLikeVaultMove(e.dataTransfer) &&
+				dataTransferLooksLikePdfs(e.dataTransfer)
+			) {
+				return;
+			}
 			// Finder / Preview / other-app image drops include text/plain paths
 			// AND Files. Those belong to PromptInput, not @ context chips.
 			// In-app tree moves always stay path chips.
@@ -487,30 +759,67 @@ export function useAgentComposer({
 		[attachContextPaths],
 	);
 
-	const attachSkill = (skill: AgentSkill) => {
-		setSelectedSkillIds((prev) => [...new Set([...prev, skill.id])]);
-		setComposerMenuDismissed(true);
-		setComposerText((prev) =>
-			prev.replace(/(^|\s)\$[^\s]*$/, (_match, prefix: string) => `${prefix}`),
-		);
-	};
+	const attachSkill = useCallback(
+		(skill: AgentSkill) => {
+			setComposerMenuDismissed(true);
+			setComposerText((prev) => {
+				const token = encodeSkillToken(skill.id);
+				if (prev.includes(token)) {
+					setSelectedSkillIds(extractSkillIds(prev));
+					return prev.replace(
+						/(^|\s)[/$][^\s]*$/,
+						(_m, prefix: string) => `${prefix}`,
+					);
+				}
+				const next = replaceTrailingTriggerWithToken(prev, "skill", token);
+				setSelectedSkillIds(extractSkillIds(next));
+				return next;
+			});
+		},
+		[setComposerText, setSelectedSkillIds],
+	);
+
+	const removeSkill = useCallback(
+		(skillId: string) => {
+			const token = encodeSkillToken(skillId);
+			setComposerText((prev) => {
+				const next = prev
+					.split(token)
+					.join("")
+					.replace(/[ \t]{2,}/g, " ");
+				setSelectedSkillIds(extractSkillIds(next));
+				return next;
+			});
+		},
+		[setComposerText, setSelectedSkillIds],
+	);
 
 	const attachSlashCommand = useCallback(
 		(command: AcpCommand) => {
+			if (command.kind === "skill") {
+				attachSkill({
+					id: command.name,
+					name: command.title,
+					description: command.description,
+				});
+				return;
+			}
 			setComposerMenuDismissed(true);
-			setComposerText((prev) =>
-				prev.replace(
-					/(^|\s)\/[^\s]*$/,
-					(_match, prefix: string) => `${prefix}/${command.name} `,
-				),
-			);
+			setComposerText((prev) => {
+				const token = encodeCommandToken(acpCommandInvocation(command));
+				if (prev.includes(token)) {
+					return prev.replace(
+						/(^|\s)[/$][^\s]*$/,
+						(_m, prefix: string) => `${prefix}`,
+					);
+				}
+				return replaceTrailingTriggerWithToken(prev, "command", token);
+			});
 		},
-		[setComposerText],
+		[attachSkill, setComposerText],
 	);
 
-	const handleComposerMenuKeyDown = (
-		event: KeyboardEvent<HTMLTextAreaElement>,
-	) => {
+	const handleComposerMenuKeyDown = (event: KeyboardEvent<HTMLElement>) => {
 		// IME: do not treat Enter as mention/skill select while composing.
 		// PromptInputTextarea owns compositionend grace + blocks submit; here
 		// we only need keyCode 229 / isComposing so menus do not steal the key.
@@ -611,21 +920,26 @@ export function useAgentComposer({
 			return;
 		}
 
-		// ↑ / ↓ → walk previous user prompts into the composer (shell-style).
-		// Does not open inline edit / rollback — Pencil still does that.
+		// ↑ / ↓ → walk previous user prompts (shell-style). Contenteditable has
+		// no .value; treat an empty marked draft as empty and ignore caret while
+		// already browsing so chips/markers do not block ArrowDown.
 		if (switchingRef.current) return;
-		const el = event.currentTarget;
 		const isBrowsing = promptHistoryIndexRef.current !== null;
 		const history = collectUserPromptTexts(
 			lines,
 			stripPromptEnvelopeForDisplay,
 		);
+		const historyTarget = {
+			value: composerText,
+			selectionStart: isBrowsing ? 0 : composerText.trim() === "" ? 0 : 1,
+			selectionEnd: isBrowsing ? 0 : composerText.trim() === "" ? 0 : 1,
+		};
 
-		if (shouldNavigateHistoryUp(event, el, isBrowsing)) {
+		if (shouldNavigateHistoryUp(event, historyTarget, isBrowsing)) {
 			if (history.length === 0) return;
 			event.preventDefault();
 			if (!isBrowsing) {
-				promptHistoryDraftRef.current = el.value;
+				promptHistoryDraftRef.current = composerText;
 			}
 			const nextIndex = nextHistoryIndexOnUp(
 				history.length,
@@ -636,11 +950,15 @@ export function useAgentComposer({
 			promptHistoryIndexRef.current = nextIndex;
 			promptHistoryAppliedRef.current = text;
 			setComposerText(text);
-			placeCaretAtEnd(el, text);
 			return;
 		}
 
-		if (shouldNavigateHistoryDown(event, el, isBrowsing)) {
+		const downTarget = {
+			value: composerText,
+			selectionStart: composerText.length,
+			selectionEnd: composerText.length,
+		};
+		if (shouldNavigateHistoryDown(event, downTarget, isBrowsing)) {
 			event.preventDefault();
 			const nextIndex = nextHistoryIndexOnDown(
 				history.length,
@@ -652,14 +970,12 @@ export function useAgentComposer({
 				promptHistoryDraftRef.current = "";
 				promptHistoryAppliedRef.current = null;
 				setComposerText(draft);
-				placeCaretAtEnd(el, draft);
 				return;
 			}
 			const text = history[nextIndex] ?? "";
 			promptHistoryIndexRef.current = nextIndex;
 			promptHistoryAppliedRef.current = text;
 			setComposerText(text);
-			placeCaretAtEnd(el, text);
 		}
 	};
 
@@ -675,12 +991,16 @@ export function useAgentComposer({
 				promptHistoryAppliedRef.current = null;
 			}
 			setComposerText(text);
+			setMentionedPaths(extractMentionPaths(text));
+			setSelectedSkillIds(extractSkillIds(text));
 		},
 		[
 			promptHistoryAppliedRef,
 			promptHistoryDraftRef,
 			promptHistoryIndexRef,
 			setComposerText,
+			setMentionedPaths,
+			setSelectedSkillIds,
 		],
 	);
 
@@ -695,7 +1015,6 @@ export function useAgentComposer({
 		setSlashActiveIndex,
 		currentFileLabel,
 		mentionChipPaths,
-		selectionChips,
 		visualDrafts,
 		removeContextPath,
 		selectedSkills,
@@ -709,6 +1028,7 @@ export function useAgentComposer({
 		showSkillMenu,
 		skillOptions,
 		attachSkill,
+		removeSkill,
 		showSlashMenu,
 		slashOptions,
 		attachSlashCommand,
@@ -717,5 +1037,6 @@ export function useAgentComposer({
 		handleComposerDrop,
 		handleComposerMenuKeyDown,
 		onComposerTextChangeFromUser,
+		composerInputRef,
 	};
 }

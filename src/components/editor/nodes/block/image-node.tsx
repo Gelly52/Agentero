@@ -7,17 +7,22 @@ import {
 	useFocused,
 	useSelected,
 } from "platejs/react";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
+import { useImageGroup } from "@/components/editor/context/image-group-context";
 import { useMarkdownDoc } from "@/components/editor/context/markdown-doc-context";
 import { useMarkdownExportMode } from "@/components/editor/markdown-export-mode-context";
+import { useInView } from "@/hooks/use-in-view";
 import { cn } from "@/lib/core/utils";
 import {
 	formatMarkdownImageSyntax,
 	isRemoteOrInlineImageUrl,
 	resolveMarkdownImageAbs,
 } from "@/lib/markdown/image";
-import { localImageToViewerSource, revokePdfViewerSource } from "@/lib/paper";
+import {
+	acquireImageSource,
+	releaseImageSource,
+} from "@/lib/markdown/image-source-cache";
 import { imageMimeFromPath } from "@/lib/workspace/viewer";
 
 export function ImageElement(props: PlateElementProps<TImageElement>) {
@@ -25,58 +30,57 @@ export function ImageElement(props: PlateElementProps<TImageElement>) {
 	const alt = (props.element as { alt?: string }).alt ?? "";
 	const { filePath } = useMarkdownDoc();
 	const exportMode = useMarkdownExportMode();
+	const imageGroup = useImageGroup();
 	const selected = useSelected();
 	const focused = useFocused();
 	const active = selected && focused;
+	const figureRef = useRef<HTMLElement | null>(null);
 	const [src, setSrc] = useState<string>(() =>
 		url && isRemoteOrInlineImageUrl(url) ? url : "",
 	);
+	const [failed, setFailed] = useState(false);
+	// Export must paint every image; reading may defer offscreen ones.
+	const inView = useInView(figureRef, { enabled: !exportMode });
 
 	useEffect(() => {
+		if (!inView) return;
 		let cancelled = false;
-		let blobUrl: string | null = null;
 
-		async function load() {
-			if (!url) {
-				setSrc("");
-				return;
-			}
-			if (isRemoteOrInlineImageUrl(url)) {
-				setSrc(url);
-				return;
-			}
-			if (!filePath) {
-				setSrc("");
-				return;
-			}
-			const abs = resolveMarkdownImageAbs(filePath, url);
-			if (!abs) {
-				setSrc("");
-				return;
-			}
-			const mime = imageMimeFromPath(abs);
-			const resolved = await localImageToViewerSource(abs, mime);
-			if (cancelled) {
-				if (resolved) revokePdfViewerSource(resolved);
-				return;
-			}
-			blobUrl = resolved;
-			setSrc(resolved ?? "");
+		if (!url) {
+			setSrc("");
+			setFailed(false);
+			return;
 		}
-
-		void load();
+		if (isRemoteOrInlineImageUrl(url)) {
+			setSrc(url);
+			setFailed(false);
+			return;
+		}
+		const abs = filePath ? resolveMarkdownImageAbs(filePath, url) : null;
+		if (!abs) {
+			setSrc("");
+			setFailed(true);
+			return;
+		}
+		const mime = imageMimeFromPath(abs);
+		setFailed(false);
+		void acquireImageSource(abs, mime).then((resolved) => {
+			if (cancelled) return;
+			setSrc(resolved ?? "");
+			setFailed(!resolved);
+		});
 		return () => {
 			cancelled = true;
-			if (blobUrl) revokePdfViewerSource(blobUrl);
+			releaseImageSource(abs, mime);
 		};
-	}, [url, filePath]);
+	}, [inView, url, filePath]);
 
 	const sourceText = formatMarkdownImageSyntax(alt, url);
 
 	return (
 		<PlateElement
 			{...props}
-			className={cn("py-2", active && "rounded-sm")}
+			className={cn(imageGroup ? null : "py-2", active && "rounded-sm")}
 			data-selected={active ? "true" : undefined}
 		>
 			{/*
@@ -86,33 +90,55 @@ export function ImageElement(props: PlateElementProps<TImageElement>) {
 			 * instead so the image stays visible.
 			 */}
 			<figure
+				ref={figureRef}
 				className="m-0"
 				contentEditable={false}
-				data-export-pending={url && !src ? "true" : undefined}
+				data-export-pending={url && !src && !failed ? "true" : undefined}
 			>
 				{src ? (
 					<img
 						src={src}
 						alt={alt}
 						className={cn(
-							"max-w-full rounded-sm",
-							active && "ring-2 ring-ring ring-offset-2 ring-offset-background",
+							// 组内由 item 的 aspect-ratio 定形,图片铺满格子等高显示。
+							imageGroup
+								? "h-full w-full rounded-sm object-contain"
+								: "max-w-full rounded-sm",
+							active &&
+								"ring-2 ring-default-ring ring-offset-2 ring-offset-background",
 						)}
 						loading={exportMode ? "eager" : "lazy"}
+						decoding="async"
 						draggable={false}
+						onLoad={(event) => {
+							const img = event.currentTarget;
+							if (imageGroup && img.naturalWidth > 0 && img.naturalHeight > 0) {
+								imageGroup.reportRatio(
+									url,
+									img.naturalWidth / img.naturalHeight,
+								);
+							}
+						}}
+						onError={() => setFailed(true)}
 					/>
-				) : url ? (
+				) : failed && url ? (
 					<div
 						className={cn(
 							"rounded-sm border border-dashed border-border px-3 py-6 text-center text-muted-foreground text-sm",
-							active && "ring-2 ring-ring ring-offset-2 ring-offset-background",
+							active &&
+								"ring-2 ring-default-ring ring-offset-2 ring-offset-background",
 						)}
 					>
 						{url}
 					</div>
+				) : url ? (
+					<div
+						aria-hidden
+						className="min-h-8 rounded-sm border border-dashed border-border/50 bg-muted/10"
+					/>
 				) : null}
 				{active ? (
-					<figcaption className="mt-1 break-all font-mono text-[11px] text-muted-foreground leading-snug">
+					<figcaption className="mt-1 break-all font-mono text-caption text-muted-foreground leading-snug">
 						{sourceText}
 					</figcaption>
 				) : null}

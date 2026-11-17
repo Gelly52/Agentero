@@ -2,27 +2,43 @@ import type {
 	KeyboardEvent as ReactKeyboardEvent,
 	PointerEvent as ReactPointerEvent,
 } from "react";
-import { memo, useCallback, useEffect, useRef, useState } from "react";
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useTranslation } from "react-i18next";
 import {
 	AgentAskUserSurface,
 	isAskUserSurfaceActive,
 } from "@/components/agent/agent-ask-user-surface";
 import { AgentComposer } from "@/components/agent/agent-composer";
+import { AgentConfigBar } from "@/components/agent/agent-config-bar";
 import { SidebarHistoryTrailing } from "@/components/agent/agent-history";
 import { AgentPermissionDialog } from "@/components/agent/agent-permission-dialog";
 import { AgentSwitcher } from "@/components/agent/agent-switcher";
 import { ChatTranscript } from "@/components/agent/chat-transcript";
+import { PiProjectTrustNotice } from "@/components/agent/pi-project-trust-notice";
 import type { AgentPanelProps } from "@/components/agent/types";
 import { useAgentPanel } from "@/components/agent/use-agent-panel";
 import { PaneHeader } from "@/components/shell/pane-header";
-import { removeSelection } from "@/lib/agent/selection-store";
 import { cn } from "@/lib/core/utils";
 
 const COMPOSER_DEFAULT_HEIGHT_PX = 208;
 const COMPOSER_MIN_HEIGHT_PX = 88;
 const COMPOSER_MAX_HEIGHT_PX = 360;
-const COMPOSER_COMPACT_THRESHOLD_PX = 140;
+const COMPOSER_COMPACT_THRESHOLD_PX = 160;
+/** Below this app window height, prefer compact as the starting composer size. */
+const WINDOW_COMPACT_THRESHOLD_PX = 600;
 const TRANSCRIPT_MIN_HEIGHT_PX = 160;
+
+// PERF: memoized at the usage site (definition file shared) — every prop is a
+// primitive, stable state, or an identity-stable handler, so the config bar
+// bails out on unrelated panel re-renders (streaming phase flips, typing).
+const AgentConfigBarMemo = memo(AgentConfigBar);
+
+function initialComposerHeightPx(): number {
+	if (typeof window === "undefined") return COMPOSER_DEFAULT_HEIGHT_PX;
+	return window.innerHeight < WINDOW_COMPACT_THRESHOLD_PX
+		? COMPOSER_COMPACT_THRESHOLD_PX
+		: COMPOSER_DEFAULT_HEIGHT_PX;
+}
 
 export type { AgentPanelProps } from "@/components/agent/types";
 
@@ -41,7 +57,15 @@ export const AgentPanel = memo(function AgentPanel({
 	title = "Chat",
 	onOpenAgentSettings,
 	onOpenSource,
+	initialAgentId = null,
+	onAgentChange,
+	openHistoryItem = null,
+	onOpenHistoryHandled,
+	restoringHistory = false,
+	suppressHistoryImport = false,
+	wide = false,
 }: AgentPanelProps) {
+	const { t } = useTranslation("agent");
 	const panel = useAgentPanel({
 		vaultPath,
 		selectedPath,
@@ -51,10 +75,21 @@ export const AgentPanel = memo(function AgentPanel({
 		vaultPaperPaths,
 		paperMetaByRelPath,
 		paperTreeLabelMode,
+		initialAgentId,
+		onAgentChange,
+		openHistoryItem,
+		onOpenHistoryHandled,
+		suppressHistoryImport,
 	});
 	const bodyRef = useRef<HTMLDivElement>(null);
 	const [composerHeightPx, setComposerHeightPx] = useState(
-		COMPOSER_DEFAULT_HEIGHT_PX,
+		initialComposerHeightPx,
+	);
+	// Track short-window edge so we only auto-collapse once when crossing below
+	// the threshold — never lock the user out of dragging back to expanded.
+	const windowWasShortRef = useRef(
+		typeof window !== "undefined" &&
+			window.innerHeight < WINDOW_COMPACT_THRESHOLD_PX,
 	);
 
 	const clampComposerHeight = useCallback((height: number) => {
@@ -73,8 +108,17 @@ export const AgentPanel = memo(function AgentPanel({
 	}, []);
 
 	useEffect(() => {
-		const handleResize = () =>
-			setComposerHeightPx((height) => clampComposerHeight(height));
+		const handleResize = () => {
+			const short = window.innerHeight < WINDOW_COMPACT_THRESHOLD_PX;
+			const crossedIntoShort = short && !windowWasShortRef.current;
+			windowWasShortRef.current = short;
+			setComposerHeightPx((height) => {
+				const next = crossedIntoShort
+					? Math.min(height, COMPOSER_COMPACT_THRESHOLD_PX)
+					: height;
+				return clampComposerHeight(next);
+			});
+		};
 		handleResize();
 		window.addEventListener("resize", handleResize);
 		return () => window.removeEventListener("resize", handleResize);
@@ -142,14 +186,22 @@ export const AgentPanel = memo(function AgentPanel({
 		},
 		[clampComposerHeight],
 	);
+	// Compact is driven only by composer height so the resize handle can always
+	// leave or re-enter compact, even when the app window is short.
 	const composerCompact = composerHeightPx <= COMPOSER_COMPACT_THRESHOLD_PX;
+	// Compact mode hugs content (no fixed height) so the shell does not leave a
+	// empty band under the single-line input. Non-compact keeps the resize budget.
+	const composerDisplayHeightPx = composerCompact
+		? undefined
+		: composerHeightPx;
 
 	const {
-		t,
-		lines,
+		selectedPaperMeta,
 		activeTabId,
+		hydratingSessionId,
 		selected,
 		activeTabIsRunning,
+		activePhase,
 		submitting,
 		switching,
 		editingLineId,
@@ -161,20 +213,23 @@ export const AgentPanel = memo(function AgentPanel({
 		cancelEditingMessage,
 		resendEditedMessage,
 		startEditingMessage,
+		openSelectedAgentLogin,
+		selectedLogin,
 		submitComposer,
 		messageQueue,
 		removeQueuedMessage,
-		sessionHistory,
 		historyOpen,
 		setHistoryOpen,
 		newConversation,
 		openHistorySession,
+		removeHistorySession,
 		options,
 		selectedAgentId,
 		hasRunningSessions,
 		selectAgent,
 		composerText,
 		onComposerTextChangeFromUser,
+		composerInputRef,
 		setComposerMenuDismissed,
 		setMentionActiveIndex,
 		setSkillActiveIndex,
@@ -184,7 +239,6 @@ export const AgentPanel = memo(function AgentPanel({
 		currentFilePath,
 		currentFileLabel,
 		mentionChipPaths,
-		selectionChips,
 		visualDrafts,
 		removeVisualDraft,
 		directoryPathSet,
@@ -192,7 +246,6 @@ export const AgentPanel = memo(function AgentPanel({
 		labelForPath,
 		removeContextPath,
 		selectedSkills,
-		setSelectedSkillIds,
 		showMentionMenu,
 		mentionBrowseRoot,
 		mentionOptions,
@@ -205,6 +258,7 @@ export const AgentPanel = memo(function AgentPanel({
 		skillOptions,
 		skillActiveIndex,
 		attachSkill,
+		removeSkill,
 		showSlashMenu,
 		slashOptions,
 		slashActiveIndex,
@@ -224,10 +278,9 @@ export const AgentPanel = memo(function AgentPanel({
 		collaborationModeId,
 		selectedCollaborationName,
 		pickCollaborationMode,
-		effortOptionsInDisplayOrder,
+		effortOptions,
 		reasoningEffort,
-		setReasoningEffort,
-		formatEffort,
+		pickReasoningEffort,
 		activeUsage,
 		fastAvailable,
 		fastEnabled,
@@ -242,6 +295,7 @@ export const AgentPanel = memo(function AgentPanel({
 		toolAskUserRequest,
 		setToolAskUserRequest,
 		answerToolAskUser,
+		recordAskUserAnswers,
 		switchingRef,
 		submittingRef,
 	} = panel;
@@ -253,14 +307,63 @@ export const AgentPanel = memo(function AgentPanel({
 		toolAskUserRequest,
 	});
 
-	const sendSuggestion = (label: string, workflow?: string) => {
-		void submitComposer(label, workflow);
+	// PERF: latest-ref wrappers keep memoized children (ChatTranscript,
+	// AgentConfigBar) props identity-stable — the sub-hooks return plain
+	// functions whose identity changes every render. Wrappers always call
+	// the freshest handler, so stability never means stale closures.
+	const latestTranscriptHandlersRef = useRef({
+		submitComposer,
+		cancelEditingMessage,
+		resendEditedMessage,
+		startEditingMessage,
+	});
+	latestTranscriptHandlersRef.current = {
+		submitComposer,
+		cancelEditingMessage,
+		resendEditedMessage,
+		startEditingMessage,
 	};
+	const sendSuggestion = useCallback((label: string, workflow?: string) => {
+		void latestTranscriptHandlersRef.current.submitComposer(label, workflow);
+	}, []);
+	const handleCancelEditing = useCallback(
+		() => latestTranscriptHandlersRef.current.cancelEditingMessage(),
+		[],
+	);
+	const handleResendEdited = useCallback((lineId: string) => {
+		void latestTranscriptHandlersRef.current.resendEditedMessage(lineId);
+	}, []);
+	const handleStartEditing = useCallback(
+		(lineId: string, text: string) =>
+			latestTranscriptHandlersRef.current.startEditingMessage(lineId, text),
+		[],
+	);
+	// editCompositionProps is a fresh object literal per render while its
+	// callbacks are useCallback-stable — rewrap so memo shallow-equality holds.
+	const { onCompositionStart, onCompositionEnd } = editCompositionProps;
+	const stableEditCompositionProps = useMemo(
+		() => ({ onCompositionStart, onCompositionEnd }),
+		[onCompositionStart, onCompositionEnd],
+	);
+
+	const latestPickModelRef = useRef(pickModel);
+	latestPickModelRef.current = pickModel;
+	const handlePickModel = useCallback(
+		(id: string) => latestPickModelRef.current(id),
+		[],
+	);
+	const toggleFastEnabled = useCallback(
+		() => setFastEnabled((current) => !current),
+		[setFastEnabled],
+	);
 
 	return (
 		<section
 			data-agent-panel
-			className={cn("flex h-full min-h-0 flex-col bg-background", className)}
+			className={cn(
+				"flex h-full min-h-0 select-none flex-col bg-sidebar",
+				className,
+			)}
 			aria-label={title}
 		>
 			<div className="flex min-h-0 min-w-0 flex-1 flex-col">
@@ -269,12 +372,12 @@ export const AgentPanel = memo(function AgentPanel({
 						<SidebarHistoryTrailing
 							historyOpen={historyOpen}
 							onHistoryOpenChange={setHistoryOpen}
-							sessionHistory={sessionHistory}
 							activeTabId={activeTabId}
 							submitting={submitting}
 							headerActions={headerActions}
 							onNewConversation={newConversation}
 							onOpenSession={openHistorySession}
+							onDeleteSession={removeHistorySession}
 						/>
 					}
 				>
@@ -288,26 +391,54 @@ export const AgentPanel = memo(function AgentPanel({
 					/>
 				</PaneHeader>
 
+				<AgentConfigBarMemo
+					modelSelectorOpen={modelSelectorOpen}
+					onModelSelectorOpenChange={setModelSelectorOpen}
+					models={models}
+					groupedModels={groupedModels}
+					modelId={modelId}
+					selectedModelName={selectedModelName}
+					favoriteIds={favoriteIds}
+					warming={warming}
+					onPickModel={handlePickModel}
+					onToggleFavorite={toggleFavorite}
+					collaborationOptions={collaborationOptions}
+					collaborationModeId={collaborationModeId}
+					selectedCollaborationName={selectedCollaborationName}
+					onPickCollaborationMode={pickCollaborationMode}
+					effortOptions={effortOptions}
+					reasoningEffort={reasoningEffort}
+					onReasoningEffortChange={pickReasoningEffort}
+					fastAvailable={fastAvailable}
+					fastEnabled={fastEnabled}
+					onFastEnabledToggle={toggleFastEnabled}
+				/>
+
 				<div ref={bodyRef} className="flex min-h-0 flex-1 flex-col">
 					<ChatTranscript
-						lines={lines}
+						wide={wide}
 						activeTabId={activeTabId}
-						agentName={selected?.name ?? t("defaultName")}
+						hydratingSessionId={hydratingSessionId}
+						restoring={restoringHistory}
 						compact={composerCompact}
 						activeTabIsRunning={activeTabIsRunning}
+						phase={activePhase}
 						submitting={submitting}
 						switching={switching}
 						editingLineId={editingLineId}
 						editingText={editingText}
 						editTextareaRef={editTextareaRef}
-						editCompositionProps={editCompositionProps}
+						editCompositionProps={stableEditCompositionProps}
 						isEditBlockedByIme={isEditBlockedByIme}
 						onEditingTextChange={setEditingText}
-						onCancelEditing={cancelEditingMessage}
-						onResendEdited={(lineId) => void resendEditedMessage(lineId)}
-						onStartEditing={startEditingMessage}
+						onCancelEditing={handleCancelEditing}
+						onResendEdited={handleResendEdited}
+						onStartEditing={handleStartEditing}
 						onSendSuggestion={sendSuggestion}
+						onAgentLogin={selectedLogin ? openSelectedAgentLogin : undefined}
 						onOpenSource={onOpenSource}
+						agentTemplate={selected?.template ?? null}
+						paper={selectedPaperMeta}
 					/>
 
 					{/* Questionnaire replaces the composer until submit/cancel. */}
@@ -319,11 +450,18 @@ export const AgentPanel = memo(function AgentPanel({
 						toolAskUserRequest={toolAskUserRequest}
 						onToolAskUserResolved={() => setToolAskUserRequest(null)}
 						onAnswerToolAskUser={answerToolAskUser}
+						onRecordAskUserAnswers={recordAskUserAnswers}
 						disabled={switching}
 					/>
 
 					{!askUserActive ? (
 						<>
+							<PiProjectTrustNotice
+								vaultPath={vaultPath}
+								agentId={selected?.id}
+								template={selected?.template}
+								disabled={hasRunningSessions}
+							/>
 							<button
 								type="button"
 								aria-label={t("composer.resizeHandle")}
@@ -336,10 +474,10 @@ export const AgentPanel = memo(function AgentPanel({
 							</button>
 
 							<AgentComposer
+								wide={wide}
 								autoFocus={autoFocus}
-								heightPx={composerHeightPx}
+								heightPx={composerDisplayHeightPx}
 								compact={composerCompact}
-								linesLength={lines.length}
 								activeTabIsRunning={activeTabIsRunning}
 								switching={switching}
 								submitting={submitting}
@@ -371,8 +509,6 @@ export const AgentPanel = memo(function AgentPanel({
 								currentFilePath={currentFilePath}
 								currentFileLabel={currentFileLabel}
 								mentionChipPaths={mentionChipPaths}
-								selectionChips={selectionChips}
-								onRemoveSelection={removeSelection}
 								visualDrafts={visualDrafts}
 								onRemoveVisualDraft={removeVisualDraft}
 								directoryPathSet={directoryPathSet}
@@ -380,11 +516,7 @@ export const AgentPanel = memo(function AgentPanel({
 								labelForPath={labelForPath}
 								onRemoveContextPath={removeContextPath}
 								selectedSkills={selectedSkills}
-								onRemoveSkill={(skillId) =>
-									setSelectedSkillIds((prev) =>
-										prev.filter((id) => id !== skillId),
-									)
-								}
+								onRemoveSkill={removeSkill}
 								showMentionMenu={showMentionMenu}
 								mentionBrowseRoot={mentionBrowseRoot}
 								mentionOptions={mentionOptions}
@@ -404,32 +536,9 @@ export const AgentPanel = memo(function AgentPanel({
 								slashActiveIndex={slashActiveIndex}
 								onAttachSlashCommand={attachSlashCommand}
 								onSlashActiveIndexChange={setSlashActiveIndex}
-								modelSelectorOpen={modelSelectorOpen}
-								onModelSelectorOpenChange={setModelSelectorOpen}
-								models={models}
-								groupedModels={groupedModels}
-								modelId={modelId}
-								selectedModelName={selectedModelName}
-								favoriteIds={favoriteIds}
-								warming={warming}
-								onPickModel={pickModel}
-								onToggleFavorite={toggleFavorite}
-								collaborationOptions={collaborationOptions}
-								collaborationModeId={collaborationModeId}
-								selectedCollaborationName={selectedCollaborationName}
-								onPickCollaborationMode={pickCollaborationMode}
-								effortOptionsInDisplayOrder={effortOptionsInDisplayOrder}
-								reasoningEffort={reasoningEffort}
-								onReasoningEffortChange={setReasoningEffort}
-								formatEffort={formatEffort}
 								activeUsage={activeUsage}
-								fastAvailable={fastAvailable}
-								fastEnabled={fastEnabled}
-								onFastEnabledToggle={() =>
-									setFastEnabled((current) => !current)
-								}
+								composerInputRef={composerInputRef}
 								onCancelRun={() => void cancelCurrentRun()}
-								onSendSuggestion={sendSuggestion}
 							/>
 						</>
 					) : null}

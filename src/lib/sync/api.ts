@@ -1,12 +1,15 @@
 /**
- * Vault cloud sync (S3-compatible) — Host command wrappers + event names.
- * Design: docs/development/cloud-sync-s3.md
+ * Vault cloud sync (S3-compatible / WebDAV) — Host command wrappers.
+ * Design: docs/backend/sync.md
  */
 
-import { invokeApi } from "@/lib/core/ipc";
-
-export const SYNC_STATE_EVENT = "sync:state";
-export const SYNC_PROGRESS_EVENT = "sync:progress";
+import {
+	commands,
+	type SyncBackendConfig as SyncBackendConfigWire,
+	type SyncStateEvent_Deserialize,
+	type SyncStatus_Serialize,
+} from "@/lib/core/bindings";
+import { callApiResult } from "@/lib/core/ipc";
 
 /**
  * Which bulky paper assets take part in sync. Notes, metadata sidecars,
@@ -19,7 +22,11 @@ export type SyncScope = {
 	attachments: boolean;
 };
 
+/** Storage backend discriminator; legacy configs without one are S3. */
+export type SyncBackendKind = "s3" | "webdav" | "git" | "agentero";
+
 export type SyncBackendConfig = {
+	backend: SyncBackendKind;
 	endpoint: string;
 	region: string;
 	bucket: string;
@@ -28,6 +35,25 @@ export type SyncBackendConfig = {
 	/** Masked (`***`) on the way out; send the mask back to keep the secret. */
 	secretKey: string;
 	forcePathStyle: boolean;
+	/** WebDAV server directory, e.g. `https://dav.jianguoyun.com/dav/agentero/`. */
+	webdavUrl: string;
+	webdavUsername: string;
+	/** Masked like the S3 secret key. */
+	webdavPassword: string;
+	/** Git remote URL or local path; credentials come from system Git. */
+	gitRemote: string;
+	/** Branch synced by the Git backend (default `main`). */
+	gitBranch: string;
+	/** Allow a non-loopback `http://` remote. The token travels in cleartext. */
+	gitAllowInsecureHttp: boolean;
+	/** Absolute PEM CA path for a self-signed HTTPS remote. Empty uses the system store. */
+	gitSslCaInfo: string;
+	/** `user` or `organization` for official cloud sync. */
+	agenteroSubject: "user" | "organization";
+	/** Organization id when `agenteroSubject` is `organization`. */
+	agenteroOrgId: string;
+	/** API origin. Empty until the host fills the signed-in origin. */
+	agenteroApi: string;
 	/** Background sync: on open, after 30s quiet, and every intervalMinutes. */
 	autoSync: boolean;
 	intervalMinutes: number;
@@ -54,20 +80,35 @@ export type SyncOutcome = {
 	conflictCopies: string[];
 };
 
-export type SyncStateEvent = {
-	vaultPath: string;
-	status: "syncing" | "idle" | "error";
-	error?: string;
-};
+/** `sync:state` payload comes straight from the generated wire contract. */
+export type SyncStateEvent = SyncStateEvent_Deserialize;
+
+/** `sync:progress` phases; the wire payload types `phase` as a plain string. */
+export type SyncPhase = "scan" | "pull" | "download" | "upload" | "finalize";
 
 export type SyncProgressEvent = {
 	vaultPath: string;
-	phase: "scan" | "pull" | "download" | "upload" | "finalize";
+	phase: SyncPhase;
 	current: number;
 	total: number;
 };
 
-export const emptySyncConfig = (): SyncBackendConfig => ({
+const SYNC_PHASES: readonly string[] = [
+	"scan",
+	"pull",
+	"download",
+	"upload",
+	"finalize",
+];
+
+export function isSyncProgressPhase(phase: string): phase is SyncPhase {
+	return SYNC_PHASES.includes(phase);
+}
+
+export const emptySyncConfig = (
+	backend: SyncBackendKind = "agentero",
+): SyncBackendConfig => ({
+	backend,
 	endpoint: "",
 	region: "us-east-1",
 	bucket: "",
@@ -75,6 +116,16 @@ export const emptySyncConfig = (): SyncBackendConfig => ({
 	accessKey: "",
 	secretKey: "",
 	forcePathStyle: true,
+	webdavUrl: "",
+	webdavUsername: "",
+	webdavPassword: "",
+	gitRemote: "",
+	gitBranch: "main",
+	gitAllowInsecureHttp: false,
+	gitSslCaInfo: "",
+	agenteroSubject: "user",
+	agenteroOrgId: "",
+	agenteroApi: "",
 	autoSync: true,
 	intervalMinutes: 30,
 	conditionalWrites: true,
@@ -91,31 +142,90 @@ export type SyncScopeSizes = {
 	attachments: number;
 };
 
-export function syncGetStatus(vaultPath: string): Promise<SyncStatus> {
-	return invokeApi("sync_get_status", { args: { vaultPath } });
+/** Fold the generated wire status into the local all-fields-present shape. */
+function statusFromWire(status: SyncStatus_Serialize): SyncStatus {
+	const config = status.config;
+	return {
+		configured: status.configured,
+		config: config ? configFromWire(config) : undefined,
+		running: status.running,
+		lastSyncAt: status.lastSyncAt ?? undefined,
+		lastVersion: status.lastVersion,
+	};
 }
 
-export function syncScopeSizes(vaultPath: string): Promise<SyncScopeSizes> {
-	return invokeApi("sync_scope_sizes", { args: { vaultPath } });
-}
-
-export function syncConfigure(
-	vaultPath: string,
-	config: SyncBackendConfig,
-): Promise<SyncStatus> {
-	return invokeApi("sync_configure", { args: { vaultPath, config } });
-}
-
-export function syncDisconnect(vaultPath: string): Promise<void> {
-	return invokeApi(
-		"sync_disconnect",
-		{ args: { vaultPath } },
-		{
-			allowVoid: true,
+function configFromWire(config: SyncBackendConfigWire): SyncBackendConfig {
+	return {
+		backend: (config.backend as SyncBackendKind | undefined) ?? "s3",
+		endpoint: config.endpoint ?? "",
+		region: config.region ?? "us-east-1",
+		bucket: config.bucket ?? "",
+		prefix: config.prefix ?? "",
+		accessKey: config.accessKey ?? "",
+		secretKey: config.secretKey ?? "",
+		forcePathStyle: config.forcePathStyle ?? true,
+		webdavUrl: config.webdavUrl ?? "",
+		webdavUsername: config.webdavUsername ?? "",
+		webdavPassword: config.webdavPassword ?? "",
+		gitRemote: config.gitRemote ?? "",
+		gitBranch: config.gitBranch ?? "main",
+		gitAllowInsecureHttp: config.gitAllowInsecureHttp ?? false,
+		gitSslCaInfo: config.gitSslCaInfo ?? "",
+		agenteroSubject:
+			config.agenteroSubject === "organization" ? "organization" : "user",
+		agenteroOrgId: config.agenteroOrgId ?? "",
+		agenteroApi: config.agenteroApi ?? "",
+		autoSync: config.autoSync ?? true,
+		intervalMinutes: config.intervalMinutes ?? 30,
+		conditionalWrites: config.conditionalWrites ?? true,
+		scope: {
+			pdf: config.scope?.pdf ?? true,
+			source: config.scope?.source ?? true,
+			attachments: config.scope?.attachments ?? true,
 		},
+	};
+}
+
+export async function syncGetStatus(vaultPath: string): Promise<SyncStatus> {
+	return statusFromWire(
+		await callApiResult(() => commands.syncGetStatus({ vaultPath })),
 	);
 }
 
+export function syncScopeSizes(vaultPath: string): Promise<SyncScopeSizes> {
+	return callApiResult(() => commands.syncScopeSizes({ vaultPath }));
+}
+
+export async function syncConfigure(
+	vaultPath: string,
+	config: SyncBackendConfig,
+): Promise<SyncStatus> {
+	return statusFromWire(
+		await callApiResult(() => commands.syncConfigure({ vaultPath, config })),
+	);
+}
+
+export async function syncDisconnect(vaultPath: string): Promise<void> {
+	await callApiResult(() => commands.syncDisconnect({ vaultPath }));
+}
+
 export function syncNow(vaultPath: string): Promise<SyncOutcome> {
-	return invokeApi("sync_now", { args: { vaultPath } });
+	return callApiResult(() => commands.syncNow({ vaultPath }));
+}
+
+export type SyncCloudUsage = {
+	signedIn: boolean;
+	used: number;
+	limit: number;
+	tier: string;
+	planKey: string;
+};
+
+export function syncCloudUsage(
+	subject: "user" | "organization",
+	orgId?: string,
+): Promise<SyncCloudUsage> {
+	return callApiResult(() =>
+		commands.syncCloudUsage({ subject, orgId: orgId ?? null }),
+	);
 }

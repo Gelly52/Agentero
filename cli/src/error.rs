@@ -65,7 +65,13 @@ impl CliError {
     pub fn paper_ambiguous(ref_: &str, candidates: &[String]) -> Self {
         Self::with_details(
             "paper_ambiguous",
-            format!("Multiple papers match id '{ref_}'"),
+            format!(
+                "Multiple papers match id '{ref_}'. Retry with a vault-relative path from candidates (e.g. {})",
+                candidates
+                    .first()
+                    .map(|s| s.as_str())
+                    .unwrap_or("papers/<shelf>/<id>")
+            ),
             json!({ "candidates": candidates }),
             ExitCode::Business,
         )
@@ -104,8 +110,18 @@ impl fmt::Display for CliError {
 
 impl std::error::Error for CliError {}
 
-impl From<agentero_lib::core::error::AppError> for CliError {
-    fn from(err: agentero_lib::core::error::AppError) -> Self {
+impl From<agentero_core::error::AppError> for CliError {
+    fn from(err: agentero_core::error::AppError) -> Self {
+        use agentero_core::error::AppError;
+        // Preserve stable domain codes (layout_index_missing, usage, …).
+        if let AppError::Domain { code, message } = &err {
+            let exit = if *code == "usage" {
+                ExitCode::Usage
+            } else {
+                ExitCode::Business
+            };
+            return Self::new(code, message.clone(), exit);
+        }
         let msg = err.to_string();
         let lower = msg.to_ascii_lowercase();
         if lower.contains("not found") {
@@ -114,10 +130,9 @@ impl From<agentero_lib::core::error::AppError> for CliError {
         if lower.contains("vault") && lower.contains("not a directory") {
             return Self::vault_not_found(msg);
         }
-        // Prefer domain-specific codes for Translator IO.
-        if lower.contains("export") {
-            return Self::export_failed(msg);
-        }
+        // Prefer domain-specific codes for Translator IO. Export maps its own
+        // failures explicitly (`export_failed`); matching the bare substring
+        // here would also catch URLs such as `export.arxiv.org`.
         if lower.contains("translator") || lower.contains("import") {
             return Self::import_failed(msg);
         }
@@ -135,6 +150,23 @@ impl From<agentero_lib::core::error::AppError> for CliError {
 impl From<std::io::Error> for CliError {
     fn from(err: std::io::Error) -> Self {
         Self::new("io", err.to_string(), ExitCode::Business)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use agentero_core::error::AppError;
+
+    #[test]
+    fn arxiv_network_errors_are_not_misread_as_export_failures() {
+        let err = AppError::message(
+            "network: error sending request for url \
+             (https://export.arxiv.org/api/query?search_query=all:test)",
+        );
+        let cli = CliError::from(err);
+        assert_eq!(cli.code, "message");
+        assert_eq!(cli.exit_code(), ExitCode::Business);
     }
 }
 

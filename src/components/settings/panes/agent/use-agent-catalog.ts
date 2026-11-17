@@ -10,6 +10,8 @@ import {
 import { useProbingKeys } from "@/components/settings/use-probing-keys";
 import {
 	type CatalogScanResponse,
+	checkCatalogUpdates,
+	openAgentLoginTerminal,
 	probeAgent,
 	probeCatalogAgent,
 	scanCatalog,
@@ -76,6 +78,23 @@ export function useAgentCatalog({
 				return null;
 			}
 		}, [t, sessionId]);
+
+	/**
+	 * Local-only: re-scan and compare CLI versions so Upgrade shows only when a
+	 * newer silent-update target is known. Remote vaults skip (no silent update).
+	 */
+	const refreshVersions =
+		useCallback(async (): Promise<CatalogScanResponse | null> => {
+			if (!isTauri() || sessionId) return null;
+			try {
+				const scan = await checkCatalogUpdates();
+				setCatalog(scan);
+				return scan;
+			} catch (e) {
+				notifyError(errorText(e));
+				return null;
+			}
+		}, [sessionId]);
 
 	/**
 	 * Parallel ACP probe. Soft open skips already-ready rows; force re-probes all
@@ -179,14 +198,50 @@ export function useAgentCatalog({
 				setLoading(false);
 				if (scan) {
 					await probeInstalled(scan, force);
-					await scanOnce();
+					// Version check after probe so Upgrade reflects npm/pin targets.
+					await refreshVersions();
 				}
 			} finally {
 				setLoading(false);
 				clearAllProbingKeys();
 			}
 		},
-		[probeInstalled, scanOnce, t, sessionId, clearAllProbingKeys],
+		[
+			probeInstalled,
+			refreshVersions,
+			scanOnce,
+			t,
+			sessionId,
+			clearAllProbingKeys,
+		],
+	);
+
+	const refreshAfterLogin = useCallback(() => {
+		const attempts = [2_000, 5_000, 10_000, 20_000];
+		for (const delay of attempts) {
+			window.setTimeout(() => {
+				void rescanAndProbe(true);
+			}, delay);
+		}
+	}, [rescanAndProbe]);
+
+	const openLoginTerminal = useCallback(
+		async (templateId: string): Promise<boolean> => {
+			if (!isTauri()) {
+				notifyError(t("agent.desktopOnly"));
+				return false;
+			}
+			if (sessionId) return false;
+			try {
+				await openAgentLoginTerminal(templateId);
+				void refreshAfterLogin();
+				return true;
+			} catch (e) {
+				notifyError(errorText(e));
+				return false;
+			}
+		},
+		[t, sessionId, refreshAfterLogin],
 	);
 
 	// Open once: soft probe (skip ready). Refresh / proxy use force=true.
@@ -223,7 +278,9 @@ export function useAgentCatalog({
 		clearAllProbingKeys,
 		scanOnce,
 		probeInstalled,
+		refreshVersions,
 		rescanAndProbe,
+		openLoginTerminal,
 		patchUserAgent,
 	};
 }

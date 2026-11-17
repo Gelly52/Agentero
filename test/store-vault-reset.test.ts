@@ -75,7 +75,7 @@ describe("vault-scoped store clears", () => {
 		agentSessionStore.setState({
 			sessions: [{ id: "s1" }] as never,
 			activeTabId: "s1",
-			submitting: true,
+			hydratingSessionId: "s1",
 			runningSessionIds: ["s1"],
 			turnRequest: {} as never,
 		});
@@ -86,7 +86,7 @@ describe("vault-scoped store clears", () => {
 		expect(s.sessions).toEqual([]);
 		expect(s.activeTabId).toBe("draft");
 		expect(s.draftLines).toEqual([]);
-		expect(s.submitting).toBe(false);
+		expect(s.hydratingSessionId).toBeNull();
 		expect(s.runningSessionIds).toEqual([]);
 		expect(s.turnRequest).toBeNull();
 		// AgentPanel owns this slot; clearing it would break PDF-pin turns.
@@ -114,6 +114,7 @@ describe("vault-scoped store clears", () => {
 			byDocument: { doc1: {} as never },
 			ui: { stage: "analyzing" } as never,
 			activeDocumentId: "doc1",
+			activePaperAbsPath: "/vault/papers/a",
 			focused: { documentId: "doc1", regionId: "r1" },
 			overlayVisible: { doc1: true },
 		});
@@ -124,6 +125,7 @@ describe("vault-scoped store clears", () => {
 			byDocument: {},
 			ui: { stage: "idle" },
 			activeDocumentId: null,
+			activePaperAbsPath: null,
 			focused: null,
 			overlayVisible: {},
 		});
@@ -135,7 +137,6 @@ describe("vault-scoped store clears", () => {
 			zoteroOpen: true,
 			zoteroSyncOpen: true,
 			commandOpen: true,
-			agentSessionOpenRequest: {} as never,
 			// Must all survive.
 			sidebarCollapsed: true,
 			rightSidebarOpen: true,
@@ -153,7 +154,6 @@ describe("vault-scoped store clears", () => {
 		expect(s.zoteroOpen).toBe(false);
 		expect(s.zoteroSyncOpen).toBe(false);
 		expect(s.commandOpen).toBe(false);
-		expect(s.agentSessionOpenRequest).toBeNull();
 
 		expect(s.sidebarCollapsed).toBe(true);
 		expect(s.rightSidebarOpen).toBe(true);

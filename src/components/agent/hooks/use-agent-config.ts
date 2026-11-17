@@ -30,10 +30,13 @@ import {
 	loadModelCatalog,
 	loadModelFavorites,
 	loadModelPref,
+	loadReasoningEffortPref,
+	resolveReasoningEffort,
 	saveCollaborationPref,
 	saveModelCatalog,
 	saveModelFavorites,
 	saveModelPref,
+	saveReasoningEffortPref,
 	scanCatalog,
 	warmAgent,
 } from "@/lib/agent";
@@ -43,6 +46,7 @@ import {
 	ensureModelsInclude,
 	errorChatLine,
 	errorText,
+	mergeModelChoices,
 } from "@/lib/agent/chat-state";
 import type { AcpCommand } from "@/lib/agent/slash-commands";
 import { isTauri } from "@/lib/core/tauri";
@@ -97,9 +101,9 @@ export type AgentConfig = {
 	setAcpCommandsByAgent: Dispatch<SetStateAction<Record<string, AcpCommand[]>>>;
 	collaborationOptions: AgentModeChoice[];
 	collaborationModeId: string | null;
-	effortOptionsInDisplayOrder: AgentEffortChoice[];
+	effortOptions: AgentEffortChoice[];
 	reasoningEffort: string | null;
-	setReasoningEffort: Dispatch<SetStateAction<string | null>>;
+	pickReasoningEffort: (id: string) => void;
 	fastAvailable: boolean;
 	fastEnabled: boolean;
 	setFastEnabled: Dispatch<SetStateAction<boolean>>;
@@ -128,7 +132,6 @@ export type AgentConfig = {
 		isFavorites: boolean;
 		items: AgentModelChoice[];
 	}[];
-	formatEffort: (value: string) => string;
 	selectedCollaborationName: string | null;
 	pickCollaborationMode: (id: string) => void;
 	pickModel: (id: string) => void;
@@ -172,6 +175,14 @@ export function useAgentConfig({
 	const [fastAvailable, setFastAvailable] = useState(false);
 	const [fastEnabled, setFastEnabled] = useState(false);
 	const warmGenRef = useRef(0);
+	/**
+	 * Richest model catalog seen for each agent in this panel session. ACP
+	 * agents (opencode 2.x) report a partial catalog first and push the complete
+	 * one later, so a stale warm result / pooled-slot snapshot must not shrink
+	 * the picker (Fix #638). In-memory only, so a catalog that legitimately
+	 * removes models on a fresh start still wins.
+	 */
+	const modelsSeenRef = useRef<Map<string, AgentModelChoice[]>>(new Map());
 
 	const applyModelsEvent = useCallback(
 		(ev: {
@@ -183,12 +194,16 @@ export function useAgentConfig({
 			const cur = selectedAgentIdRef.current;
 			const pref = loadModelPref(ev.agentId)?.trim() || null;
 			const current = ev.currentId?.trim() || null;
+			const incoming = dedupeModelsClient(ev.models);
+			const seen = modelsSeenRef.current.get(ev.agentId);
+			const base =
+				seen && seen.length > incoming.length
+					? mergeModelChoices(seen, incoming)
+					: incoming;
+			if (base.length > 0) modelsSeenRef.current.set(ev.agentId, base);
 			// Keep user/custom prefs and agent current even when not in the fixed
 			// official catalog (third-party / gateway model ids; Fix #216).
-			const catalogModels = ensureModelsInclude(dedupeModelsClient(ev.models), [
-				current,
-				pref,
-			]);
+			const catalogModels = ensureModelsInclude(base, [current, pref]);
 			if (catalogModels.length === 0) return;
 			saveModelCatalog(ev.agentId, {
 				configId: ev.configId,
@@ -241,7 +256,13 @@ export function useAgentConfig({
 			const cur = selectedAgentIdRef.current;
 			if (cur && cur !== ev.agentId) return;
 			setEffortOptions(ev.efforts);
-			setReasoningEffort(ev.currentId);
+			setReasoningEffort(
+				resolveReasoningEffort(
+					loadReasoningEffortPref(ev.agentId),
+					ev.currentId,
+					ev.efforts,
+				),
+			);
 		},
 		[selectedAgentIdRef],
 	);
@@ -259,9 +280,12 @@ export function useAgentConfig({
 	const refresh = useCallback(async () => {
 		if (!isTauri()) return;
 		try {
-			const [list, scan, discoveredSkills] = await Promise.all([
+			// Scan first: scanCatalog now auto-registers catalog agents that are
+			// on PATH but not yet persisted, so listAgents() returns them without
+			// requiring the user to open Settings first.
+			const scan = await scanCatalog();
+			const [list, discoveredSkills] = await Promise.all([
 				listAgents(),
-				scanCatalog(),
 				listAgentSkills(vaultPath ?? undefined).catch(() => []),
 			]);
 			setRegistry(list);
@@ -314,7 +338,7 @@ export function useAgentConfig({
 		setCollaborationOptions([]);
 		setCollaborationModeId(loadCollaborationPref(selectedAgentId));
 		setEffortOptions([]);
-		setReasoningEffort(null);
+		setReasoningEffort(loadReasoningEffortPref(selectedAgentId));
 		setFastAvailable(false);
 		setFastEnabled(false);
 		setUsage(null);
@@ -465,32 +489,6 @@ export function useAgentConfig({
 		return result;
 	}, [models, favoriteIds, t]);
 
-	const effortOptionsInDisplayOrder = useMemo(() => {
-		const order = ["max", "xhigh", "high", "medium", "low"];
-		return [...effortOptions].sort(
-			(left, right) =>
-				order.indexOf(left.id.toLocaleLowerCase()) -
-				order.indexOf(right.id.toLocaleLowerCase()),
-		);
-	}, [effortOptions]);
-
-	const formatEffort = (value: string) => {
-		switch (value.toLocaleLowerCase()) {
-			case "max":
-				return t("composer.effort.max");
-			case "xhigh":
-				return t("composer.effort.xhigh");
-			case "high":
-				return t("composer.effort.high");
-			case "medium":
-				return t("composer.effort.medium");
-			case "low":
-				return t("composer.effort.low");
-			default:
-				return value;
-		}
-	};
-
 	const selectedCollaborationName = useMemo(() => {
 		if (!collaborationModeId) return null;
 		return (
@@ -514,7 +512,7 @@ export function useAgentConfig({
 	const pickModel = (id: string) => {
 		const next = id.trim();
 		if (!next) return;
-		setModelSelectorOpen(false);
+		if (next === modelId) return;
 		// Free-form / third-party ids may not be in the advertised catalog yet.
 		setModels((prev) => ensureModelsInclude(prev, [next]));
 		setModelId(next);
@@ -526,7 +524,7 @@ export function useAgentConfig({
 		const requestVaultPath = vaultPath;
 		const generation = ++warmGenRef.current;
 		setEffortOptions([]);
-		setReasoningEffort(null);
+		setReasoningEffort(loadReasoningEffortPref(agentId));
 		setFastAvailable(false);
 		setFastEnabled(false);
 		void runWarmAgent({
@@ -545,6 +543,16 @@ export function useAgentConfig({
 				vaultPathRef.current === requestVaultPath,
 		});
 	};
+
+	const pickReasoningEffort = useCallback(
+		(id: string) => {
+			if (!selectedAgentId || !effortOptions.some((option) => option.id === id))
+				return;
+			saveReasoningEffortPref(selectedAgentId, id);
+			setReasoningEffort(id);
+		},
+		[effortOptions, selectedAgentId],
+	);
 
 	const toggleFavorite = useCallback(
 		(id: string) => {
@@ -580,9 +588,9 @@ export function useAgentConfig({
 		setAcpCommandsByAgent,
 		collaborationOptions,
 		collaborationModeId,
-		effortOptionsInDisplayOrder,
+		effortOptions,
 		reasoningEffort,
-		setReasoningEffort,
+		pickReasoningEffort,
 		fastAvailable,
 		fastEnabled,
 		setFastEnabled,
@@ -593,7 +601,6 @@ export function useAgentConfig({
 		refresh,
 		selectedModelName,
 		groupedModels,
-		formatEffort,
 		selectedCollaborationName,
 		pickCollaborationMode,
 		pickModel,

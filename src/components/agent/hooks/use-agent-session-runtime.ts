@@ -8,6 +8,7 @@ import {
 	type SetStateAction,
 	useCallback,
 	useEffect,
+	useRef,
 	useState,
 } from "react";
 import type {
@@ -18,10 +19,12 @@ import {
 	type AgentEffortChoice,
 	type AgentModeChoice,
 	type AgentModelChoice,
+	type AgentPhaseState,
 	type AgentPlanEvent,
 	type AgentResultPayload,
 	type AgentStreamEvent,
 	type AgentToolEvent,
+	type AgentTurnPhase,
 	displayHistoryTitle,
 	listenAgentCollaboration,
 	listenAgentCommands,
@@ -32,13 +35,14 @@ import {
 	listenAgentModels,
 	listenAgentPlan,
 	listenAgentSessionInfo,
+	listenAgentStatus,
 	listenAgentStream,
 	listenAgentTool,
 	listenAgentUsage,
 } from "@/lib/agent";
 import {
 	type AgentSessionRecord,
-	agentSessionStore,
+	useAgentSessionStoreApi,
 } from "@/lib/agent/agent-session-store";
 import {
 	type AgentPart,
@@ -46,9 +50,10 @@ import {
 	agentReasoningFromParts,
 	agentTextFromParts,
 	appendStreamPart,
-	applyToolToParts,
+	applyToolToLines,
 	type ChatLine,
 	errorChatLine,
+	failIncompleteTools,
 	isPendingAskUserToolStatus,
 	type PendingSessionEvent,
 	parseAskUserQuestions,
@@ -60,6 +65,7 @@ import { type AcpCommand, mapAcpCommands } from "@/lib/agent/slash-commands";
 import {
 	classifyStreamChunk,
 	promoteOrphanThoughtToText,
+	type StreamSlice,
 	ThinkTagParser,
 } from "@/lib/agent/stream-parse";
 import { isTauri } from "@/lib/core/tauri";
@@ -77,6 +83,7 @@ import {
 	writePdfAskThread,
 } from "@/lib/pdf/ask";
 import { nextLineId, nextPartId } from "@/lib/pdf-visual/ids";
+import { playCue } from "@/lib/ui/sound";
 
 export type UseAgentSessionRuntimeOptions = {
 	refs: Pick<
@@ -130,6 +137,10 @@ export type AgentSessionRuntime = {
 	applyPlanEvent: (ev: AgentPlanEvent) => void;
 	completeSession: (ev: AgentResultPayload) => void;
 	failSession: (sessionId: string, error: string) => void;
+	/** Whether this chat surface owns the session (stream / dialog routing). */
+	isChatOwnedSession: (sessionId: string) => boolean;
+	/** Live turn phase per session (drives the streaming activity label/orb). */
+	phaseBySession: Record<string, AgentPhaseState>;
 };
 
 export function useAgentSessionRuntime({
@@ -155,12 +166,60 @@ export function useAgentSessionRuntime({
 	setAcpCommandsByAgent,
 	setAgentListenersReady,
 }: UseAgentSessionRuntimeOptions): AgentSessionRuntime {
+	const sessionStore = useAgentSessionStoreApi();
 	const updateSessionLines = useCallback(
 		(sessionId: string, update: (lines: ChatLine[]) => ChatLine[]) => {
 			// Shared store: modal pin + sidebar both observe the same lines.
-			agentSessionStore.getState().updateSessionLines(sessionId, update);
+			sessionStore.getState().updateSessionLines(sessionId, update);
 		},
-		[],
+		[sessionStore],
+	);
+
+	/**
+	 * Streamed chunks arrive ~25×/s and each one used to trigger a store update
+	 * plus a full panel re-render. Buffer the classified slices per session and
+	 * flush once per animation frame so streaming aligns with the render loop.
+	 * Non-stream updates flush the buffer first, preserving event order.
+	 */
+	const streamBufferRef = useRef<Map<string, StreamSlice[]>>(new Map());
+	const streamFlushFrameRef = useRef(0);
+
+	const flushStreamBuffer = useCallback(
+		(sessionId: string) => {
+			const buffer = streamBufferRef.current.get(sessionId);
+			if (!buffer?.length) return;
+			streamBufferRef.current.delete(sessionId);
+			updateSessionLines(sessionId, (prev) => {
+				const next = [...prev];
+				const last = next[next.length - 1];
+				if (last?.kind !== "agent" || !last.streaming) return prev;
+				let parts = last.parts;
+				for (const slice of buffer) {
+					parts = appendStreamPart(parts, slice.kind, slice.text);
+				}
+				next[next.length - 1] = {
+					...last,
+					parts,
+				};
+				return next;
+			});
+		},
+		[updateSessionLines],
+	);
+
+	const flushAllStreamBuffers = useCallback(() => {
+		for (const sessionId of [...streamBufferRef.current.keys()]) {
+			flushStreamBuffer(sessionId);
+		}
+	}, [flushStreamBuffer]);
+
+	/** Apply a non-stream update after any buffered chunks of the same session. */
+	const updateSessionLinesOrdered = useCallback(
+		(sessionId: string, update: (lines: ChatLine[]) => ChatLine[]) => {
+			flushStreamBuffer(sessionId);
+			updateSessionLines(sessionId, update);
+		},
+		[flushStreamBuffer, updateSessionLines],
 	);
 
 	/** Only composer-owned sessions (or pending submit) update the chat transcript. */
@@ -180,6 +239,26 @@ export function useAgentSessionRuntime({
 		],
 	);
 
+	// OpenCode / Claude / Codex tool-shaped ask → bottom form surface (not transcript).
+	// Declared before applyToolEvent so the promote path can set it.
+	const [toolAskUserRequest, setToolAskUserRequest] =
+		useState<ToolAskUserRequest | null>(null);
+
+	/** Backend loading phase of the current turn, keyed by runtime session. */
+	const [phaseBySession, setPhaseBySession] = useState<
+		Record<string, AgentPhaseState>
+	>({});
+
+	/** Drop the phase once real output arrives / the turn finalizes. */
+	const clearPhase = useCallback((sessionId: string) => {
+		setPhaseBySession((prev) => {
+			if (!prev[sessionId]) return prev;
+			const next = { ...prev };
+			delete next[sessionId];
+			return next;
+		});
+	}, []);
+
 	const applyStreamEvent = useCallback(
 		(ev: AgentStreamEvent) => {
 			if (!isChatOwnedSession(ev.sessionId)) return;
@@ -191,51 +270,38 @@ export function useAgentSessionRuntime({
 			}
 			const slices = classifyStreamChunk(streamKind, ev.chunk, parser);
 			if (slices.length === 0) return;
-			updateSessionLines(ev.sessionId, (prev) => {
-				const next = [...prev];
-				const last = next[next.length - 1];
-				if (last?.kind !== "agent" || !last.streaming) return prev;
-				let parts = last.parts;
-				for (const slice of slices) {
-					if (!slice.text) continue;
-					parts = appendStreamPart(parts, slice.kind, slice.text);
-				}
-				next[next.length - 1] = {
-					...last,
-					parts,
-				};
-				return next;
+			// Real model output arrived — the loading phase is over.
+			clearPhase(ev.sessionId);
+			const buffer = streamBufferRef.current.get(ev.sessionId) ?? [];
+			for (const slice of slices) {
+				if (slice.text) buffer.push(slice);
+			}
+			if (!buffer.length) return;
+			streamBufferRef.current.set(ev.sessionId, buffer);
+			if (streamFlushFrameRef.current) return;
+			streamFlushFrameRef.current = requestAnimationFrame(() => {
+				streamFlushFrameRef.current = 0;
+				flushAllStreamBuffers();
 			});
 		},
-		[isChatOwnedSession, thinkParsersRef, updateSessionLines],
+		[clearPhase, flushAllStreamBuffers, isChatOwnedSession, thinkParsersRef],
 	);
-
-	// OpenCode / Claude / Codex tool-shaped ask → bottom form surface (not transcript).
-	// Declared before applyToolEvent so the promote path can set it.
-	const [toolAskUserRequest, setToolAskUserRequest] =
-		useState<ToolAskUserRequest | null>(null);
 
 	const applyToolEvent = useCallback(
 		(ev: AgentToolEvent) => {
 			if (!isChatOwnedSession(ev.sessionId)) return;
-			updateSessionLines(ev.sessionId, (prev) => {
-				const next = [...prev];
-				const last = next[next.length - 1];
-				if (last?.kind !== "agent" || !last.streaming) return prev;
-				next[next.length - 1] = {
-					...last,
-					parts: applyToolToParts(last.parts, {
-						id: ev.toolCallId,
-						title: ev.title,
-						kind: ev.kind,
-						status: ev.status,
-						input: ev.input,
-						output: ev.output,
-						full: ev.full,
-					}),
-				};
-				return next;
-			});
+			clearPhase(ev.sessionId);
+			updateSessionLinesOrdered(ev.sessionId, (prev) =>
+				applyToolToLines(prev, {
+					id: ev.toolCallId,
+					title: ev.title,
+					kind: ev.kind,
+					status: ev.status,
+					input: ev.input,
+					output: ev.output,
+					full: ev.full,
+				}),
+			);
 
 			// Promote pending ask-user tools to the bottom surface (hides free-text composer).
 			// Surface priority: elicitation > Grok ext > tool; listeners clear tool on host asks.
@@ -255,13 +321,14 @@ export function useAgentSessionRuntime({
 				);
 			}
 		},
-		[isChatOwnedSession, updateSessionLines],
+		[clearPhase, isChatOwnedSession, updateSessionLinesOrdered],
 	);
 
 	const applyPlanEvent = useCallback(
 		(ev: AgentPlanEvent) => {
 			if (!isChatOwnedSession(ev.sessionId)) return;
-			updateSessionLines(ev.sessionId, (prev) => {
+			clearPhase(ev.sessionId);
+			updateSessionLinesOrdered(ev.sessionId, (prev) => {
 				const next = [...prev];
 				const last = next[next.length - 1];
 				if (last?.kind !== "agent" || !last.streaming) return prev;
@@ -272,7 +339,7 @@ export function useAgentSessionRuntime({
 				return next;
 			});
 		},
-		[isChatOwnedSession, updateSessionLines],
+		[clearPhase, isChatOwnedSession, updateSessionLinesOrdered],
 	);
 
 	const deferSessionEvent = useCallback(
@@ -380,6 +447,7 @@ export function useAgentSessionRuntime({
 	const completeSession = useCallback(
 		(ev: AgentResultPayload) => {
 			if (!isChatOwnedSession(ev.sessionId)) return;
+			clearPhase(ev.sessionId);
 			if (ev.providerSessionId) {
 				// Durable source session for next turn (Host: resume or load).
 				if (activeTabRef.current === ev.sessionId) {
@@ -399,13 +467,14 @@ export function useAgentSessionRuntime({
 					kind: "system",
 					text: t("messages.cancelled"),
 				};
-				updateSessionLines(ev.sessionId, (prev) => {
+				updateSessionLinesOrdered(ev.sessionId, (prev) => {
 					const next = [...prev];
 					const last = next[next.length - 1];
 					if (last?.kind === "agent" && last.streaming) {
 						if (agentHasContent(last.parts)) {
 							next[next.length - 1] = {
 								...last,
+								parts: failIncompleteTools(last.parts),
 								streaming: false,
 							};
 						} else {
@@ -432,12 +501,13 @@ export function useAgentSessionRuntime({
 				});
 				return;
 			}
+			playCue("done");
 			thinkParsersRef.current.delete(ev.sessionId);
-			updateSessionLines(ev.sessionId, (prev) => {
+			updateSessionLinesOrdered(ev.sessionId, (prev) => {
 				const next = [...prev];
 				const last = next[next.length - 1];
 				if (last?.kind === "agent" && last.streaming) {
-					let parts = last.parts;
+					let parts = failIncompleteTools(last.parts);
 					if (
 						agentReasoningFromParts(parts).trim().length === 0 &&
 						ev.reasoning &&
@@ -508,12 +578,13 @@ export function useAgentSessionRuntime({
 		[
 			activeConversationRef,
 			activeTabRef,
+			clearPhase,
 			finalizeAskThreads,
 			finalizeVisualTraces,
 			isChatOwnedSession,
 			t,
 			thinkParsersRef,
-			updateSessionLines,
+			updateSessionLinesOrdered,
 			setSessionHistory,
 		],
 	);
@@ -521,14 +592,17 @@ export function useAgentSessionRuntime({
 	const failSession = useCallback(
 		(sessionId: string, error: string) => {
 			if (!isChatOwnedSession(sessionId)) return;
+			playCue("error");
+			clearPhase(sessionId);
 			const failedLine: ChatLine = errorChatLine(error);
-			updateSessionLines(sessionId, (prev) => {
+			updateSessionLinesOrdered(sessionId, (prev) => {
 				const next = [...prev];
 				const last = next[next.length - 1];
 				if (last?.kind === "agent" && last.streaming) {
 					if (agentHasContent(last.parts)) {
 						next[next.length - 1] = {
 							...last,
+							parts: failIncompleteTools(last.parts),
 							streaming: false,
 						};
 					} else {
@@ -552,10 +626,11 @@ export function useAgentSessionRuntime({
 			});
 		},
 		[
+			clearPhase,
 			finalizeAskThreads,
 			finalizeVisualTraces,
 			isChatOwnedSession,
-			updateSessionLines,
+			updateSessionLinesOrdered,
 			setSessionHistory,
 		],
 	);
@@ -621,14 +696,20 @@ export function useAgentSessionRuntime({
 				const title = ev.title ? displayHistoryTitle(ev.title) : "";
 				if (!title) return;
 				const providerId = ev.providerSessionId?.trim() ?? "";
-				agentSessionStore.getState().setSessions((prev) => {
+				sessionStore.getState().setSessions((prev) => {
 					let changed = false;
 					const next = prev.map((s) => {
 						const matches =
 							s.id === ev.sessionId ||
 							(providerId !== "" && s.providerSessionId === providerId);
-						// Visual-trace titles are user-meaningful; never override them.
-						if (!matches || s.visualTraceId || s.title === title) return s;
+						// Visual-trace and user-renamed titles are meaningful; never override.
+						if (
+							!matches ||
+							s.visualTraceId ||
+							s.titleLocked ||
+							s.title === title
+						)
+							return s;
 						changed = true;
 						return { ...s, title };
 					});
@@ -667,6 +748,34 @@ export function useAgentSessionRuntime({
 				}
 				failSession(ev.sessionId, ev.error);
 			});
+			const uStatus = await listenAgentStatus((ev) => {
+				if (!isChatOwnedSession(ev.sessionId)) return;
+				const phase = ev.phase as AgentTurnPhase;
+				if (
+					phase !== "starting" &&
+					phase !== "waiting-model" &&
+					phase !== "reconnecting"
+				) {
+					return;
+				}
+				const detail = ev.detail?.trim();
+				setPhaseBySession((prev) => {
+					const current = prev[ev.sessionId];
+					if (
+						current?.phase === phase &&
+						current.detail === (detail || undefined)
+					) {
+						return prev;
+					}
+					return {
+						...prev,
+						[ev.sessionId]: {
+							phase,
+							detail: detail || undefined,
+						},
+					};
+				});
+			});
 
 			if (cancelled) {
 				u1();
@@ -681,6 +790,7 @@ export function useAgentSessionRuntime({
 				uFast();
 				u2();
 				u3();
+				uStatus();
 				return;
 			}
 			unsubs.push(
@@ -696,6 +806,7 @@ export function useAgentSessionRuntime({
 				uFast,
 				u2,
 				u3,
+				uStatus,
 			);
 			setAgentListenersReady(true);
 		})();
@@ -703,6 +814,11 @@ export function useAgentSessionRuntime({
 		return () => {
 			cancelled = true;
 			for (const u of unsubs) u();
+			if (streamFlushFrameRef.current) {
+				cancelAnimationFrame(streamFlushFrameRef.current);
+				streamFlushFrameRef.current = 0;
+			}
+			flushAllStreamBuffers();
 		};
 	}, [
 		applyCollaborationEvent,
@@ -715,11 +831,14 @@ export function useAgentSessionRuntime({
 		completeSession,
 		deferSessionEvent,
 		failSession,
+		flushAllStreamBuffers,
+		isChatOwnedSession,
 		pendingTerminalEventsRef,
 		setAcpCommandsByAgent,
 		setAgentListenersReady,
 		setUsage,
 		setUsageBySession,
+		sessionStore,
 		shouldDeferTerminalEvent,
 	]);
 
@@ -731,5 +850,7 @@ export function useAgentSessionRuntime({
 		applyPlanEvent,
 		completeSession,
 		failSession,
+		isChatOwnedSession,
+		phaseBySession,
 	};
 }

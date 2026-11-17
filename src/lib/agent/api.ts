@@ -1,10 +1,17 @@
 import type { UnlistenFn } from "@tauri-apps/api/event";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import i18n from "@/i18n";
-import { invokeApi } from "@/lib/core/ipc";
+import {
+	commands,
+	events,
+	type PiProjectTrustStatus,
+	type UpsertAgentRequest_Deserialize,
+} from "@/lib/core/bindings";
+import { callApi, callApiResult } from "@/lib/core/ipc";
 import { readJsonStorage, writeJsonStorage } from "@/lib/core/storage";
 import { loadSettings } from "@/lib/settings";
 import type { CatalogAcpStatus, CatalogEntry, ProbeResult } from "./api-types";
+import type { ContextRequest } from "./context-request";
 
 export type {
 	AcpSessionCapabilities,
@@ -15,17 +22,45 @@ export type {
 
 export type AgentTemplate =
 	| "opencode"
-	| "openclaw"
-	| "gemini"
 	| "hermes"
 	| "claude-acp"
 	| "codex-acp"
+	| "cursor-agent"
+	| "antigravity-acp"
 	| "qodercli"
 	| "grok-build"
 	| "pi"
 	| "dsh"
 	| "kimi-code"
+	| "zcode"
+	| "minimax-code"
+	| "mimo-code"
+	| "codebuddy"
+	| "qoder-cn"
+	| "zhihu"
 	| "custom";
+
+/**
+ * Built-in agents that are chat-only: no Vault access, no ACP process. The
+ * composer must not inject Vault read-instructions for them (the prompt would
+ * otherwise leak local paths to a third-party service).
+ */
+const CHAT_ONLY_TEMPLATES = new Set<AgentTemplate>(["zhihu"]);
+
+export function isChatOnlyAgentTemplate(
+	template: AgentTemplate | string | null | undefined,
+): boolean {
+	return !!template && CHAT_ONLY_TEMPLATES.has(template as AgentTemplate);
+}
+
+/** Template for a registry agent id, for availability / chat-only checks. */
+export function agentTemplateById(
+	registry: { agents: AgentDescriptor[] } | null | undefined,
+	agentId: string | null | undefined,
+): AgentTemplate | undefined {
+	if (!registry || !agentId) return undefined;
+	return registry.agents.find((a) => a.id === agentId)?.template;
+}
 
 export type AgentDescriptor = {
 	id: string;
@@ -74,6 +109,18 @@ export type AcpListSessionsResult = {
 	supported: boolean;
 };
 
+export type AcpDeleteSessionResult = {
+	sessionId: string;
+	deletedOnAgent: boolean;
+	agentError?: string | null;
+};
+
+export type PromptImage = {
+	/** Raw base64 without data: prefix */
+	data: string;
+	mimeType: string;
+};
+
 export type AcpHistoryToolCall = {
 	id: string;
 	title: string;
@@ -97,6 +144,18 @@ export type AcpHistoryLine = {
 	/** Ordered parts for agent lines (reasoning/text/tool/plan). */
 	parts?: AcpHistoryPart[];
 	sources?: string[];
+	/** Visual PDF annotations attached to a user turn. */
+	visualAnnotations?: {
+		id: string;
+		/** 1-based PDF page number. */
+		page: number;
+		comment: string;
+		image: PromptImage;
+		/** Vault-relative paper path when known. */
+		paperPath?: string;
+	}[];
+	/** Multimodal images attached to a user turn. */
+	images?: PromptImage[];
 };
 
 export type AcpLoadSessionResult = {
@@ -127,6 +186,16 @@ export type AgentResultPayload = {
 	stopReason?: string | null;
 	/** Durable ACP provider session id for the next `session/resume`. */
 	providerSessionId?: string | null;
+};
+
+export type CitationTarget = {
+	paperPath: string;
+	path: string;
+	fragment: string;
+	pageIndex: number;
+	bbox: { x: number; y: number; w: number; h: number };
+	title?: string | null;
+	regionId: string;
 };
 
 export type AgentStreamKind = "message" | "thought";
@@ -242,6 +311,22 @@ export type AgentFailedEvent = {
 	error: string;
 };
 
+/** Loading phase of a turn: before spawn, waiting for first model output, or upstream reconnect. */
+export type AgentTurnPhase = "starting" | "waiting-model" | "reconnecting";
+
+export type AgentStatusEvent = {
+	sessionId: string;
+	phase: AgentTurnPhase;
+	/** e.g. "2/5" attempt counter for reconnecting. */
+	detail?: string | null;
+};
+
+/** Runtime-tracked phase state for a session's current turn. */
+export type AgentPhaseState = {
+	phase: AgentTurnPhase;
+	detail?: string;
+};
+
 export type PermissionOption = {
 	optionId: string;
 	name: string;
@@ -262,7 +347,7 @@ export type ElicitationField = {
 	title: string;
 	description?: string | null;
 	required: boolean;
-	/** select | text | boolean | number | other */
+	/** select | multiselect | text | boolean | number | other */
 	kind: string;
 	options: ElicitationOption[];
 	/** Codex free-text companion for the same logical question ("Other"). */
@@ -315,29 +400,46 @@ export type PermissionRequest = {
 	kind?: string | null;
 	paths: string[];
 	options: PermissionOption[];
+	/** Remote host when the request came from a delegated run. */
+	host?: string | null;
 };
 
-async function invokeAgentApi<T>(
-	cmd: string,
-	args?: Record<string, unknown>,
-): Promise<T> {
-	return invokeApi<T>(cmd, args, {
-		desktopOnly: "Agent features require the Tauri desktop app.",
-	});
-}
+/** Shared non-Tauri guard message for every agent Host call. */
+const AGENT_CALL_OPTS = {
+	desktopOnly: "Agent features require the Tauri desktop app.",
+};
 
 export async function listAgents(): Promise<AgentListResponse> {
-	return invokeAgentApi("agent_list_agents");
+	// Wire descriptors keep serde defaults optional; the Host always fills
+	// args/env/available, so fold once at the boundary.
+	return (await callApi(
+		() => commands.agentListAgents(),
+		AGENT_CALL_OPTS,
+	)) as AgentListResponse;
 }
 
 export async function listAgentSkills(
 	vaultPath?: string,
 ): Promise<AgentSkill[]> {
-	return invokeAgentApi("agent_list_skills", { vaultPath: vaultPath ?? null });
+	return (await callApiResult(
+		() => commands.agentListSkills(vaultPath ?? null),
+		AGENT_CALL_OPTS,
+	)) as AgentSkill[];
 }
 
 export async function scanCatalog(): Promise<CatalogScanResponse> {
-	return invokeAgentApi("agent_scan_catalog");
+	return (await callApi(
+		() => commands.agentScanCatalog(),
+		AGENT_CALL_OPTS,
+	)) as CatalogScanResponse;
+}
+
+/** PATH scan + version compare for Settings Upgrade visibility. */
+export async function checkCatalogUpdates(): Promise<CatalogScanResponse> {
+	return (await callApiResult(
+		() => commands.agentCheckCatalogUpdates(),
+		AGENT_CALL_OPTS,
+	)) as CatalogScanResponse;
 }
 
 export async function upsertAgent(request: {
@@ -349,32 +451,35 @@ export async function upsertAgent(request: {
 	env?: Record<string, string>;
 	setDefault?: boolean;
 }): Promise<AgentDescriptor> {
-	const res = await invokeAgentApi<{ agent: AgentDescriptor }>(
-		"agent_upsert_agent",
-		{ request },
+	const res = await callApi(
+		() => commands.agentUpsertAgent(request as UpsertAgentRequest_Deserialize),
+		AGENT_CALL_OPTS,
 	);
-	return res.agent;
+	return res.agent as AgentDescriptor;
 }
 
 export async function ensureCatalogAgent(
 	templateId: string,
 	setDefault = false,
 ): Promise<AgentDescriptor> {
-	const res = await invokeAgentApi<{ agent: AgentDescriptor }>(
-		"agent_ensure_catalog",
-		{ templateId, setDefault },
+	const res = await callApi(
+		() => commands.agentEnsureCatalog(templateId, setDefault),
+		AGENT_CALL_OPTS,
 	);
-	return res.agent;
+	return res.agent as AgentDescriptor;
 }
 
 export async function removeAgent(id: string): Promise<void> {
-	await invokeAgentApi("agent_remove_agent", { id });
+	await callApi(() => commands.agentRemoveAgent(id), AGENT_CALL_OPTS);
 }
 
 export async function setDefaultAgent(
 	id: string | null,
 ): Promise<AgentListResponse> {
-	return invokeAgentApi("agent_set_default", { id });
+	return (await callApi(
+		() => commands.agentSetDefault(id),
+		AGENT_CALL_OPTS,
+	)) as AgentListResponse;
 }
 
 /** Persist optional ACP User-Agent override for Codex / mid-station affinity. */
@@ -382,20 +487,44 @@ export async function setAgentUserAgent(
 	userAgent: string,
 	userAgentProviderIds = "",
 ): Promise<{ userAgent: string; userAgentProviderIds: string }> {
-	return invokeAgentApi("agent_set_user_agent", {
-		userAgent,
-		userAgentProviderIds,
-	});
+	return callApi(
+		() => commands.agentSetUserAgent(userAgent, userAgentProviderIds),
+		AGENT_CALL_OPTS,
+	);
 }
 
 export async function probeAgent(id: string): Promise<ProbeResult> {
-	return invokeAgentApi("agent_probe", { id });
+	return (await callApiResult(
+		() => commands.agentProbe(id),
+		AGENT_CALL_OPTS,
+	)) as ProbeResult;
 }
 
 export async function probeCatalogAgent(
 	templateId: string,
 ): Promise<ProbeResult> {
-	return invokeAgentApi("agent_probe_catalog", { templateId });
+	return (await callApiResult(
+		() => commands.agentProbeCatalog(templateId),
+		AGENT_CALL_OPTS,
+	)) as ProbeResult;
+}
+
+/** Open a trusted template-owned CLI login command in a confirm-to-run terminal. */
+export async function openAgentLoginTerminal(
+	templateId: string,
+): Promise<void> {
+	await callApi(
+		() => commands.doctorOpenAgentLoginTerminal(templateId),
+		AGENT_CALL_OPTS,
+	);
+}
+
+/** Open the installed Agent's interactive host CLI in a confirm-to-run terminal. */
+export async function openAgentCliTerminal(templateId: string): Promise<void> {
+	await callApi(
+		() => commands.doctorOpenAgentCliTerminal(templateId),
+		AGENT_CALL_OPTS,
+	);
 }
 
 export type ToolLifecycleAction = "install" | "update" | "uninstall";
@@ -410,32 +539,52 @@ export async function runToolLifecycle(
 	action: ToolLifecycleAction,
 	taskId?: string,
 ): Promise<void> {
-	await invokeAgentApi("agent_run_tool_lifecycle", {
-		templateId,
-		action,
-		taskId,
-	});
+	await callApiResult(
+		() => commands.agentRunToolLifecycle(templateId, action, taskId ?? null),
+		AGENT_CALL_OPTS,
+	);
 }
 
-export type UninstallInfo = {
+export type UninstallScope = "agent" | "acp" | "all";
+
+export type UninstallScopeInfo = {
 	/** Complete `npm uninstall` commands (best-effort), mirroring install. */
 	npmCommands: string[];
 	/** Agentero-managed directories to delete (e.g. dsh launcher, kimi code). */
 	dirs: string[];
 };
 
+export type UninstallInfo = {
+	/** Host CLI / main binary uninstall payload. */
+	agent: UninstallScopeInfo;
+	/** ACP adapter uninstall payload. */
+	acp: UninstallScopeInfo;
+};
+
 /** What a silent uninstall of this template would remove; null if unsupported. */
 export async function toolUninstallInfo(
 	templateId: string,
 ): Promise<UninstallInfo | null> {
-	return invokeAgentApi("agent_tool_uninstall_info", { templateId });
+	return callApi(
+		() => commands.agentToolUninstallInfo(templateId),
+		AGENT_CALL_OPTS,
+	);
 }
 
-export type PromptImage = {
-	/** Raw base64 without data: prefix */
-	data: string;
-	mimeType: string;
-};
+/**
+ * Silently uninstall a catalog Agent CLI, its ACP adapter, or both. Host only
+ * allows known templates — no free-form shell from the UI.
+ */
+export async function runPartialUninstall(
+	templateId: string,
+	scope: UninstallScope,
+	taskId?: string,
+): Promise<void> {
+	await callApiResult(
+		() => commands.agentRunPartialUninstall(templateId, scope, taskId ?? null),
+		AGENT_CALL_OPTS,
+	);
+}
 
 export async function runOnce(request: {
 	agentId?: string;
@@ -454,12 +603,12 @@ export async function runOnce(request: {
 	collaborationModeId?: string;
 	/** ACP reasoning-effort value id (from agent:effort). */
 	reasoningEffort?: string;
+	/** Resolve the highest supported effort after session setup, unless explicitly chosen. */
+	preferHighestReasoningEffort?: boolean;
 	/** ACP fast-mode preference (from agent:fast-mode). */
 	fastMode?: boolean;
 	/** Local SKILL.md identifiers selected through the composer. */
 	skillIds?: string[];
-	/** Select the agent's first ACP permission option for this run. */
-	autoApprove?: boolean;
 	/** ACP permission handling: "restricted" | "ask" | "auto" (from settings). */
 	permissionMode?: string;
 	/**
@@ -479,6 +628,16 @@ export async function runOnce(request: {
 	 * (paper-reader and other non-composer workflows).
 	 */
 	hideFromChatHistory?: boolean;
+	/**
+	 * Vault anchors for this turn. The host resolver adds the minimum evidence
+	 * and, on a local session, the session-scoped context tools.
+	 */
+	context?: ContextRequest;
+	/**
+	 * Earlier turns to insert only if the host refuses to resume the session.
+	 * Omit when `prompt` already starts with that transcript.
+	 */
+	resumeTranscript?: string;
 }): Promise<RunOnceAccepted> {
 	const settings = loadSettings();
 	const language = request.responseLanguage ?? settings.aiResponseLanguage;
@@ -495,28 +654,33 @@ export async function runOnce(request: {
 			},
 		});
 	});
-	return invokeAgentApi("agent_run_once", {
-		request: {
-			agentId: request.agentId,
-			sessionId: request.sessionId,
-			prompt: request.prompt,
-			isAcpCommand: request.isAcpCommand ?? false,
-			images: request.images ?? [],
-			vaultPath: request.vaultPath,
-			workflow: request.workflow,
-			target: request.target,
-			modelId: request.modelId,
-			collaborationModeId: request.collaborationModeId,
-			reasoningEffort: request.reasoningEffort,
-			fastMode: request.fastMode,
-			skillIds: request.skillIds ?? [],
-			autoApprove: request.autoApprove ?? false,
-			permissionMode: request.permissionMode,
-			responseLanguage,
-			personalPrompt,
-			hideFromChatHistory: request.hideFromChatHistory ?? false,
-		},
-	});
+	return callApiResult(
+		() =>
+			commands.agentRunOnce({
+				agentId: request.agentId,
+				sessionId: request.sessionId,
+				prompt: request.prompt,
+				isAcpCommand: request.isAcpCommand ?? false,
+				images: request.images ?? [],
+				vaultPath: request.vaultPath,
+				workflow: request.workflow,
+				target: request.target,
+				modelId: request.modelId,
+				collaborationModeId: request.collaborationModeId,
+				reasoningEffort: request.reasoningEffort,
+				preferHighestReasoningEffort:
+					request.preferHighestReasoningEffort ?? false,
+				fastMode: request.fastMode,
+				skillIds: request.skillIds ?? [],
+				permissionMode: request.permissionMode,
+				responseLanguage,
+				personalPrompt,
+				hideFromChatHistory: request.hideFromChatHistory ?? false,
+				context: request.context,
+				resumeTranscript: request.resumeTranscript,
+			}),
+		AGENT_CALL_OPTS,
+	);
 }
 
 /** List ACP sessions for an agent via `session/list`. */
@@ -525,11 +689,38 @@ export async function listSessions(request: {
 	vaultPath?: string;
 	cursor?: string;
 }): Promise<AcpListSessionsResult> {
-	return invokeAgentApi("agent_list_sessions", {
-		agentId: request.agentId ?? null,
-		vaultPath: request.vaultPath ?? null,
-		cursor: request.cursor ?? null,
-	});
+	return (await callApiResult(
+		() =>
+			commands.agentListSessions(
+				request.agentId ?? null,
+				request.vaultPath ?? null,
+				request.cursor ?? null,
+			),
+		AGENT_CALL_OPTS,
+	)) as AcpListSessionsResult;
+}
+
+/**
+ * Remove one session from history.
+ *
+ * The host always hides the id from later lists. `deletedOnAgent` is true
+ * only when the agent accepted `session/delete`. `agentError` means that
+ * call failed and the agent's own copy may remain.
+ */
+export async function deleteSession(request: {
+	agentId?: string;
+	sessionId: string;
+	vaultPath?: string;
+}): Promise<AcpDeleteSessionResult> {
+	return (await callApiResult(
+		() =>
+			commands.agentDeleteSession(
+				request.agentId ?? null,
+				request.sessionId,
+				request.vaultPath ?? null,
+			),
+		AGENT_CALL_OPTS,
+	)) as AcpDeleteSessionResult;
 }
 
 /** Load an ACP session's history via `session/load`. */
@@ -538,16 +729,20 @@ export async function loadSession(request: {
 	sessionId: string;
 	vaultPath?: string;
 }): Promise<AcpLoadSessionResult> {
-	return invokeAgentApi("agent_load_session", {
-		agentId: request.agentId ?? null,
-		sessionId: request.sessionId,
-		vaultPath: request.vaultPath ?? null,
-	});
+	return (await callApiResult(
+		() =>
+			commands.agentLoadSession(
+				request.agentId ?? null,
+				request.sessionId,
+				request.vaultPath ?? null,
+			),
+		AGENT_CALL_OPTS,
+	)) as AcpLoadSessionResult;
 }
 
 /** Request cooperative cancellation of the active ACP session. */
 export async function cancelAgentRun(sessionId: string): Promise<void> {
-	await invokeAgentApi<boolean>("agent_cancel_run", { sessionId });
+	await callApi(() => commands.agentCancelRun(sessionId), AGENT_CALL_OPTS);
 }
 
 /** Answer a pending ACP permission request (ask mode). `optionId = null` cancels. */
@@ -555,24 +750,27 @@ export async function respondPermission(
 	requestId: string,
 	optionId: string | null,
 ): Promise<void> {
-	await invokeAgentApi<{ resolved: boolean }>("agent_respond_permission", {
-		request: { requestId, optionId },
-	});
+	await callApi(
+		() => commands.agentRespondPermission({ requestId, optionId }),
+		AGENT_CALL_OPTS,
+	);
 }
 
 /** Answer a pending ACP form elicitation. */
 export async function respondElicitation(request: {
 	requestId: string;
 	action: "accept" | "decline" | "cancel";
-	content?: Record<string, string>;
+	content?: Record<string, string | string[]>;
 }): Promise<void> {
-	await invokeAgentApi<{ resolved: boolean }>("agent_respond_elicitation", {
-		request: {
-			requestId: request.requestId,
-			action: request.action,
-			content: request.content ?? null,
-		},
-	});
+	await callApi(
+		() =>
+			commands.agentRespondElicitation({
+				requestId: request.requestId,
+				action: request.action,
+				content: request.content ?? null,
+			}),
+		AGENT_CALL_OPTS,
+	);
 }
 
 /** Answer a pending Grok `_x.ai/ask_user_question` extension request. */
@@ -581,13 +779,15 @@ export async function respondAskUser(request: {
 	action: "accept" | "cancel";
 	answers?: string[];
 }): Promise<void> {
-	await invokeAgentApi<{ resolved: boolean }>("agent_respond_ask_user", {
-		request: {
-			requestId: request.requestId,
-			action: request.action,
-			answers: request.answers ?? null,
-		},
-	});
+	await callApi(
+		() =>
+			commands.agentRespondAskUser({
+				requestId: request.requestId,
+				action: request.action,
+				answers: request.answers ?? null,
+			}),
+		AGENT_CALL_OPTS,
+	);
 }
 
 export type WarmResult = {
@@ -599,6 +799,38 @@ export type WarmResult = {
 	error?: string | null;
 };
 
+/**
+ * Pi's effective project-trust state for a local Vault.
+ *
+ * Pi runs headless under `pi-acp`, so `defaultProjectTrust: "ask"` resolves to
+ * untrusted and project skills are skipped. The Host mirrors Pi's lookup order
+ * instead of guessing.
+ */
+export async function piProjectTrustStatus(
+	agentId: string,
+	vaultPath: string,
+): Promise<PiProjectTrustStatus> {
+	return callApi(
+		() => commands.agentPiProjectTrustStatus(agentId, vaultPath),
+		AGENT_CALL_OPTS,
+	);
+}
+
+/**
+ * Explicitly trust this Vault for Pi. The Host merges the Vault entry into
+ * `~/.pi/agent/trust.json` and discards the agent's warm connection so the next
+ * session loads project resources.
+ */
+export async function grantPiProjectTrust(
+	agentId: string,
+	vaultPath: string,
+): Promise<PiProjectTrustStatus> {
+	return callApi(
+		() => commands.agentPiProjectTrustGrant(agentId, vaultPath),
+		AGENT_CALL_OPTS,
+	);
+}
+
 /** Start ACP in the background (no prompt) to prefetch models / usage for Chat UI. */
 export async function warmAgent(request: {
 	agentId?: string;
@@ -606,95 +838,131 @@ export async function warmAgent(request: {
 	modelId?: string;
 	collaborationModeId?: string;
 }): Promise<WarmResult> {
-	return invokeAgentApi("agent_warm", {
-		request: {
-			agentId: request.agentId,
-			vaultPath: request.vaultPath,
-			modelId: request.modelId,
-			collaborationModeId: request.collaborationModeId,
-		},
-	});
-}
-
-function listenAgentEvent<T>(
-	event: string,
-	handler: (payload: T) => void,
-): Promise<UnlistenFn> {
-	return getCurrentWebviewWindow().listen<T>(event, (message) =>
-		handler(message.payload),
+	return callApiResult(
+		() =>
+			commands.agentWarm({
+				agentId: request.agentId,
+				vaultPath: request.vaultPath,
+				modelId: request.modelId,
+				collaborationModeId: request.collaborationModeId,
+			}),
+		AGENT_CALL_OPTS,
 	);
 }
 
-export async function listenAgentStream(
+/** Resolve an inline citation link to PDF page/bbox coordinates. */
+export async function resolvePdfCitation(
+	vaultPath: string,
+	source: string,
+): Promise<CitationTarget> {
+	return (await callApiResult(
+		() => commands.agentResolveCitation(vaultPath, source),
+		AGENT_CALL_OPTS,
+	)) as CitationTarget;
+}
+
+export function listenAgentStream(
 	handler: (e: AgentStreamEvent) => void,
 ): Promise<UnlistenFn> {
-	return listenAgentEvent("agent:stream", handler);
+	return events
+		.agentStream(getCurrentWebviewWindow())
+		.listen((message) => handler(message.payload));
 }
 
-export async function listenAgentCompleted(
+export function listenAgentCompleted(
 	handler: (e: AgentResultPayload) => void,
 ): Promise<UnlistenFn> {
-	return listenAgentEvent("agent:completed", handler);
+	return events
+		.agentCompleted(getCurrentWebviewWindow())
+		.listen((message) => handler(message.payload));
 }
 
-export async function listenAgentFailed(
+export function listenAgentFailed(
 	handler: (e: AgentFailedEvent) => void,
 ): Promise<UnlistenFn> {
-	return listenAgentEvent("agent:failed", handler);
+	return events
+		.agentFailed(getCurrentWebviewWindow())
+		.listen((message) => handler(message.payload));
 }
 
-export async function listenAgentTool(
+export function listenAgentStatus(
+	handler: (e: AgentStatusEvent) => void,
+): Promise<UnlistenFn> {
+	return events
+		.agentStatus(getCurrentWebviewWindow())
+		.listen((message) => handler(message.payload as AgentStatusEvent));
+}
+
+export function listenAgentTool(
 	handler: (e: AgentToolEvent) => void,
 ): Promise<UnlistenFn> {
-	return listenAgentEvent("agent:tool", handler);
+	return events
+		.agentTool(getCurrentWebviewWindow())
+		.listen((message) => handler(message.payload));
 }
 
-export async function listenAgentPlan(
+export function listenAgentPlan(
 	handler: (e: AgentPlanEvent) => void,
 ): Promise<UnlistenFn> {
-	return listenAgentEvent("agent:plan", handler);
+	return events
+		.agentPlan(getCurrentWebviewWindow())
+		.listen((message) => handler(message.payload));
 }
 
-export async function listenAgentUsage(
+export function listenAgentUsage(
 	handler: (e: AgentUsageEvent) => void,
 ): Promise<UnlistenFn> {
-	return listenAgentEvent("agent:usage", handler);
+	return events
+		.agentUsage(getCurrentWebviewWindow())
+		.listen((message) => handler(message.payload));
 }
 
-export async function listenAgentSessionInfo(
+export function listenAgentSessionInfo(
 	handler: (e: AgentSessionInfoEvent) => void,
 ): Promise<UnlistenFn> {
-	return listenAgentEvent("agent:session-info", handler);
+	return events
+		.agentSessionInfo(getCurrentWebviewWindow())
+		.listen((message) => handler(message.payload));
 }
 
-export async function listenAgentCommands(
+export function listenAgentCommands(
 	handler: (e: AgentCommandsEvent) => void,
 ): Promise<UnlistenFn> {
-	return listenAgentEvent("agent:commands", handler);
+	return events
+		.agentCommands(getCurrentWebviewWindow())
+		.listen((message) => handler(message.payload));
 }
 
-export async function listenAgentModels(
+export function listenAgentModels(
 	handler: (e: AgentModelsEvent) => void,
 ): Promise<UnlistenFn> {
-	return listenAgentEvent("agent:models", handler);
+	return events
+		.agentModels(getCurrentWebviewWindow())
+		.listen((message) => handler(message.payload));
 }
 
-export async function listenAgentEffort(
+export function listenAgentEffort(
 	handler: (e: AgentEffortEvent) => void,
 ): Promise<UnlistenFn> {
-	return listenAgentEvent("agent:effort", handler);
+	return events
+		.agentEffort(getCurrentWebviewWindow())
+		.listen((message) => handler(message.payload));
 }
 
-export async function listenAgentFastMode(
+export function listenAgentFastMode(
 	handler: (e: AgentFastModeEvent) => void,
 ): Promise<UnlistenFn> {
-	return listenAgentEvent("agent:fast-mode", handler);
+	return events
+		.agentFastMode(getCurrentWebviewWindow())
+		.listen((message) => handler(message.payload));
 }
 
-export async function listenAgentCollaboration(
+export function listenAgentCollaboration(
 	handler: (e: AgentCollaborationEvent) => void,
 ): Promise<UnlistenFn> {
-	return listenAgentEvent("agent:collaboration", handler);
+	return events
+		.agentCollaboration(getCurrentWebviewWindow())
+		.listen((message) => handler(message.payload));
 }
 
 const MODEL_PREF_KEY = "agentero-agent-model-pref";

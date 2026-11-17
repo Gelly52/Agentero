@@ -2,16 +2,17 @@
 
 use crate::error::CliError;
 use crate::output::to_value;
-use crate::resolve::{paper_dir, resolve_paper, resolve_vault, GlobalOpts};
+use crate::resolve::{looks_like_vault, paper_dir, resolve_paper, resolve_vault, GlobalOpts};
 use crate::style::{format_table, truncate_chars};
-use agentero_lib::features::catalog;
-use agentero_lib::features::catalog::papers::{self, PaperRecord, PaperTag};
-use agentero_lib::features::import::pdf_parse::{self, PaperParseBodyArgs};
-use agentero_lib::features::import::{self, PaperDownloadAssetsArgs};
+use agentero_core::features::catalog;
+use agentero_core::features::catalog::papers::{self, PaperRecord, PaperTag};
+use agentero_core::features::import::pdf_parse::{self, PaperParseBodyArgs};
+use agentero_core::features::import::{self, skipped_preparation_line, PaperDownloadAssetsArgs};
+use agentero_core::features::paper::discovery::coolpapers::{self, FetchNotesRequest};
 use clap::{Subcommand, ValueHint};
 use serde::Serialize;
 use serde_json::{json, Value};
-use std::fs;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Subcommand)]
 pub enum PaperCmd {
@@ -78,6 +79,31 @@ pub enum PaperCmd {
         #[arg(long = "false")]
         set_false: bool,
     },
+    /// Update catalog metadata fields (e.g. publication/venue, title, date, doi, arxiv_id, authors).
+    #[command(alias = "update")]
+    SetMeta {
+        /// Vault-relative path or paper id.
+        #[arg(value_hint = ValueHint::DirPath)]
+        r#ref: String,
+        /// Set publication / venue name.
+        #[arg(long = "publication", value_name = "VENUE")]
+        publication: Option<String>,
+        /// Set paper title.
+        #[arg(long = "title", value_name = "TITLE")]
+        title: Option<String>,
+        /// Set publication date (YYYY, YYYY-MM, or YYYY-MM-DD).
+        #[arg(long = "date", value_name = "DATE")]
+        date: Option<String>,
+        /// Set DOI.
+        #[arg(long = "doi", value_name = "DOI")]
+        doi: Option<String>,
+        /// Set arXiv ID.
+        #[arg(long = "arxiv-id", value_name = "ARXIV_ID")]
+        arxiv_id: Option<String>,
+        /// Set authors (comma-separated or repeatable).
+        #[arg(long = "authors", value_name = "AUTHORS", value_delimiter = ',')]
+        authors: Option<Vec<String>>,
+    },
     /// Download PDF / arXiv TeX for an existing paper.
     Download {
         #[arg(value_hint = ValueHint::DirPath)]
@@ -90,14 +116,57 @@ pub enum PaperCmd {
         #[arg(long = "force")]
         force: bool,
     },
-    /// Move a paper or papers organization directory under another papers/ directory.
-    Move {
-        /// Vault-relative source path under papers/.
+    /// Add a paper to another folder or vault.
+    ///
+    /// Same vault: directory link (Windows falls back to a junction), catalog
+    /// stays one row. Another vault: copy the files and insert a catalog row.
+    /// Paths follow `paper move`: `papers/...` uses the current vault, and a
+    /// path under a vault root selects that vault.
+    Add {
+        /// Source path: vault-relative or vault-prefixed.
         #[arg(value_hint = ValueHint::DirPath)]
         from: String,
-        /// Vault-relative destination parent under papers/.
+        /// Destination parent: vault-relative or vault-prefixed.
         #[arg(value_hint = ValueHint::DirPath)]
         dest_parent: String,
+    },
+    /// Move a paper or papers organization directory under another papers/ directory.
+    ///
+    /// Paths are normally vault-relative (e.g. `papers/topic/foo`). If a path
+    /// starts with or resolves to a Vault root, that Vault is used explicitly,
+    /// enabling cross-vault migration (e.g.
+    /// `/path/to/src-vault/papers/topic/foo /path/to/dst-vault/papers/`).
+    Move {
+        /// Source path: vault-relative or vault-prefixed.
+        #[arg(value_hint = ValueHint::DirPath)]
+        from: String,
+        /// Destination parent: vault-relative or vault-prefixed.
+        #[arg(value_hint = ValueHint::DirPath)]
+        dest_parent: String,
+    },
+    /// Open a paper in the running desktop App.
+    ///
+    /// Resolves the vault-relative paper folder, then wakes the App via a
+    /// request file + `agentero://paper` deep link (spawning it when needed).
+    Open {
+        /// Vault-relative path or paper id.
+        #[arg(value_hint = ValueHint::DirPath)]
+        r#ref: String,
+    },
+    /// NOTES.md operations.
+    Notes {
+        #[command(subcommand)]
+        cmd: NotesCmd,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum NotesCmd {
+    /// Fetch the Cool Papers (papers.cool) Kimi analysis and append it to NOTES.md.
+    Fetch {
+        /// Vault-relative path or paper id.
+        #[arg(value_hint = ValueHint::DirPath)]
+        r#ref: String,
     },
 }
 
@@ -194,10 +263,97 @@ pub async fn run(cmd: PaperCmd, globals: &GlobalOpts) -> Result<Value, CliError>
         PaperCmd::Paths { r#ref } => paths(globals, &r#ref),
         PaperCmd::Delete { path, files } => delete(globals, &path, files),
         PaperCmd::SetRead { r#ref, set_false } => set_read(globals, &r#ref, !set_false),
+        PaperCmd::SetMeta {
+            r#ref,
+            publication,
+            title,
+            date,
+            doi,
+            arxiv_id,
+            authors,
+        } => {
+            if publication.is_none()
+                && title.is_none()
+                && date.is_none()
+                && doi.is_none()
+                && arxiv_id.is_none()
+                && authors.is_none()
+            {
+                return Err(CliError::message(
+                    "at least one metadata field (--publication, --title, --date, --doi, --arxiv-id, --authors) must be specified",
+                ));
+            }
+            let patch = papers::PaperMetaPatch {
+                title,
+                authors,
+                date,
+                doi,
+                arxiv_id,
+                publication,
+                ..Default::default()
+            };
+            set_meta(globals, &r#ref, patch)
+        }
         PaperCmd::Download { r#ref } => download(globals, &r#ref).await,
         PaperCmd::Parse { r#ref, force } => parse(globals, &r#ref, force).await,
+        PaperCmd::Add { from, dest_parent } => add_paper(globals, &from, &dest_parent),
         PaperCmd::Move { from, dest_parent } => move_paper(globals, &from, &dest_parent),
+        PaperCmd::Open { r#ref } => open_in_app(globals, &r#ref),
+        PaperCmd::Notes { cmd } => run_notes(cmd, globals).await,
     }
+}
+
+async fn run_notes(cmd: NotesCmd, globals: &GlobalOpts) -> Result<Value, CliError> {
+    match cmd {
+        NotesCmd::Fetch { r#ref } => fetch_notes(globals, &r#ref).await,
+    }
+}
+
+async fn fetch_notes(globals: &GlobalOpts, ref_: &str) -> Result<Value, CliError> {
+    let vault = resolve_vault(globals)?;
+    let paper = resolve_paper(&vault, ref_, globals)?;
+    let result = coolpapers::fetch_notes(FetchNotesRequest {
+        vault: &vault,
+        paper_rel: &paper.path,
+        catalog_id: Some(paper.id.as_str()),
+        source_url: paper.source_url.as_deref(),
+        arxiv_id: paper.arxiv_id.as_deref(),
+        title: Some(paper.title.as_str()),
+    })
+    .await?;
+    let style = globals.style;
+    let line = if !result.found {
+        format!(
+            "{} {}  not found on papers.cool",
+            style.dim("notes"),
+            style.path(&paper.path)
+        )
+    } else if !result.appended {
+        format!(
+            "{} {}  already in NOTES.md",
+            style.ok("notes"),
+            style.path(&paper.path)
+        )
+    } else {
+        format!(
+            "{} {}  {}",
+            style.ok("notes"),
+            style.path(&paper.path),
+            style.dim(result.url.as_deref().unwrap_or(""))
+        )
+    };
+    let mut v = to_value(&result)?;
+    if let Some(obj) = v.as_object_mut() {
+        obj.insert("lines".into(), json!([line]));
+    }
+    Ok(v)
+}
+
+/// Resolve the paper folder, then hand off to the desktop open pipeline.
+fn open_in_app(globals: &GlobalOpts, ref_: &str) -> Result<Value, CliError> {
+    let vault = resolve_vault(globals)?;
+    let paper = resolve_paper(&vault, ref_, globals)?;
+    crate::commands::open::open_paper_in_app(&vault, &paper.path, globals)
 }
 
 fn run_tag(cmd: TagCmd, globals: &GlobalOpts) -> Result<Value, CliError> {
@@ -284,14 +440,18 @@ fn list(
     let table_rows: Vec<Vec<String>> = rows
         .iter()
         .map(|r| {
-            let year = r.year.map(|y| y.to_string()).unwrap_or_else(|| "-".into());
+            let date = r
+                .date
+                .clone()
+                .or_else(|| r.year.map(|y| y.to_string()))
+                .unwrap_or_else(|| "-".into());
             let tags =
                 style.tags_join(r.tags.iter().map(|t| (t.name.as_str(), t.color.as_deref())));
             vec![
                 style.path(&truncate_chars(&r.path, 40)),
                 style.id(&truncate_chars(&r.id, 16)),
                 style.title(&truncate_chars(&r.title, 48)),
-                style.dim(&year),
+                style.dim(&date),
                 tags,
                 style.read_status(r.is_read),
             ]
@@ -302,7 +462,7 @@ fn list(
     } else {
         format_table(
             style,
-            &["PATH", "ID", "TITLE", "YEAR", "TAGS", "STATUS"],
+            &["PATH", "ID", "TITLE", "DATE", "TAGS", "STATUS"],
             &table_rows,
         )
     };
@@ -317,7 +477,7 @@ fn list(
 }
 
 /// JSON field names of `PaperRecord` valid for `paper list --fields`.
-const PAPER_LIST_FIELDS: [&str; 40] = [
+const PAPER_LIST_FIELDS: [&str; 41] = [
     "path",
     "id",
     "type",
@@ -344,6 +504,7 @@ const PAPER_LIST_FIELDS: [&str; 40] = [
     "pdf_url",
     "html_url",
     "source_url",
+    "openreview_url",
     "body_source",
     "body_quality",
     "bibtex_key",
@@ -400,10 +561,7 @@ fn list_items(rows: &[PaperRecord], full: bool, fields: &[String]) -> Result<Vec
 
 fn list_tags(globals: &GlobalOpts, include_all: bool) -> Result<Value, CliError> {
     let vault = resolve_vault(globals)?;
-    let pairs = papers::list_all_tags(&vault)?
-        .into_iter()
-        .filter(|t| include_all || !papers::is_internal_tag_name(&t.name))
-        .collect::<Vec<_>>();
+    let pairs = papers::list_tags(&vault, include_all)?;
     let items: Vec<TagCountOut> = pairs
         .into_iter()
         .map(|t| TagCountOut {
@@ -458,9 +616,10 @@ fn get(globals: &GlobalOpts, ref_: &str, include_all: bool) -> Result<Value, Cli
             .iter()
             .map(|t| (t.name.as_str(), t.color.as_deref())),
     );
-    let year = paper
-        .year
-        .map(|y| y.to_string())
+    let date = paper
+        .date
+        .clone()
+        .or_else(|| paper.year.map(|y| y.to_string()))
         .unwrap_or_else(|| "-".into());
     let asset_bits = [
         ("pdf", data.assets.pdf),
@@ -486,8 +645,8 @@ fn get(globals: &GlobalOpts, ref_: &str, include_all: bool) -> Result<Value, Cli
             "{} {}  {} {}  {} {}  {} {}",
             style.key("id"),
             style.id(&paper.id),
-            style.key("year"),
-            style.dim(&year),
+            style.key("date"),
+            style.dim(&date),
             style.key("status"),
             style.read_status(paper.is_read),
             style.key("tags"),
@@ -519,31 +678,7 @@ fn get(globals: &GlobalOpts, ref_: &str, include_all: bool) -> Result<Value, Cli
 fn paths(globals: &GlobalOpts, ref_: &str) -> Result<Value, CliError> {
     let vault = resolve_vault(globals)?;
     let paper = resolve_paper(&vault, ref_, globals)?;
-    let dir = paper_dir(&vault, &paper.path);
-    let assets = probe_assets(&dir);
-
-    let mut paths = Vec::new();
-    paths.push(paper.path.clone());
-    for name in ["NOTES.md", "PAPER.md"] {
-        let rel = format!("{}/{}", paper.path, name);
-        if vault.join(&rel).is_file() {
-            paths.push(rel);
-        }
-    }
-    if assets.marks_dir {
-        paths.push(format!("{}/marks", paper.path));
-    }
-    if let Some(pdf) = catalog::find_local_pdf(&dir) {
-        if let Ok(rel) = pdf.strip_prefix(&vault) {
-            paths.push(rel.to_string_lossy().replace('\\', "/"));
-        }
-    }
-    if assets.tex {
-        let src = format!("{}/source", paper.path);
-        if vault.join(&src).is_dir() {
-            paths.push(src);
-        }
-    }
+    let paths = catalog::paper_related_paths(&vault, &paper.path)?;
 
     // Text mode: colorize paths when painting lines wrapper would be skipped for
     // pure string arrays — emit via lines when color is on so path tint applies.
@@ -569,27 +704,23 @@ fn delete(globals: &GlobalOpts, path: &str, files: bool) -> Result<Value, CliErr
         }
     }
 
+    let result =
+        agentero_core::features::trash::delete_paths(&vault, std::slice::from_ref(&path), files)?;
     if files {
-        let removed = papers::delete_under_path(&vault, &path)?;
-        let dir = paper_dir(&vault, &path);
-        if dir.is_dir() {
-            fs::remove_dir_all(&dir)?;
-        }
         let style = globals.style;
         return Ok(json!({
-            "removed": removed,
+            "removed": result.removed_rows,
             "path": path,
             "deletedFiles": true,
             "lines": [format!(
                 "{} removed {} catalog row(s) for {}",
                 style.ok("✓"),
-                removed,
+                result.removed_rows,
                 style.path(&path)
             )]
         }));
     }
 
-    let result = agentero_lib::features::trash::trash_paths(&vault, std::slice::from_ref(&path))?;
     Ok(json!({
         "batchId": result.batch_id,
         "count": result.count,
@@ -623,6 +754,27 @@ fn set_read(globals: &GlobalOpts, ref_: &str, is_read: bool) -> Result<Value, Cl
     Ok(v)
 }
 
+fn set_meta(
+    globals: &GlobalOpts,
+    ref_: &str,
+    patch: papers::PaperMetaPatch,
+) -> Result<Value, CliError> {
+    let vault = resolve_vault(globals)?;
+    let paper = resolve_paper(&vault, ref_, globals)?;
+    let row = papers::update_meta(&vault, &paper.path, &patch)?;
+    let style = globals.style;
+    let mut v = to_value(&row)?;
+    if let Some(obj) = v.as_object_mut() {
+        let mut lines = Vec::new();
+        if let Some(pub_str) = &row.publication {
+            lines.push(format!("{} {}", style.key("publication"), pub_str));
+        }
+        lines.push(format!("{} {}", style.key("path"), style.path(&row.path)));
+        obj.insert("lines".into(), json!(lines));
+    }
+    Ok(v)
+}
+
 fn set_tags(
     globals: &GlobalOpts,
     ref_: &str,
@@ -635,32 +787,24 @@ fn set_tags(
         .iter()
         .map(|tag| parse_tag_spec(tag))
         .collect::<Result<_, _>>()?;
-    let tag_objs = if matches!(mode, TagMode::Replace) {
-        paper
-            .tags
-            .iter()
-            .filter(|tag| papers::is_internal_tag_name(&tag.name))
-            .cloned()
-            .chain(parsed_tags)
-            .collect()
-    } else {
-        parsed_tags
-    };
     let row = match mode {
         TagMode::Add => {
             if tags.is_empty() {
                 return Err(CliError::usage("tag add requires at least one tag"));
             }
-            papers::add_tags(&vault, &paper.path, &tag_objs)?
+            papers::add_tags(&vault, &paper.path, &parsed_tags)?
         }
         TagMode::Remove => {
             if tags.is_empty() {
                 return Err(CliError::usage("tag rm requires at least one tag"));
             }
-            let names = tag_objs.iter().map(|t| t.name.clone()).collect::<Vec<_>>();
+            let names = parsed_tags
+                .iter()
+                .map(|t| t.name.clone())
+                .collect::<Vec<_>>();
             papers::remove_tags(&vault, &paper.path, &names)?
         }
-        TagMode::Replace => papers::set_tags(&vault, &paper.path, &tag_objs)?,
+        TagMode::Replace => papers::set_user_tags(&vault, &paper.path, &parsed_tags)?,
     };
     let style = globals.style;
     let tags_disp = style.tags_join(
@@ -684,41 +828,129 @@ fn set_tags(
     Ok(v)
 }
 
-fn move_paper(globals: &GlobalOpts, from: &str, dest_parent: &str) -> Result<Value, CliError> {
+#[derive(Debug)]
+struct MoveTarget {
+    vault: PathBuf,
+    rel: String,
+}
+
+fn resolve_move_target(arg: &str, globals: &GlobalOpts) -> Result<MoveTarget, CliError> {
+    let normalized = arg.replace('\\', "/");
+
+    // Vault-relative paper path: use current vault.
+    if normalized.starts_with("papers/") || normalized == "papers" {
+        let vault = resolve_vault(globals)?;
+        return Ok(MoveTarget {
+            vault,
+            rel: normalized,
+        });
+    }
+
+    // Otherwise try to find a Vault root in the path.
+    let path = Path::new(arg);
+    let abs = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    let abs = agentero_core::fs::canonicalize_best_effort(&abs);
+
+    let mut cur = abs.clone();
+    loop {
+        if looks_like_vault(&cur) {
+            let rel = abs
+                .strip_prefix(&cur)
+                .map_err(|_| CliError::message("path not under vault"))?
+                .to_string_lossy()
+                .to_string()
+                .replace('\\', "/")
+                .trim_start_matches('/')
+                .to_string();
+            if rel.is_empty() {
+                return Err(CliError::usage("cannot move vault root"));
+            }
+            return Ok(MoveTarget { vault: cur, rel });
+        }
+        if !cur.pop() {
+            break;
+        }
+    }
+
+    // Fallback: treat as relative to current vault.
     let vault = resolve_vault(globals)?;
-    let new_rel = catalog::move_paper_under(&vault, from, dest_parent)?;
+    Ok(MoveTarget {
+        vault,
+        rel: normalized,
+    })
+}
+
+fn add_paper(globals: &GlobalOpts, from: &str, dest_parent: &str) -> Result<Value, CliError> {
+    let from = resolve_move_target(from, globals)?;
+    let to = resolve_move_target(dest_parent, globals)?;
+    let added = catalog::add_paper::add_paper(&from.vault, &from.rel, &to.vault, &to.rel)?;
+    let style = globals.style;
+    let from_vault = from.vault.to_string_lossy().to_string();
+    let to_vault = to.vault.to_string_lossy().to_string();
+    let line = if added.mode == "link" {
+        format!(
+            "linked {} → {}",
+            style.path(&added.from),
+            style.path(&added.new_rel)
+        )
+    } else {
+        format!(
+            "copied {} → {} ({} → {})",
+            style.path(&added.from),
+            style.path(&added.new_rel),
+            style.path(&from_vault),
+            style.path(&to_vault)
+        )
+    };
     Ok(json!({
-        "from": from,
-        "newRel": new_rel,
-        "lines": [format!("moved {} → {}", globals.style.path(from), globals.style.path(&new_rel))],
+        "mode": added.mode,
+        "from": added.from,
+        "newRel": added.new_rel,
+        "fromVault": from_vault,
+        "toVault": to_vault,
+        "lines": [line],
     }))
 }
 
-const TAG_COLORS: &[&str] = &[
-    "red", "orange", "yellow", "green", "teal", "blue", "indigo", "purple",
-];
+fn move_paper(globals: &GlobalOpts, from: &str, dest_parent: &str) -> Result<Value, CliError> {
+    let from = resolve_move_target(from, globals)?;
+    let to = resolve_move_target(dest_parent, globals)?;
+
+    if from.vault == to.vault {
+        // The shared headless entry builds its Wiki snapshot; this process has
+        // no unsaved editors to protect. Cross-vault migration stays separate.
+        let new_rel = catalog::move_paper_under(&from.vault, &from.rel, &to.rel)?;
+        Ok(json!({
+            "from": from.rel,
+            "newRel": new_rel,
+            "vault": from.vault.to_string_lossy().to_string(),
+            "lines": [format!("moved {} → {}", globals.style.path(&from.rel), globals.style.path(&new_rel))],
+        }))
+    } else {
+        let new_rel =
+            catalog::migrate_paper_between_vaults(&from.vault, &from.rel, &to.vault, &to.rel)?;
+        Ok(json!({
+            "from": from.rel,
+            "fromVault": from.vault.to_string_lossy().to_string(),
+            "newRel": new_rel,
+            "toVault": to.vault.to_string_lossy().to_string(),
+            "lines": [format!(
+                "migrated {} → {} ({} → {})",
+                globals.style.path(&from.rel),
+                globals.style.path(&new_rel),
+                globals.style.path(&from.vault.to_string_lossy()),
+                globals.style.path(&to.vault.to_string_lossy())
+            )],
+        }))
+    }
+}
 
 fn parse_tag_spec(raw: &str) -> Result<PaperTag, CliError> {
-    let value = raw.trim();
-    if value.is_empty() {
-        return Err(CliError::usage("tag name must not be empty"));
-    }
-    let Some((name, color)) = value.rsplit_once(':') else {
-        return Ok(PaperTag::new(value));
-    };
-    if name.trim().is_empty() {
-        return Err(CliError::usage("tag name must not be empty"));
-    }
-    if TAG_COLORS
-        .iter()
-        .any(|id| id.eq_ignore_ascii_case(color.trim()))
-    {
-        return Ok(PaperTag {
-            name: name.trim().to_string(),
-            color: Some(color.trim().to_ascii_lowercase()),
-        });
-    }
-    Ok(PaperTag::new(value))
+    papers::parse_tag_spec(raw).map_err(|err| CliError::usage(err.to_string()))
 }
 
 async fn download(globals: &GlobalOpts, ref_: &str) -> Result<Value, CliError> {
@@ -731,19 +963,25 @@ async fn download(globals: &GlobalOpts, ref_: &str) -> Result<Value, CliError> {
     })
     .await?;
     let style = globals.style;
+    let mut lines = vec![format!(
+        "{} {}  pdf={} tex={} paperMd={}",
+        style.ok("download"),
+        style.path(&paper.path),
+        result.pdf,
+        result.tex,
+        result.paper_md
+    )];
+    let skipped = skipped_preparation_line(&result.preparation);
+    if let Some(line) = &skipped {
+        log::info!(target: "agentero::import", "{line}");
+        lines.push(line.clone());
+    }
     let mut v = to_value(&result)?;
     if let Some(obj) = v.as_object_mut() {
-        obj.insert(
-            "lines".into(),
-            json!([format!(
-                "{} {}  pdf={} tex={} paperMd={}",
-                style.ok("download"),
-                style.path(&paper.path),
-                result.pdf,
-                result.tex,
-                result.paper_md
-            )]),
-        );
+        if let Some(line) = skipped {
+            obj.insert("preparationSkipped".into(), json!([line]));
+        }
+        obj.insert("lines".into(), json!(lines));
         obj.insert("path".into(), json!(paper.path));
     }
     Ok(v)

@@ -73,6 +73,13 @@ describe("paper folder minimal unit", () => {
 		).toBe("/vault/papers/nlp/transformers/1706.03762");
 		expect(paperDirFromPath("papers/a/b/marks/hl-1.json")).toBe("papers/a/b");
 		expect(paperDirFromPath("/vault/notes/idea.md")).toBe(null);
+		// Main PDF on the paper root (citation links like …/id.pdf#page=1).
+		expect(paperDirFromPath("papers/vla/2504.16054/2504.16054.pdf")).toBe(
+			"papers/vla/2504.16054",
+		);
+		expect(
+			paperDirFromPath("/vault/papers/vla/2504.16054/2504.16054.pdf"),
+		).toBe("/vault/papers/vla/2504.16054");
 	});
 
 	it("uses paperFolders list for longest prefix", () => {
@@ -342,6 +349,23 @@ describe("sortFileTreeNodes", () => {
 			"mid-paper",
 			"zeta-paper",
 		]);
+	});
+
+	it("folder mode sorts numeric prefixes naturally", () => {
+		const names = sortFileTreeNodes(
+			[
+				paper("10-topic"),
+				paper("9-topic"),
+				org("10-org", [paper("nested-a")]),
+				org("9-org", [paper("nested-b")]),
+			],
+			"folder",
+			null,
+			undefined,
+			"folder",
+		).map((n) => n.name);
+
+		expect(names).toEqual(["9-org", "10-org", "9-topic", "10-topic"]);
 	});
 
 	it("title mode: org folders first, then papers by title", () => {

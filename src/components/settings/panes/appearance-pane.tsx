@@ -1,4 +1,4 @@
-import { Check, LoaderCircle } from "lucide-react";
+import { Check, LoaderCircle, Volume2 } from "lucide-react";
 import { useTheme } from "next-themes";
 import { memo, useEffect, useId, useState } from "react";
 import { useTranslation } from "react-i18next";
@@ -7,7 +7,9 @@ import {
 	PageTitle,
 	SettingsGroup,
 	SettingsRow,
+	SettingsSectionLabel,
 } from "@/components/settings/settings-layout";
+import { Button } from "@/components/ui/button";
 import {
 	Select,
 	SelectContent,
@@ -16,6 +18,8 @@ import {
 	SelectValue,
 } from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
+import { useThemePreviews } from "@/hooks/use-theme-previews";
+import { cn } from "@/lib/core/utils";
 import type {
 	AppSettings,
 	LocalePreference,
@@ -25,26 +29,27 @@ import {
 	EDITOR_LINE_HEIGHT_MAX,
 	EDITOR_LINE_HEIGHT_MIN,
 	EDITOR_LINE_HEIGHT_STEP,
+	MARKDOWN_MAX_WIDTH_PRESETS,
+	WIKI_EMBED_FONT_SIZE_MAX,
+	WIKI_EMBED_FONT_SIZE_MIN,
 } from "@/lib/settings";
-import {
-	applyUiTheme,
-	DEFAULT_UI_THEME,
-	loadUiThemes,
-	UI_THEMES,
-	type UiThemeDef,
-} from "@/lib/ui/theme";
+import { playCue } from "@/lib/ui/sound";
+import { applyUiTheme } from "@/lib/ui/theme";
 
 export type AppearancePaneProps = {
 	theme: ThemePreference;
 	uiTheme: string;
 	locale: LocalePreference;
 	uiScale: number;
+	soundEnabled: boolean;
 	editorFontSize: number;
 	interfaceFontFamily: string;
 	textFontFamily: string;
 	monoFontFamily: string;
 	editorLineHeight: number;
 	showEditorToolbar: boolean;
+	wikiEmbedFontSize: number;
+	markdownMaxWidth: number;
 	patch: (p: Partial<AppSettings>) => void;
 };
 
@@ -53,12 +58,15 @@ function AppearancePaneInner({
 	uiTheme,
 	locale,
 	uiScale,
+	soundEnabled,
 	editorFontSize,
 	interfaceFontFamily,
 	textFontFamily,
 	monoFontFamily,
 	editorLineHeight,
 	showEditorToolbar,
+	wikiEmbedFontSize,
+	markdownMaxWidth,
 	patch,
 }: AppearancePaneProps) {
 	const { t } = useTranslation("settings");
@@ -68,8 +76,9 @@ function AppearancePaneInner({
 	const textFontId = useId();
 	const monoFontId = useId();
 	const lineHeightId = useId();
+	const wikiEmbedFontId = useId();
+	const markdownWidthId = useId();
 	const uiScaleId = useId();
-	const [themeDefs, setThemeDefs] = useState<UiThemeDef[]>([]);
 
 	const [fontSize, setFontSize] = useState(editorFontSize);
 	useEffect(() => {
@@ -83,6 +92,19 @@ function AppearancePaneInner({
 		}, 150);
 		return () => clearTimeout(id);
 	}, [fontSize, editorFontSize, patch]);
+
+	const [embedFontSize, setEmbedFontSize] = useState(wikiEmbedFontSize);
+	useEffect(() => {
+		setEmbedFontSize(wikiEmbedFontSize);
+	}, [wikiEmbedFontSize]);
+
+	useEffect(() => {
+		if (embedFontSize === wikiEmbedFontSize) return;
+		const id = setTimeout(() => {
+			patch({ wikiEmbedFontSize: embedFontSize });
+		}, 150);
+		return () => clearTimeout(id);
+	}, [embedFontSize, wikiEmbedFontSize, patch]);
 
 	const [lineHeight, setLineHeight] = useState(editorLineHeight);
 	useEffect(() => {
@@ -110,51 +132,16 @@ function AppearancePaneInner({
 		return () => clearTimeout(id);
 	}, [scale, uiScale, patch]);
 
-	useEffect(() => {
-		let active = true;
-		void loadUiThemes()
-			.then((themes) => {
-				if (active) setThemeDefs(themes);
-			})
-			.catch(() => {
-				// Manifest names remain usable if preview data fails to load.
-			});
-		return () => {
-			active = false;
-		};
-	}, []);
-
 	const setThemePref = (next: ThemePreference) => {
 		patch({ theme: next });
 		setTheme(next);
 	};
 
 	const isDark = resolvedTheme === "dark";
-	const defaultPreview = {
-		background: isDark ? "oklch(0.145 0 0)" : "oklch(1 0 0)",
-		card: isDark ? "oklch(0.205 0 0)" : "oklch(1 0 0)",
-		primary: isDark ? "oklch(0.922 0 0)" : "oklch(0.205 0 0)",
-		secondary: isDark ? "oklch(0.269 0 0)" : "oklch(0.97 0 0)",
-		accent: isDark ? "oklch(0.269 0 0)" : "oklch(0.97 0 0)",
-		foreground: isDark ? "oklch(0.985 0 0)" : "oklch(0.145 0 0)",
-		border: isDark ? "oklch(1 0 0 / 10%)" : "oklch(0.922 0 0)",
-	};
-	const previewThemes = [
-		{
-			name: DEFAULT_UI_THEME,
-			title: t("appearance.uiTheme.default"),
-			light: defaultPreview,
-			dark: defaultPreview,
-		},
-		...UI_THEMES.map(
-			(meta) =>
-				themeDefs.find((theme) => theme.name === meta.name) ?? {
-					...meta,
-					light: defaultPreview,
-					dark: defaultPreview,
-				},
-		),
-	];
+	const { previewThemes, hasPreviewData } = useThemePreviews(
+		isDark,
+		t("appearance.uiTheme.default"),
+	);
 
 	return (
 		<>
@@ -179,9 +166,9 @@ function AppearancePaneInner({
 						</SelectContent>
 					</Select>
 				</SettingsRow>
-				<div className="border-b px-3.5 py-3.5">
+				<div className="border-b border-border/50 px-3.5 py-3.5">
 					<div className="mb-2.5 flex items-center justify-between gap-3">
-						<span className="font-normal text-[13px]">
+						<span className="font-normal text-sm text-foreground">
 							{t("appearance.uiThemeLabel")}
 						</span>
 						<span className="truncate text-muted-foreground text-xs">
@@ -189,7 +176,7 @@ function AppearancePaneInner({
 								uiTheme}
 						</span>
 					</div>
-					<div className="agentero-scroll grid max-h-[15rem] grid-cols-2 auto-rows-[7.25rem] gap-2 overflow-y-auto pr-1 sm:grid-cols-3">
+					<div className="agentero-scroll grid max-h-[15rem] grid-cols-2 auto-rows-[7.25rem] gap-2 overflow-y-auto overscroll-y-contain pr-1 sm:grid-cols-3">
 						{previewThemes.map((item) => {
 							const colors = isDark ? item.dark : item.light;
 							const selected = item.name === uiTheme;
@@ -205,7 +192,15 @@ function AppearancePaneInner({
 										patch({ uiTheme: item.name });
 										void applyUiTheme(item.name);
 									}}
-									className="group h-[7.25rem] min-w-0 rounded-lg border border-border/70 p-1 text-left outline-none transition-colors hover:border-primary/60 focus-visible:border-ring focus-visible:ring-2 focus-visible:ring-ring/50"
+									className={cn(
+										"group h-[7.25rem] min-w-0 rounded-lg border p-1 text-left outline-none",
+										"transition-[border-color,box-shadow,transform,background-color] duration-[var(--motion-duration-micro)] ease-[var(--motion-ease-out)]",
+										"hover:border-primary/55 focus-visible:border-ring focus-visible:ring-2 focus-visible:ring-ring/50",
+										"active:scale-[0.98]",
+										selected
+											? "border-primary/80 bg-primary/5 ring-1 ring-primary/35"
+											: "border-border/70",
+									)}
 								>
 									<div
 										className="overflow-hidden rounded-md border border-black/10 p-1.5 dark:border-white/10"
@@ -245,16 +240,21 @@ function AppearancePaneInner({
 										</div>
 									</div>
 									<div className="flex min-w-0 items-center gap-1.5 px-1 py-1">
-										<span className="truncate text-xs">{item.title}</span>
+										<span className="truncate font-medium text-xs">
+											{item.title}
+										</span>
 										{selected ? (
-											<Check className="ml-auto size-3.5 shrink-0 text-primary" />
+											<Check
+												className="ml-auto size-3.5 shrink-0 text-primary"
+												aria-hidden
+											/>
 										) : null}
 									</div>
 								</button>
 							);
 						})}
 					</div>
-					{themeDefs.length === 0 ? (
+					{!hasPreviewData ? (
 						<LoaderCircle className="mx-auto mt-2 size-3.5 animate-spin text-muted-foreground" />
 					) : null}
 				</div>
@@ -287,6 +287,12 @@ function AppearancePaneInner({
 							step={1}
 							value={Math.round(scale * 100)}
 							onChange={(e) => setScale(Number(e.target.value) / 100)}
+							aria-valuemin={80}
+							aria-valuemax={150}
+							aria-valuenow={Math.round(scale * 100)}
+							aria-valuetext={t("appearance.uiScale.value", {
+								percent: Math.round(scale * 100),
+							})}
 							className="w-28 accent-primary"
 						/>
 						<span className="w-12 text-right text-muted-foreground text-xs tabular-nums">
@@ -296,11 +302,34 @@ function AppearancePaneInner({
 						</span>
 					</div>
 				</SettingsRow>
+				<SettingsRow
+					label={t("appearance.sound.label")}
+					description={t("appearance.sound.description")}
+					htmlFor="sound-enabled"
+				>
+					<div className="flex items-center gap-2">
+						<Button
+							type="button"
+							variant="ghost"
+							size="icon-xs"
+							aria-label={t("appearance.sound.preview")}
+							disabled={!soundEnabled}
+							onClick={() => playCue("done")}
+						>
+							<Volume2 />
+						</Button>
+						<Switch
+							id="sound-enabled"
+							checked={soundEnabled}
+							onCheckedChange={(checked) => patch({ soundEnabled: checked })}
+						/>
+					</div>
+				</SettingsRow>
 			</SettingsGroup>
 
-			<p className="mb-1.5 mt-4 font-medium text-muted-foreground text-xs uppercase tracking-wide">
+			<SettingsSectionLabel className="mt-4">
 				{t("appearance.fonts.section")}
-			</p>
+			</SettingsSectionLabel>
 			<SettingsGroup>
 				<SettingsRow
 					label={t("appearance.fonts.interface")}
@@ -331,9 +360,9 @@ function AppearancePaneInner({
 				</SettingsRow>
 			</SettingsGroup>
 
-			<p className="mb-1.5 mt-4 font-medium text-muted-foreground text-xs uppercase tracking-wide">
+			<SettingsSectionLabel className="mt-4">
 				{t("appearance.markdownEditor.section")}
-			</p>
+			</SettingsSectionLabel>
 			<SettingsGroup>
 				<SettingsRow label={t("appearance.fontSize.label")} htmlFor={fontId}>
 					<div className="flex items-center gap-2">
@@ -345,6 +374,12 @@ function AppearancePaneInner({
 							step={1}
 							value={fontSize}
 							onChange={(e) => setFontSize(Number(e.target.value))}
+							aria-valuemin={12}
+							aria-valuemax={20}
+							aria-valuenow={fontSize}
+							aria-valuetext={t("appearance.fontSize.value", {
+								size: fontSize,
+							})}
 							className="w-28 accent-primary"
 						/>
 						<span className="w-12 text-right text-muted-foreground text-xs tabular-nums">
@@ -365,6 +400,12 @@ function AppearancePaneInner({
 							step={EDITOR_LINE_HEIGHT_STEP}
 							value={lineHeight}
 							onChange={(e) => setLineHeight(Number(e.target.value))}
+							aria-valuemin={EDITOR_LINE_HEIGHT_MIN}
+							aria-valuemax={EDITOR_LINE_HEIGHT_MAX}
+							aria-valuenow={lineHeight}
+							aria-valuetext={t("appearance.lineHeight.value", {
+								value: lineHeight.toFixed(1),
+							})}
 							className="w-28 accent-primary"
 						/>
 						<span className="w-12 text-right text-muted-foreground text-xs tabular-nums">
@@ -373,6 +414,61 @@ function AppearancePaneInner({
 							})}
 						</span>
 					</div>
+				</SettingsRow>
+				<SettingsRow
+					label={t("appearance.wikiEmbedFontSize.label")}
+					htmlFor={wikiEmbedFontId}
+				>
+					<div className="flex items-center gap-2">
+						<input
+							id={wikiEmbedFontId}
+							type="range"
+							min={WIKI_EMBED_FONT_SIZE_MIN}
+							max={WIKI_EMBED_FONT_SIZE_MAX}
+							step={1}
+							value={embedFontSize}
+							onChange={(e) => setEmbedFontSize(Number(e.target.value))}
+							aria-valuemin={WIKI_EMBED_FONT_SIZE_MIN}
+							aria-valuemax={WIKI_EMBED_FONT_SIZE_MAX}
+							aria-valuenow={embedFontSize}
+							aria-valuetext={t("appearance.wikiEmbedFontSize.value", {
+								size: embedFontSize,
+							})}
+							className="w-28 accent-primary"
+						/>
+						<span className="w-12 text-right text-muted-foreground text-xs tabular-nums">
+							{t("appearance.wikiEmbedFontSize.value", { size: embedFontSize })}
+						</span>
+					</div>
+				</SettingsRow>
+				<SettingsRow
+					label={t("appearance.markdownMaxWidth.label")}
+					htmlFor={markdownWidthId}
+				>
+					<Select
+						value={String(markdownMaxWidth)}
+						onValueChange={(value) =>
+							patch({ markdownMaxWidth: Number(value) })
+						}
+					>
+						<SelectTrigger
+							id={markdownWidthId}
+							size="sm"
+							className="min-w-[120px]"
+						>
+							<SelectValue />
+						</SelectTrigger>
+						<SelectContent>
+							<SelectItem value="0">
+								{t("appearance.markdownMaxWidth.full")}
+							</SelectItem>
+							{MARKDOWN_MAX_WIDTH_PRESETS.map((width) => (
+								<SelectItem key={width} value={String(width)}>
+									{t("appearance.markdownMaxWidth.value", { width })}
+								</SelectItem>
+							))}
+						</SelectContent>
+					</Select>
 				</SettingsRow>
 				<SettingsRow
 					label={t("appearance.editorToolbar.label")}

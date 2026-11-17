@@ -2,13 +2,25 @@
  * Paper tag semantics (P2-18b: moved down from `lib/ui/tag-colors.ts`,
  * which keeps only the color-token mapping).
  */
-import type { PaperMetadata, PaperTag, PaperTagInput } from "@/lib/paper/types";
+import {
+	isLegacyVenueTagName,
+	isSystemManagedTagName,
+} from "@/lib/paper/tag-namespaces";
+import type { PaperTag, PaperTagInput } from "@/lib/paper/types";
 import { isTagColorId, type TagColorId } from "@/lib/ui/tag-colors";
 
 export type { PaperTag, PaperTagInput } from "@/lib/paper/types";
 
 /** Internal tags retained for provenance but omitted from user-facing tag UI. */
 export const CONNECTOR_TAG_PREFIX = "@zotero:";
+/**
+ * Hidden provenance tag written by Zotero migration for every full collection
+ * membership. It is deliberately separate from the visible leaf-name tags:
+ * collection names are not globally unique and a paper may have many paths.
+ */
+export const ZOTERO_COLLECTION_TAG_PREFIX = "@zotero:collection:";
+/** Parent directory under which a Zotero collection tree was materialized. */
+export const ZOTERO_COLLECTION_ROOT_TAG_PREFIX = "@zotero:collection-root:";
 export const ARXIV_TAG_PREFIX = "@arxiv:";
 
 /** Zotero arXiv translator `"Archive - Sub-Field"` subject labels. */
@@ -29,6 +41,40 @@ const ARXIV_CATEGORY_PREFIXES = [
 
 export function isConnectorTagName(name: string): boolean {
 	return name.trim().toLocaleLowerCase().startsWith(CONNECTOR_TAG_PREFIX);
+}
+
+/** Full, sanitized Zotero collection paths retained by migration metadata. */
+export function zoteroCollectionPaths(
+	tags: readonly PaperTagInput[],
+): string[] {
+	const paths = new Map<string, string>();
+	for (const tag of tags) {
+		const name = tagName(tag).trim();
+		if (!name.toLocaleLowerCase().startsWith(ZOTERO_COLLECTION_TAG_PREFIX)) {
+			continue;
+		}
+		const path = name.slice(ZOTERO_COLLECTION_TAG_PREFIX.length).trim();
+		if (!path) continue;
+		paths.set(path.toLocaleLowerCase(), path);
+	}
+	return [...paths.values()];
+}
+
+/** Vault-relative parent of the materialized Zotero collection tree. */
+export function zoteroCollectionRoot(
+	tags: readonly PaperTagInput[],
+): string | null {
+	for (const tag of tags) {
+		const name = tagName(tag).trim();
+		if (
+			!name.toLocaleLowerCase().startsWith(ZOTERO_COLLECTION_ROOT_TAG_PREFIX)
+		) {
+			continue;
+		}
+		const root = name.slice(ZOTERO_COLLECTION_ROOT_TAG_PREFIX.length).trim();
+		if (root) return root.replace(/\\/g, "/").replace(/^\/+|\/+$/g, "");
+	}
+	return null;
 }
 
 export function isArxivTagName(name: string): boolean {
@@ -55,12 +101,29 @@ export function isVisiblePaperTag(tag: PaperTagInput): boolean {
 	return (
 		typeof name === "string" &&
 		name.trim().length > 0 &&
-		!isInternalTagName(name)
+		!isInternalTagName(name) &&
+		// Retired: publication is shown directly; old tags are cleaned by sync.
+		!isLegacyVenueTagName(name)
 	);
 }
 
 export function visiblePaperTags(tags: readonly PaperTagInput[]): PaperTag[] {
 	return normalizePaperTags(tags.filter(isVisiblePaperTag));
+}
+
+/** Tags the user may create, recolor, or delete in the UI. */
+export function isEditablePaperTag(tag: PaperTagInput): boolean {
+	const name = typeof tag === "string" ? tag : tag?.name;
+	return (
+		typeof name === "string" &&
+		isVisiblePaperTag(tag) &&
+		!isSystemManagedTagName(name)
+	);
+}
+
+/** Visible user tags only; Host-owned projections are preserved but not edited. */
+export function editablePaperTags(tags: readonly PaperTagInput[]): PaperTag[] {
+	return normalizePaperTags(tags.filter(isEditablePaperTag));
 }
 
 export function normalizePaperTag(raw: PaperTagInput): PaperTag | null {
@@ -97,21 +160,23 @@ export function tagName(t: PaperTagInput): string {
 	return typeof t === "string" ? t : t.name;
 }
 
-export function tagColorOf(t: PaperTagInput): TagColorId | undefined {
-	if (typeof t === "string") return undefined;
-	return isTagColorId(t.color) ? t.color : undefined;
-}
-
 /** Coerce API/catalog tags (string[] or mixed) into PaperTag[]. */
 export function coercePaperTags(tags: unknown): PaperTag[] {
 	if (!Array.isArray(tags)) return [];
 	return normalizePaperTags(tags as PaperTagInput[]);
 }
 
-/** Ensure `tags` is a normalized `PaperTag[]`. */
-export function withNormalizedTags(meta: PaperMetadata): PaperMetadata {
-	return {
-		...meta,
-		tags: coercePaperTags(meta.tags),
-	};
+/** Change only one existing tag, retaining invisible provenance tags. */
+export function withPaperTagColor(
+	tags: unknown,
+	name: string,
+	color: TagColorId | null,
+): PaperTag[] {
+	return coercePaperTags(tags).map((tag) =>
+		tag.name.toLocaleLowerCase() === name.toLocaleLowerCase()
+			? color
+				? { ...tag, color }
+				: { name: tag.name }
+			: tag,
+	);
 }

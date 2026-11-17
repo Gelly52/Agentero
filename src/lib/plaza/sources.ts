@@ -2,13 +2,12 @@
  * 广场（Plaza）— external discovery sources.
  *
  * Virtual tree/tab paths only; nothing here ever touches disk. Adding a source
- * is a single {@link PLAZA_SOURCES} entry — the sidebar node, its child row, the
- * home page card and the center panel all derive from this registry.
+ * is a single {@link PLAZA_SOURCES} entry — the sidebar child row and the
+ * center panel both derive from this registry.
  *
- * @see docs/development/plaza.md
+ * @see docs/frontend/paper-import.md
  */
 
-import type { ParseKeys } from "i18next";
 import i18n from "@/i18n";
 
 /** Virtual tree/tab path for the Plaza parent node. */
@@ -22,9 +21,11 @@ export const PLAZA_VIRTUAL_PATH = "agentero:plaza";
 export type PlazaSourceIcon =
 	| "coolPapers"
 	| "modelScope"
+	| "conference"
 	| "sparkles"
 	| "rss"
-	| "telescope";
+	| "telescope"
+	| "calendarClock";
 
 export type PlazaSource = {
 	id: string;
@@ -32,17 +33,14 @@ export type PlazaSource = {
 	path: string;
 	label: string;
 	/**
-	 * Sidebar-namespace i18n key for the one line shown on the Plaza home card.
-	 * Stored as a key (translated at render) so it follows language switches.
-	 */
-	description: ParseKeys<"sidebar">;
-	/**
 	 * Canonical public site: used for "open in browser", and embedded directly
 	 * when there is no proxy. `null` with no {@link panel} is a placeholder.
 	 */
 	url: string | null;
+	/** Minimum virtual viewport for a fixed desktop layout; other sites reflow normally. */
+	desktopWidth?: number;
 	/** Native plaza panel (not an iframe). */
-	panel?: "skills" | "feeds" | "arxivRec";
+	panel?: "skills" | "feeds" | "arxivRec" | "ccfDeadlines";
 	/**
 	 * Host proxy scheme origin used for embedding. A cross-origin frame cannot
 	 * retarget the site's `target="_blank"` links or report its navigations, so
@@ -72,7 +70,6 @@ export const PLAZA_SOURCES: readonly PlazaSource[] = [
 		id: "cool-papers",
 		path: sourcePath("cool-papers"),
 		label: "Cool Papers",
-		description: "plaza.arxivDescription",
 		url: "https://papers.cool/",
 		embedOrigin: () => schemeOrigin("agentero-coolpapers"),
 		icon: "coolPapers",
@@ -81,16 +78,23 @@ export const PLAZA_SOURCES: readonly PlazaSource[] = [
 		id: "modelscope",
 		path: sourcePath("modelscope"),
 		label: "ModelScope Papers",
-		description: "plaza.modelscopeDescription",
 		url: "https://modelscope.cn/papers",
+		desktopWidth: 1280,
 		embedOrigin: () => schemeOrigin("agentero-modelscope"),
 		icon: "modelScope",
+	},
+	{
+		id: "papers-with-code",
+		path: sourcePath("papers-with-code"),
+		label: "Papers with Code",
+		url: "https://paperswithcode.co/conferences",
+		embedOrigin: () => schemeOrigin("agentero-pwc"),
+		icon: "conference",
 	},
 	{
 		id: "skills",
 		path: sourcePath("skills"),
 		label: "Skill picks",
-		description: "plaza.skillsDescription",
 		url: null,
 		embedOrigin: null,
 		panel: "skills",
@@ -100,7 +104,6 @@ export const PLAZA_SOURCES: readonly PlazaSource[] = [
 		id: "feeds",
 		path: sourcePath("feeds"),
 		label: "Feeds",
-		description: "plaza.feeds.description",
 		url: null,
 		embedOrigin: null,
 		panel: "feeds",
@@ -110,11 +113,19 @@ export const PLAZA_SOURCES: readonly PlazaSource[] = [
 		id: "arxiv-rec",
 		path: sourcePath("arxiv-rec"),
 		label: "arXiv Daily",
-		description: "plaza.arxivRec.description",
 		url: null,
 		embedOrigin: null,
 		panel: "arxivRec",
 		icon: "telescope",
+	},
+	{
+		id: "ccf-deadlines",
+		path: sourcePath("ccf-deadlines"),
+		label: "CCF Deadlines",
+		url: "https://ccfddl.com/",
+		embedOrigin: null,
+		panel: "ccfDeadlines",
+		icon: "calendarClock",
 	},
 ];
 
@@ -124,10 +135,6 @@ export function isPlazaVirtualPath(path: string | null | undefined): boolean {
 	return (
 		path === PLAZA_VIRTUAL_PATH || path.startsWith(`${PLAZA_VIRTUAL_PATH}/`)
 	);
-}
-
-export function isPlazaRootPath(path: string | null | undefined): boolean {
-	return path === PLAZA_VIRTUAL_PATH;
 }
 
 /** The source owning this path, or `null` for the Plaza root / non-Plaza paths. */
@@ -154,10 +161,14 @@ export function plazaSourceLabel(source: PlazaSource): string {
 			return i18n.t("sidebar:plaza.skills.title");
 		case "modelscope":
 			return i18n.t("sidebar:plaza.modelscope");
+		case "papers-with-code":
+			return i18n.t("sidebar:plaza.pwc.label");
 		case "feeds":
 			return i18n.t("sidebar:plaza.feeds.label");
 		case "arxiv-rec":
 			return i18n.t("sidebar:plaza.arxivRec.label");
+		case "ccf-deadlines":
+			return i18n.t("sidebar:plaza.ccfDeadlines.label");
 		default:
 			return source.label;
 	}

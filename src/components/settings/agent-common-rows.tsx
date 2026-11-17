@@ -1,5 +1,22 @@
+import { ChevronDown } from "lucide-react";
+import type { ReactNode } from "react";
 import { useTranslation } from "react-i18next";
+import { ProbeDot } from "@/components/settings/provider-card";
+import { Button } from "@/components/ui/button";
+import {
+	DropdownMenu,
+	DropdownMenuContent,
+	DropdownMenuItem,
+	DropdownMenuLabel,
+	DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
 import { Input } from "@/components/ui/input";
+import {
+	InputGroup,
+	InputGroupAddon,
+	InputGroupButton,
+	InputGroupInput,
+} from "@/components/ui/input-group";
 import {
 	Select,
 	SelectContent,
@@ -8,17 +25,23 @@ import {
 	SelectValue,
 } from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
+import {
+	Tooltip,
+	TooltipContent,
+	TooltipTrigger,
+} from "@/components/ui/tooltip";
 import { isTauri } from "@/lib/core/tauri";
 import type {
 	AgentPermissionMode,
 	AiResponseLanguage,
 	AppSettings,
 } from "@/lib/settings";
+import type { ProbeStatus } from "@/lib/ui/probe-status";
 import { SettingsRow } from "./settings-layout";
 
 type Patch = (p: Partial<AppSettings>) => void;
 
-/** Shared network proxy URL input + enable switch. */
+/** Shared network proxy / mirror URL input + enable switch. */
 export function NetworkProxyRow({
 	htmlFor,
 	label,
@@ -28,6 +51,7 @@ export function NetworkProxyRow({
 	onProxyUrlChange,
 	onCommitProxyUrl,
 	onToggleProxy,
+	placeholder = "http://127.0.0.1:7890",
 }: {
 	htmlFor: string;
 	label: string;
@@ -37,6 +61,7 @@ export function NetworkProxyRow({
 	onProxyUrlChange: (url: string) => void;
 	onCommitProxyUrl: () => void;
 	onToggleProxy: (enabled: boolean) => void;
+	placeholder?: string;
 }) {
 	return (
 		<SettingsRow label={label} description={description} htmlFor={htmlFor}>
@@ -50,7 +75,7 @@ export function NetworkProxyRow({
 							e.currentTarget.blur();
 						}
 					}}
-					placeholder="http://127.0.0.1:7890"
+					placeholder={placeholder}
 					spellCheck={false}
 					autoComplete="off"
 					disabled={!proxyEnabled || !isTauri()}
@@ -64,6 +89,187 @@ export function NetworkProxyRow({
 				/>
 			</div>
 		</SettingsRow>
+	);
+}
+
+/** Resolved quick-fill preset (label already localized by the caller). */
+export type InstitutionProxyPresetOption = {
+	id: string;
+	kind: string;
+	prefix: string;
+	label: string;
+};
+
+/** Institution proxy (EZProxy/WebVPN) prefix + session cookie for paywalled
+ * PDF fallback, with a connection test that fetches a known paywalled DOI.
+ * Prefix comes first; `typeRow` slots the gateway-type control between the
+ * prefix and cookie rows so the primary field stays on top. */
+export function InstitutionProxyRow({
+	htmlFor,
+	label,
+	description,
+	prefix,
+	cookie,
+	prefixPlaceholder,
+	cookiePlaceholder,
+	cookieLabel,
+	testLabel,
+	testingLabel,
+	loginLabel,
+	presetsLabel,
+	presets,
+	typeRow,
+	onPrefixChange,
+	onCookieChange,
+	onPresetSelect,
+	onCommit,
+	onTest,
+	onLogin,
+	testing,
+	probeStatus,
+	probeLabel,
+	probeDetail,
+}: {
+	htmlFor: string;
+	label: string;
+	description?: string;
+	prefix: string;
+	cookie: string;
+	prefixPlaceholder?: string;
+	cookiePlaceholder?: string;
+	cookieLabel: string;
+	testLabel: string;
+	testingLabel: string;
+	loginLabel: string;
+	presetsLabel: string;
+	presets: readonly InstitutionProxyPresetOption[];
+	typeRow?: ReactNode;
+	onPrefixChange: (v: string) => void;
+	onCookieChange: (v: string) => void;
+	onPresetSelect: (preset: InstitutionProxyPresetOption) => void;
+	onCommit: () => void;
+	onTest: () => void;
+	onLogin: () => void;
+	testing: boolean;
+	probeStatus: ProbeStatus;
+	probeLabel: string;
+	probeDetail?: string;
+}) {
+	return (
+		<>
+			<SettingsRow
+				label={
+					<span className="inline-flex items-center gap-1.5">
+						{label}
+						<Tooltip>
+							<TooltipTrigger asChild>
+								<ProbeDot status={probeStatus} configured label={probeLabel} />
+							</TooltipTrigger>
+							<TooltipContent>
+								{probeDetail ? `${probeLabel} · ${probeDetail}` : probeLabel}
+							</TooltipContent>
+						</Tooltip>
+					</span>
+				}
+				description={description}
+				htmlFor={htmlFor}
+			>
+				<div className="flex items-center gap-2">
+					<InputGroup className="h-8 w-64 max-w-[18rem]">
+						<InputGroupInput
+							id={htmlFor}
+							value={prefix}
+							onChange={(e) => onPrefixChange(e.target.value)}
+							onBlur={() => onCommit()}
+							onKeyDown={(e) => {
+								if (e.key === "Enter") {
+									e.currentTarget.blur();
+								}
+							}}
+							placeholder={prefixPlaceholder}
+							spellCheck={false}
+							autoComplete="off"
+							disabled={!isTauri()}
+							className="font-mono text-xs"
+						/>
+						<InputGroupAddon align="inline-end">
+							<DropdownMenu>
+								<DropdownMenuTrigger asChild>
+									<InputGroupButton
+										size="icon-xs"
+										disabled={!isTauri()}
+										title={presetsLabel}
+										aria-label={presetsLabel}
+									>
+										<ChevronDown />
+									</InputGroupButton>
+								</DropdownMenuTrigger>
+								<DropdownMenuContent
+									align="end"
+									className="max-h-72 w-64 overflow-y-auto"
+								>
+									<DropdownMenuLabel className="text-xs text-muted-foreground">
+										{presetsLabel}
+									</DropdownMenuLabel>
+									{presets.map((preset) => (
+										<DropdownMenuItem
+											key={preset.id}
+											className="flex flex-col items-start gap-0.5"
+											onSelect={() => onPresetSelect(preset)}
+										>
+											<span className="text-xs">{preset.label}</span>
+											<span className="font-mono text-[10px] text-muted-foreground">
+												{preset.prefix}
+											</span>
+										</DropdownMenuItem>
+									))}
+								</DropdownMenuContent>
+							</DropdownMenu>
+						</InputGroupAddon>
+					</InputGroup>
+					<Button
+						type="button"
+						variant="outline"
+						size="xs"
+						disabled={!isTauri() || testing || !prefix.trim()}
+						onClick={onTest}
+					>
+						{testing ? testingLabel : testLabel}
+					</Button>
+				</div>
+			</SettingsRow>
+			{typeRow}
+			<SettingsRow label={cookieLabel} htmlFor={`${htmlFor}-cookie`}>
+				<div className="flex items-center gap-2">
+					<Input
+						id={`${htmlFor}-cookie`}
+						value={cookie}
+						onChange={(e) => onCookieChange(e.target.value)}
+						onBlur={() => onCommit()}
+						onKeyDown={(e) => {
+							if (e.key === "Enter") {
+								e.currentTarget.blur();
+							}
+						}}
+						placeholder={cookiePlaceholder}
+						spellCheck={false}
+						autoComplete="off"
+						type="password"
+						disabled={!isTauri()}
+						className="h-8 w-64 max-w-[18rem] font-mono text-xs"
+					/>
+					<Button
+						type="button"
+						variant="outline"
+						size="xs"
+						disabled={!isTauri() || !prefix.trim()}
+						onClick={onLogin}
+					>
+						{loginLabel}
+					</Button>
+				</div>
+			</SettingsRow>
+		</>
 	);
 }
 

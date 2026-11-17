@@ -1,3 +1,4 @@
+import { SelectionSurface } from "@/components/selection/selection-surface";
 /**
  * Native 广场 panel: today's arXiv papers ranked against the Vault library.
  *
@@ -11,6 +12,7 @@
  */
 
 import {
+	BookOpen,
 	Check,
 	Download,
 	ExternalLink,
@@ -42,9 +44,11 @@ import {
 	TooltipContent,
 	TooltipTrigger,
 } from "@/components/ui/tooltip";
+import { formatLocaleTimestamp } from "@/i18n";
 import { errorText } from "@/lib/core/error";
 import { notifyError } from "@/lib/core/notify";
 import { openExternalUrl } from "@/lib/core/open-external";
+import { readJsonStorage, writeJsonStorage } from "@/lib/core/storage";
 import { cn } from "@/lib/core/utils";
 import { lookupSubmit } from "@/lib/paper/import-actions";
 import { ARXIV_ALL_CATEGORIES, ARXIV_FEED_CHIPS } from "@/lib/plaza/feeds";
@@ -58,32 +62,23 @@ import {
 	recommendArxiv,
 	recommendArxivLast,
 } from "@/lib/recommend";
+import type { EmbeddingSettings } from "@/lib/settings";
 import { loadSettings, subscribeSettings } from "@/lib/settings/store";
 import { openSettingsWindow } from "@/lib/shell/settings-window";
 import { runTranslate } from "@/lib/translate";
 import { getVaultPath } from "@/lib/vault/store";
+import { openRemoteArxivPaper } from "@/lib/workspace/actions";
 
 const CATEGORIES_STORAGE_KEY = "plaza:arxiv-rec:categories";
 
 function loadCategories(): string[] {
-	try {
-		const raw = localStorage.getItem(CATEGORIES_STORAGE_KEY);
-		if (raw) {
-			const parsed = JSON.parse(raw);
-			if (Array.isArray(parsed) && parsed.length > 0) return parsed;
-		}
-	} catch {
-		/* ignore */
-	}
+	const parsed = readJsonStorage<unknown>(CATEGORIES_STORAGE_KEY, null);
+	if (Array.isArray(parsed) && parsed.length > 0) return parsed;
 	return [...ARXIV_FEED_CHIPS];
 }
 
 function persistCategories(categories: string[]) {
-	try {
-		localStorage.setItem(CATEGORIES_STORAGE_KEY, JSON.stringify(categories));
-	} catch {
-		/* ignore */
-	}
+	writeJsonStorage(CATEGORIES_STORAGE_KEY, categories);
 }
 
 /** Empty-state reason, so the panel can offer the matching next action. */
@@ -98,10 +93,12 @@ type EmptyReason =
 type ProbeStatus = "pending" | "unconfigured" | "ok" | "failed";
 
 /** Snapshot of the embedding config used to decide whether to re-probe. */
+function embeddingProbeKey(e: EmbeddingSettings): string {
+	return `${e.source}|${e.baseUrl}|${e.apiKey}|${e.model}`;
+}
+
 function readEmbeddingKey(): string {
-	const s = loadSettings();
-	const e = s.embedding;
-	return `${e.baseUrl}|${e.apiKey}|${e.model}`;
+	return embeddingProbeKey(loadSettings().embedding);
 }
 
 export function PlazaArxivRecView({ className }: { className?: string }) {
@@ -160,14 +157,15 @@ export function PlazaArxivRecView({ className }: { className?: string }) {
 		} catch (error) {
 			if (token !== probeTokenRef.current) return false;
 			const message = errorText(error);
-			setProbeError(message);
+			const probeFailed = isProbeFailedError(error);
+			setProbeError(probeFailed ? null : message);
 			if (isNoEmbeddingError(error)) {
 				setProbeStatus("unconfigured");
 				setEmptyReason("noEmbedding");
 			} else {
 				setProbeStatus("failed");
 				setEmptyReason("probeFailed");
-				notifyError(message);
+				if (!probeFailed) notifyError(message);
 			}
 			return false;
 		}
@@ -227,8 +225,7 @@ export function PlazaArxivRecView({ className }: { className?: string }) {
 	// Re-probe when the user edits the embedding config in Settings.
 	useEffect(() => {
 		return subscribeSettings((next) => {
-			const e = next.embedding;
-			const key = `${e.baseUrl}|${e.apiKey}|${e.model}`;
+			const key = embeddingProbeKey(next.embedding);
 			if (key === lastEmbeddingKeyRef.current) return;
 			lastEmbeddingKeyRef.current = key;
 			// Drop any visible stored cache so we don't flash stale results
@@ -316,7 +313,7 @@ export function PlazaArxivRecView({ className }: { className?: string }) {
 					<span
 						key={category}
 						className={cn(
-							"group inline-flex items-center gap-0.5 rounded-full border border-primary/40 bg-primary/10 py-0.5 pl-2 pr-0.5 font-mono text-[11px] text-foreground",
+							"group inline-flex items-center gap-0.5 rounded-full border border-primary/40 bg-primary/10 py-0.5 pl-2 pr-0.5 font-mono text-caption text-foreground",
 							(busy || !probeOk) && "opacity-60",
 						)}
 					>
@@ -342,8 +339,8 @@ export function PlazaArxivRecView({ className }: { className?: string }) {
 				/>
 				<span className="ml-auto flex items-center gap-1.5">
 					{computedAt && probeOk ? (
-						<span className="text-muted-foreground text-[11px]">
-							{new Date(computedAt).toLocaleString()}
+						<span className="text-muted-foreground text-caption">
+							{formatLocaleTimestamp(computedAt)}
 						</span>
 					) : null}
 					<Tooltip>
@@ -468,7 +465,7 @@ function EmptyState({
 					{t("plaza.arxivRec.probeFailed")}
 				</p>
 				{probeError ? (
-					<p className="max-w-sm text-muted-foreground/70 text-[11px] leading-relaxed">
+					<p className="max-w-sm text-muted-foreground/70 text-caption leading-relaxed">
 						{probeError}
 					</p>
 				) : null}
@@ -539,14 +536,40 @@ function RecommendCard({
 	return (
 		<div className="group relative rounded-lg border bg-background p-2.5 pr-16 transition-colors hover:border-foreground/20 hover:bg-muted/50">
 			<div className="flex items-baseline gap-2">
-				<span className="min-w-0 flex-1 font-medium text-sm leading-snug">
+				<span
+					className="line-clamp-2 min-w-0 flex-1 font-medium text-sm leading-snug"
+					title={item.title}
+				>
 					{item.title}
 				</span>
 			</div>
-			<p className="mt-1 text-muted-foreground text-xs leading-snug">
+			<SelectionSurface
+				source={{
+					sourcePath: item.url,
+					sourceUrl: item.url,
+					sourceTitle: item.title,
+					origin: "markdown",
+					surface: "abstract",
+				}}
+				className="mt-1 line-clamp-3 select-text text-muted-foreground text-xs leading-snug"
+			>
 				{translation ?? item.abstract}
-			</p>
+			</SelectionSurface>
 			<div className="absolute top-2 right-2 flex items-center gap-0.5">
+				<Tooltip>
+					<TooltipTrigger asChild>
+						<Button
+							type="button"
+							variant="ghost"
+							size="icon-sm"
+							aria-label={t("plaza.arxivRec.read")}
+							onClick={() => openRemoteArxivPaper(item)}
+						>
+							<BookOpen className="size-3.5" aria-hidden />
+						</Button>
+					</TooltipTrigger>
+					<TooltipContent>{t("plaza.arxivRec.read")}</TooltipContent>
+				</Tooltip>
 				<Tooltip>
 					<TooltipTrigger asChild>
 						<Button

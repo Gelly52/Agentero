@@ -9,8 +9,8 @@ beforeEach(() => {
 	agentSessionStore.setState({
 		sessions: [],
 		activeTabId: "draft",
+		hydratingSessionId: null,
 		draftLines: EMPTY_CHAT_LINES,
-		submitting: false,
 		runningSessionIds: [],
 		turnRequest: null,
 	});
@@ -37,6 +37,14 @@ describe("startDraft", () => {
 		expect(state.activeTabId).toBe("draft");
 		expect(state.draftLines).toBe(EMPTY_CHAT_LINES);
 		expect(state.sessions[0]?.lines).toEqual(lines);
+	});
+
+	it("clears a pending history hydration marker", () => {
+		agentSessionStore.setState({ hydratingSessionId: "provider-v7" });
+
+		agentSessionStore.getState().startDraft();
+
+		expect(agentSessionStore.getState().hydratingSessionId).toBeNull();
 	});
 });
 
@@ -149,6 +157,7 @@ describe("hydrateAndActivateSession", () => {
 		agentSessionStore.setState({
 			sessions: [historyItem],
 			activeTabId: "draft",
+			hydratingSessionId: historyItem.id,
 			draftLines: [
 				{ id: "draft-u1", kind: "user" as const, text: "Unsaved draft" },
 			],
@@ -160,6 +169,7 @@ describe("hydrateAndActivateSession", () => {
 
 		const state = agentSessionStore.getState();
 		expect(state.activeTabId).toBe(historyItem.id);
+		expect(state.hydratingSessionId).toBeNull();
 		expect(state.draftLines).toBe(EMPTY_CHAT_LINES);
 		expect(state.sessions[0]).toMatchObject({
 			id: historyItem.id,

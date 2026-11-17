@@ -32,7 +32,7 @@
 | 右栏·References | 右侧引用卡片 + 近邻图 |
 | 右栏·反链 | 编辑器状态栏反链（非引用图） |
 | 设置 | `⌘,` 居中浮层 |
-| 命令面板 | `⌘P` / `⌘K` / `⇧⌘P` |
+| 命令面板 | `⌘P` / `⇧⌘P` |
 | 任务条 | 左下角后台任务 |
 | Toast | 右上角 Sonner |
 | 终端 | 系统终端（CLI 项） |
@@ -54,14 +54,17 @@
 ```bash
 pnpm lint && pnpm test && pnpm build
 cargo test --manifest-path src-tauri/Cargo.toml
-cargo test -p agentero-cli
+cargo test -p agentero-core -p agentero-cli
 ```
 
 | # | 界面 | 操作 | 预期 | 结果 |
 |---|---|---|---|---|
 | 0.2.1 | 终端 | 跑上列命令 | 全部通过 | ☐ |
 | 0.2.2 | GitHub Actions | Release job 的 updater secret 校验 | `TAURI_SIGNING_PRIVATE_KEY` 和密码缺失时在创建 Draft 前失败 | ☐ |
-| 0.2.3 | Draft Release | 检查 updater 资产 | 有 `latest.json`、各平台 updater 包与对应 `.sig`；`latest.json` 包含每个平台的 URL 和签名 | ☐ |
+| 0.2.3 | Draft Release | 检查 updater 资产 | 有 `latest.json`、各平台 updater 包与对应 `.sig`；`latest.json` 包含每个平台（含 `windows-x86_64` / `windows-aarch64`）的 URL 和签名，且 URL 为 `github.com/.../releases/download/...`（不是 `api.github.com/.../releases/assets/...`，匿名下载会被 60 次/小时限流） | ☐ |
+| 0.2.3a | GitHub Actions / AtomGit | 配置 `ATOMGIT_TOKEN`，发布 Release 后检查自动触发的同步 job（或按 tag 手动 Run workflow） | 「Publish the release tag on AtomGit」步骤不因 push 被拒而失败：镜像仓库会告警 `pull-mirror (image) repository` 后继续；同名 tag 提交一致；说明和全部上传附件同步；每个附件回读 SHA-256 一致；重跑不重复附件；最新稳定版发布后标记 `latest`；预发布与补传旧稳定版为 `pre` 且不抢占现有 `latest`；缺令牌或附件失败时 job 报错 | ☐ |
+| 0.2.3b | GitHub Actions / AtomGit | 检查同步 job 的「Pin AtomGit to its overseas edge」步骤日志 | 四个域名全部 `Pinned <host> -> <IP>`；`getent hosts` 显示该 IP；上传日志的 `via <host>` 为 `file.gitcode.com`（已在固定列表内，若变成别的 OBS 域名需补进列表）；120 MB 级 AppImage 在数十秒内 `Uploaded and verified`，无 `HTTP 502`、无 `Retry n/2` | ☐ |
+| 0.2.4 | GitHub Actions / 应用·设置 | 确认 `AGENTERO_BUILTIN_API_KEY` secret 已配且本次构建注入了它 | 缺 secret **不会**让构建失败（`option_env!` 当未设置处理），只会静默产出没有内置 provider 的包。信号：Host `builtin_provider_status.available` 为 `true`。新装正文引擎始终默认「本地」，设置页不再提供内置正文选项，不能用该下拉判断 key 是否注入。见 [release.md](release.md) §内置 Provider 构建期注入 | ☐ |
 
 ### 0.3 安装启动
 
@@ -71,7 +74,10 @@ cargo test -p agentero-cli
 | 0.3.1b | 终端 | 检查产物不含 CLI（macOS：`ls Agentero.app/Contents/MacOS/ | grep agentero-cli`；Windows：安装目录 `dir agentero-cli*`） | 应**无**任何 agentero-cli 文件（不内置真二进制，也不再有占位 stub；#320） | ☐ |
 | 0.3.2 | 欢迎页 | 不打开 Vault，空看界面 | 同一行有 Create / Open / Open remote / Migrate from Zotero + Recent 列表；无大段说明文案 | ☐ |
 | 0.3.3 | 设置 → 关于 | 已安装旧版时检查已发布新版，点「安装并重启」 | 有新版提示、下载进度；重启后 About 显示新版本 | ☐ |
+| 0.3.3b | 主窗口 | 应用跨多个 Release 长期驻留后点标题栏「新版本」标签 | 安装的是最新版而非驻留期间缓存的旧版（安装前 re-check；#481） | ☐ |
 | 0.3.4 | 主窗口 | 启动已安装旧版 | 首屏不阻塞；有新版时只出现一个「安装并重启」Toast；无更新或离线时不弹错误 | ☐ |
+| 0.3.5 | 访达（macOS） | 安装后启动一次，右键任意文件夹 → 快捷操作 | 出现 **Open with Agentero**；点击后打开为 Vault（运行中/未运行各测一次）；含空格/中文目录名正常；设置 → 通用 移除后菜单消失且重启不再自动恢复 | ☐ |
+| 0.3.6 | 资源管理器（Windows） | 安装后右键文件夹及文件夹空白处 | 均有 **Open with Agentero**（Win11 在「显示更多选项」）；含空格/`&`/中文的目录可打开；卸载后 `reg query` 无 `OpenWithAgentero` 残留 | ☐ |
 
 ---
 
@@ -119,7 +125,12 @@ cargo test -p agentero-cli
 | 3.3 | 设置 → 通用 | 改 **Paper 行标签** / **排序** 各选一档，回看树 | 展示标签/顺序变了；磁盘路径不变 | ☐ |
 | 3.4 | 左栏·树 | 在 `notes/` 右键 → **新建文件**，输入名回车 | 出现新 `.md`；中间可打开编辑 | ☐ |
 | 3.5 | 左栏·树 | 右键 → **新建文件夹** | 内联命名成功；树刷新 | ☐ |
-| 3.6 | 左栏·树 | ⌘ 点多选若干项，拖到 `papers/` 某组织夹 | 文件移入目标；树与磁盘一致 | ☐ |
+| 3.5a | 左栏·树 | 分别在重命名、新建文件/文件夹、移动面板新文件夹中用中文输入法选字，按 Enter / Escape | Enter 只确认候选词，Escape 只取消候选词，命名输入/移动面板仍保留；组字结束后再次按 Enter 才提交，普通 Escape 仍可取消/关闭（#746） | ☐ |
+| 3.5b | 左栏·树 | 树内命名确认候选词后点击外部；另测提交后立即移焦、空名称与非法名称 | 失焦提交完整名称且只提交一次；空名称取消，非法名称保留编辑；重命名未改变名称则取消 | ☐ |
+| 3.6 | 左栏·树 | ⌘ 点多选若干项，再拖到 `papers/` 某组织夹 | 标题栏原位切换为数量 / 移动 / 删除 / 清除；树不下移、不被遮挡；文件移入目标后树与磁盘一致 | ☐ |
+| 3.6a | 左栏·树 | 多选后分别右键已选行与未选行；Shift 范围同时覆盖父夹与后代 | 已选行菜单作用于整组；未选行先收敛为单项；父夹代表其后代且批量数量不重复 | ☐ |
+| 3.6b | 左栏·树 | 用 Tab 聚焦文件行，按 Space；再选中一行按 Enter；多选后按 Esc | Space 激活行且读屏获得 `aria-selected`；Enter 直接进入该行内联重命名；Esc 退出选择模式，树不位移 | ☐ |
+| 3.6c | 左栏·树 | 重命名一个文件，输入**不带扩展名**的名称（如 `notes/foo.md` → `bar`） | 出现文件夹 `bar/`，原文件保留后缀并改名为 `bar/bar.md`；双链/打开的标签跟随新路径；失败不残留空文件夹（#759） | ☐ |
 | 3.7 | 左栏·树 | 选中文件，右键 **在 Finder 中显示** 或 `⌥⌘R` | 系统访达定位到该项 | ☐ |
 | 3.8 | 左栏·树 | 选中文件夹，右键 **在终端中打开** 或 `⌥⌘T` | 系统终端 cwd = 该文件夹 | ☐ |
 | 3.9 | 左栏·树 | 选中文件再 `⌥⌘T` | 终端 cwd = **父目录** | ☐ |
@@ -163,9 +174,11 @@ cargo test -p agentero-cli
 | 4.9 | 左栏·树 | 单击 `papers/` 下**非 paper 的组织文件夹** | 仍是 Library 表，但只显示该 path 前缀下的论文（不新开 tab、不整库重拉） | ☐ |
 | 4.9.1 | 左栏·树 | 组织文件夹含索引 `NOTES.md`，且内部有多篇 paper | 组织文件夹保持可展开；内部每篇 paper 独立显示，不被合并成父目录 | ☐ |
 | 4.10 | 标题栏 Layout | 开关 NOTES 相关项 / 快捷键 | NOTES 显示或隐藏符合菜单 | ☐ |
-| 4.11 | 中间栏 | 把 panel 拖成上下或左右分屏；从树拖文件到边 | 多分屏网格可用 | ☐ |
+| 4.10a | 标题栏 Layout | 打开 PDF / NOTES 双列，在 NOTES 栏再堆多个标签；再构造三栏或四栏，点击 **阅读**；再次点击 **阅读** | 第一次点击只显示当前活动分组并铺满工作区，左右栏收起；其它分栏和标签未关闭；再次点击恢复原多栏 / 多标签布局与栏宽；在 `custom` 状态下重复点同一预设也立即生效（#764） | ☐ |
+| 4.11 | 中间栏 | 把 paper tab / tab group 拖过相邻 Library，再拖成上下或左右分屏；从树拖文件到边；drop / cancel 后立即在 Library、MD、PDF 正文选字 | 移动中不出现原生文字选区；多分屏网格可用；结束后正文恢复正常选择 | ☐ |
 | 4.12 | 左栏 / 右栏 | 点折叠按钮；交替 `⌥⌘S` / `⌘L` | 侧栏折叠且保留像素宽度；两栏快捷键不「抢成互斥坏掉」 | ☐ |
-| 4.13 | 系统 | 关窗再开同一本地库 | 布局尽量从 localStorage 恢复 | ☐ |
+| 4.13 | 系统 / 右栏 | 拖动 AI 栏宽度后开关右栏、切换 Agent/笔记/阅读预设、重启应用；调整并最大化主窗后重启 | AI 栏始终恢复最后拖出的宽度；主窗尺寸、位置和最大化状态恢复 | ☐ |
+| 4.14 | 全局 UI / 移动端 | 在标题栏、导航、工具栏、Library 表头、回收站行和可点击卡片上拖动或长按，再分别在 MD、PDF、Agent 回复、Plaza 文章、metadata 与输入框中选字 | 操作型 Chrome 不出现文字选区；正文、可复制值及编辑控件仍可选择和复制 | ☐ |
 
 ---
 
@@ -180,8 +193,8 @@ cargo test -p agentero-cli
 | 5.5 | 左栏·树 | 选中某 paper | 左下或 Info 区出现 **Paper Info** | ☐ |
 | 5.6 | 左栏·Info | 添加 tag，选一种颜色 | chip 出现；Library tags 列同色；重启后仍在 | ☐ |
 | 5.7 | 左栏·Info | 删除某 tag | Library 与 Info 同步消失 | ☐ |
-| 5.8 | 中间栏·Library | 点 **Rescan**（空态或工具栏） | 盘上有、表中无的 paper 出现 | ☐ |
-| 5.9 | 左栏·树 | 在 Library 节点右键 **导出论文库** | 得到可用 BibTeX | ☐ |
+| 5.8 | 中间栏·Library | 右键 `papers/` → **重新扫描 papers/**（非空库也可用；空库中央按钮保留） | 盘上有、表中无的 paper 出现；两篇纯中文目录/PDF 各自显示；旧 `id=paper` 修复后重扫及 sidecar 重建不再互相隐藏，笔记/标注保留 | ☐ |
+| 5.9 | 左栏·树 | 在 `papers/` 论文库节点右键 **导出论文库** | 得到可用 BibTeX | ☐ |
 | 5.10 | 中间栏·Library | 对缺 PDF 的行触发批量 Download | 任务条有进度；缺的资源补齐 | ☐ |
 | 5.11 | 中间栏·Library | 打开有阅读记录的 paper，回到 Library | 标题列左侧出现阅读热力条；未读论文无热力条 | ☐ |
 
@@ -217,12 +230,15 @@ cargo test -p agentero-cli
 | # | 界面 | 操作 | 预期 | 结果 |
 |---|---|---|---|---|
 | 6.2.1 | 魔棒弹层 | 选「本地 PDF / 文件」，多选 2 个 PDF 导入 | 各生成 `papers/<citekey>/`，含 PDF + `PAPER.md` + catalog | ☐ |
-| 6.2.2 | 访达 | 把外部 PDF **拖进**左栏 `papers/` 某组织夹 | 弹出 metadata **确认框**；确认后入库 | ☐ |
-| 6.2.2.1 | 访达 | 把 1 个或多个 PDF **拖到**中间栏 Library 表 | 出现虚线 overlay「松开以导入 PDF」；松手后同一确认框；确认后入库。文件夹作用域导入到该夹 | ☐ |
-| 6.2.2.2 | 访达 | 把 PNG / `.md` 拖到 Library 表 | **无** overlay、不入库 | ☐ |
+| 6.2.2 | 访达 | 把外部 PDF **拖进**左栏 `papers/` 某组织夹 | 直接后台入库；识别和版面分析继续后台运行 | ☐ |
+| 6.2.2.1 | 访达 | 把 1 个或多个 PDF **拖到**中间栏 Library 表 | 出现虚线 overlay「松开以导入 PDF」；松手后直接后台入库，文件夹作用域导入到该夹 | ☐ |
+| 6.2.2.2 | 中间栏·PDF 阅读器 / NOTES / 其它窗口区域 | 把一个 PDF 拖到当前阅读器，再连续拖入第二个 | 两个 PDF 都不丢失并按顺序导入；识别和版面分析继续在后台 | ☐ |
+| 6.2.2.3 | 访达 | 把 PNG / `.md` 拖到 Library 表 | **无** overlay、不入库 | ☐ |
+| 6.2.2.4 | Linux · Files（Nautilus）+ GNOME / Wayland | 从 Files 把 PDF 分别拖到主窗口 Library、`papers/` 组织夹、阅读器；再检查树内移动和 tab 重排 | PDF 按对应目标目录各导入一次；Library 有 overlay；内部移动和 tab 拖拽正常 | ☐ |
 | 6.2.3 | 同上 | 再导同名冲突 PDF | citekey 带 `-2` / `-3` 等后缀，不互相覆盖 | ☐ |
 | 6.2.4 | 终端 + 应用 | **用安装包装的应用**（非 `tauri dev`），先确认 PDFium 已随包：macOS `ls "/Applications/Agentero.app/Contents/Frameworks/libpdfium.dylib"`，Windows/Linux 查 exe 同级 `pdfium/`。再临时移走构建期缓存 `~/Library/Caches/pdfium-rs`（Linux `~/.cache/pdfium-rs`），导入一个本地 PDF | 仍生成 `PAPER.md`，catalog 写入 `body_source`；测完恢复缓存目录（回归 #303） | ☐ |
 | 6.2.5 | 同上 | 把包内 PDFium 临时改名，再导入一个本地 PDF | 任务面板出现 **失败** 的「解析 PDF 正文」，详情含找不到 PDFium 的真实原因，而不是显示“已完成” | ☐ |
+| 6.2.6 | 设置 → 版面解析 + 左栏·树 | 正文引擎选「Agentero 内置」，导入一篇无 TeX 的 PDF | 生成的 `PAPER.md` 是 OCR 质量正文（catalog `body_source` = `vlm`），**不是**静默退化成本地 liteparse 的纯文本；同时版面后端仍显示 `local`，PP-DocLayoutV3 仍从本地 cache 加载（内置 provider 只是正文引擎，不是版面后端） | ☐ |
 
 ### 6.3 补下载
 
@@ -254,23 +270,29 @@ cargo test -p agentero-cli
 | # | 界面 | 操作 | 预期 | 结果 |
 |---|---|---|---|---|
 | 7.1.1 | 左栏·树 | 点 paper 下 PDF 或 `assets/sample.pdf` | 中间 **blob 预览**，非系统外部打开 | ☐ |
-| 7.1.2 | 中间栏·PDF | 底栏改页码 / PageDown / Home | 跳页正确 | ☐ |
-| 7.1.3 | 中间栏·PDF | 底部页码栏的适应宽度、适应整页、滚轮缩放 | 重渲染清晰；放大后可平移 | ☐ |
+| 7.1.2 | 中间栏·PDF | 底栏改页码 / PageDown / Home / 悬停阅读区按 ↑↓ | 跳页、滚动位置正确；逐页模式 ↑↓ 翻页；输入框内方向键不滚动 PDF | ☐ |
+| 7.1.3 | 中间栏·PDF | 底部缩放滑动条、滚轮缩放 | 重渲染清晰；放大后可平移；左上翻译 tab、右侧评论卡与页面等比缩放；Ask / 翻译 / 视觉批注浮卡保持固定 UI 尺寸与字号，锚点仍跟随选区 | ☐ |
 | 7.1.3a | 中间栏·PDF / NOTES 分屏 | PDF 设为手动 125%，先慢速、再快速向左/向右来回拖动中间 divider，然后在一次快速拖动中直接松手 | divider 与 PDF panel 边界按屏幕帧连续跟手，无输入堆积、PDF 蓝色文本选区或松手回跳；页面仅被即时裁剪/扩展，125% 保持，滚动区域与最终尺寸一致 | ☐ |
+| 7.1.3b | 中间栏·PDF | 打开含 `/Rotate 90` 页面的 PDF（如 `10_3389_fpls_2025_1611992` 第 4、5 页） | 旋转页按横向页框显示；不被塞进竖向 A4 页框；翻译分屏同样正确 | ☐ |
+| 7.1.3c | 中间栏·PDF / NOTES 分屏 | 打开一篇长笔记（数百个标题）与 PDF 分屏，向左/向右来回拖动中间 divider，然后在一次快速拖动中直接松手 | divider 逐帧跟手无卡顿；拖动期间笔记**布局冻结**（拉宽留白 / 收窄被裁），松手后只重算一次并正好落在最终宽度上；pdf 选区、125% zoom 不受影响 | ☐ |
+| 7.1.3d | 左栏·树 / 右栏 rail | 打开同一篇长笔记（**并同时开着 PDF**），来回拖动左侧文件树与右侧栏的 rail；再把窗口拉大 / 缩小 | 两种手势都不卡（原先完全没被门控覆盖，见 bug_fix §3.4）；松手后笔记与 PDF 都正常落到最终尺寸。注意：PDF 侧这条是接了同一手势信号，但收益未测量 | ☐ |
 | 7.1.4 | 中间栏·PDF | 打开大纲，点书签 | 跳到对应位置 | ☐ |
 | 7.1.5 | 中间栏·PDF | `⌘F` 输入文中词 | 命中高亮；可下一条 | ☐ |
+| 7.1.6 | 中间栏·论文 PDF | 点击原生 citation / 章节链接、URI 及纯文本 URL，悬停引用；开启 / 关闭全文译文后重试，并在译文上划选。若测试 PDF 包含无目标 Link，也点击检查 | 内链跳页、返回位置可用；外链只打开一次；引用预览正常；无八点选中框；译文划选和高亮编辑保留，未翻译区域的链接仍可点 | ☐ |
 
 ### 7.2 划词与批注
 
 | # | 界面 | 操作 | 预期 | 结果 |
 |---|---|---|---|---|
-| 7.2.1 | 中间栏·PDF | 拖选一段文字 | 仅选中文字显示平滑蓝色选区 + 操作菜单（高亮 / 批注 / 提问 / 加入对话 / 翻译），不出现整页 / 大块 PDF 蓝色矩形框选 | ☐ |
+| 7.2.1 | 中间栏·PDF | 拖选一段文字 | 仅选中文字显示平滑蓝色选区 + 操作菜单（高亮 / 翻译 / 加入对话 ⇧⌘L / 快速对话 ⌘K，无批注按钮；文字小号）+ 页右缘竖向评论入口；不出现整页 / 大块 PDF 蓝色矩形框选 | ☐ |
 | 7.2.2 | 菜单 | 选 **高亮** | 高亮保留；磁盘 `marks/` 有记录；**原始 PDF 字节不变** | ☐ |
-| 7.2.3 | 菜单 | 选 **批注**，写 comment | 页边批注针；右侧批注面板有卡片 | ☐ |
+| 7.2.3 | 页右缘 | hover 竖向评论入口 → 移走（无输入）→ 再 hover 输入 | hover 进入编辑；无输入移走缩回图标卡；再 hover 可输入；提交后高亮 + 常驻评论卡 | ☐ |
 | 7.2.4 | 右栏·批注 | 点卡片跳转 / 编辑 / 删除 | 跳页正确；改删同步 | ☐ |
 | 7.2.5 | 菜单 | **翻译** 一段 | 按设置中翻译服务出结果 | ☐ |
 | 7.2.6 | 菜单 | **提问**（已配 Agent） | 选区旁迷你问答卡片；可发问出结果 | ☐ |
-| 7.2.7 | 菜单 | **加入对话** → 在 Agent 输入问题发送 | Composer 有选区 chip；发送后选区旁出现**对话卡片**页边针（`kind: ask`，非视觉批注）；悬停/点开可见本轮问答 | ☐ |
+| 7.2.7 | 划词加入对话 | 划词 → 点 **加入对话** 或按 `⇧⌘L` → 在 Agent 输入问题发送 | Composer 输入框内有选区引用块且侧栏打开；发送后选区旁出现**对话卡片**页边针（`kind: ask`，非视觉批注）；悬停/点开可见本轮问答 | ☐ |
+
+| 7.2.8 | 设置·快捷键 | 重绑定加入对话 → 跨 PDF / 网页 / 笔记 / 代码 / 广场触发 → 清除 / 恢复 → 重启 | 当前组合与提示一致，旧组合失效；冲突保留原值；⌘L 有选区也只切换侧栏；录制不执行命令 | ☐ |
 
 ### 7.3 视觉批注与版面分析
 
@@ -280,7 +302,8 @@ cargo test -p agentero-cli
 | 7.3.2 | 中间栏·PDF | 框选区域后按 `⌘Enter` 向 Agent 提问 | 视觉上下文进入 Agent 会话；回答后同一 mark 可续聊 | ☐ |
 | 7.3.3 | 右栏·Figures | 打开带插图的 paper，点「分析」 | 列出 figure/table/algorithm/formula；点击跳转到对应位置 | ☐ |
 | 7.3.4 | 中间栏·PDF | 悬停有编号公式命中框并单击 | 与插图一致：出现「单击进行批注」提示，单击打开视觉批注编辑器 | ☐ |
-| 7.3.5 | 中间栏·PDF | 点工具栏 Languages 全文翻译 | 按阅读顺序分批出译文并盖在 bbox 上（非整页等齐）；再点可停止/清除；磁盘 `source/layout-translate.json` 有缓存 | ☐ |
+| 7.3.5 | 中间栏·PDF | 点工具栏 Languages 全文翻译 | 分批出译文；某页条目结束即显示重排预览，后续批次不清掉它；全文结束后校正，未变化页不重复渲染；终局完成后才可导出；停止/清空/重试不恢复旧预览；磁盘 `source/layout-translate.json` 有缓存 | ☐ |
+| 7.3.5a | 中间栏·PDF（翻译服务=Agentero 内置） | 对一篇含公式 / URL / 引用标记的论文跑全文翻译，逐段对照原文 | 内置路径的 `[[n]]` 批次由 Host 拆分逐段请求再重组：译文**不错位、不并段、不丢块**；`⟦n⟧` 占位符保护的公式 / URL / 引用在译文里原样还原，**没有**出现裸露的 `⟦0⟧` 或被吞掉后整段回落原文（这两点是尚未用真实 key 验证过的假设，见 [../backend/builtin-provider.md](../backend/builtin-provider.md) §限制与后续） | ☐ |
 
 ### 7.4 图片与 MD 插图
 
@@ -302,12 +325,17 @@ cargo test -p agentero-cli
 | 8.2 | 设置 → Appearance | 开关 **格式工具栏** | 编辑器顶栏显隐 | ☐ |
 | 8.3 | 中间栏·MD | 写入 `[[某已存在笔记]]`，点击链接 | 跳转到目标文件 | ☐ |
 | 8.4 | 中间栏·MD | 写入不存在的 `[[新概念]]`，走创建入口 | 可新建目标文件 | ☐ |
-| 8.5 | 右栏 | 切到 **Backlinks**，打开被引用文件 | 上方列出反链来源 | ☐ |
+| 8.5 | 编辑器状态栏 | 打开被引用文件，悬停反向链接计数 | 列出反链来源，可跳转 | ☐ |
 | 8.6 | 右栏·References | 看卡片下方**引用近邻图**，点库内节点 | 打开对应论文；四级角色（本论文 / 引用 / 被引 / stub）可辨；stub 不可打开 | ☐ |
 | 8.7 | 中间栏·MD | 新增/删除一条 `[[链接]]`，等约 1s | 状态栏反链刷新；引用图**不**随双链改动变化 | ☐ |
 | 8.8 | 中间栏·NOTES | 对当前 paper 输入 `[[@`，↑↓ 选候选，tab/enter | 列出划词/视觉批注；↑ 在首项循环到末项且菜单不消失 | ☐ |
-| 8.9 | 中间栏·NOTES | 面板复制批注链接并粘贴；再 `![[…@id]]` | 跳转打开 PDF 到 mark；嵌入只读、可滚动，正文点击不跳转，右上角按钮跳转；视觉批注展示对话 Markdown | ☐ |
+| 8.9 | 中间栏·NOTES | 面板复制批注链接并粘贴；再 `![[…@id]]` | 跳转打开 PDF 到 mark；批注嵌入预览只读、可滚动，正文点击不跳转，右上角按钮跳转；视觉批注展示对话 Markdown | ☐ |
 | 8.10 | 中间栏·NOTES | 嵌入位置文案 | 有大纲时为标题路径，否则「第 N 页」 | ☐ |
+| 8.11 | 中间栏·NOTES | 打开含较多标题的长笔记（最好三面板同开：PDF + 笔记 + 对话），来回拖动竖直滚动条 thumb；再点 TOC 条目平滑跳转 | thumb 逐帧跟手，无「一拖就卡」；TOC 高亮正常跟随；编辑标题 / 在标题上方插入块后高亮仍正确 | ☐ |
+| 8.12 | 中间栏·MD | 分别输入 `[[笔记.md#` 与 `[[论文.pdf#`；在 PDF 章节候选上按 Enter，再试 Tab | Markdown 列标题；PDF 列编号章节。Enter 确认章节，Tab 补出下一 `#` 并列该章段落及原文 | ☐ |
+| 8.13 | 中间栏·MD | 对照 `[[论文.pdf#2.1]]`、`[[论文.pdf#2.1#p3]]` 及普通 Markdown PDF 链接；再尝试缺失/歧义目标 | 三种入口解析一致；`p3` 为该章第 3 个正文块，子章节独立计数；错误明确提示，不跳到其它段落；旧 `#section=` / `#page=` 仍可用 | ☐ |
+| 8.14 | 中间栏·MD | 同时嵌入同一 PDF 的两个章节/段落；滚动离开目标后点顶栏「回到引用位置」 | 按容器页宽显示，持续浅色高亮原始目标块；定位按钮在「打开」左侧，只恢复当前嵌入，保留缩放；普通 PDF 嵌入无此按钮 | ☐ |
+| 8.15 | 中间栏·PDF 与嵌入 | 在论文主 PDF 嵌入中新增高亮、备注、改色、删除及视觉批注；与主阅读器交替编辑，再重开 | 页内备注可编辑并保存到原论文 `marks/`；同窗口查看器同步，重开仍在；引用定位高亮不生成批注。普通附件 PDF 不套用主论文批注，嵌入滚动不改写上次阅读页 | ☐ |
 
 ---
 
@@ -315,12 +343,14 @@ cargo test -p agentero-cli
 
 | # | 界面 | 操作 | 预期 | 结果 |
 |---|---|---|---|---|
-| 9.1 | 任意（有 Vault） | `⌘P` 或 `⌘K`，输入论文标题片段 | 列表出论文；回车打开 paper | ☐ |
+| 9.1 | 任意（有 Vault） | `⌘P`，输入论文标题片段 | 列表出论文；回车打开 paper | ☐ |
 | 9.2 | 命令面板 | 输入笔记里有的正文关键词 | 全文命中可打开对应 md | ☐ |
 | 9.3 | 任意 | `⇧⌘P` 或输入 `>`，执行一条内置命令 | 命令生效 | ☐ |
 | 9.4 | 命令面板打开时 | 再按 `⌘P` 或 `⌘W` | 面板关闭 | ☐ |
 | 9.5 | 任意 | `⌘,` | 设置浮层开关 | ☐ |
 | 9.6 | 任意 | `⇧⌘I` | 魔棒打开 | ☐ |
+| 9.7 | 命令面板 | `⌘P`，输入某论文的可见标签 | 论文列表按标签命中该 paper | ☐ |
+| 9.8 | 命令面板 | `⌘P`，输入某笔记/论文的 frontmatter alias | 「别名」分组命中，回车打开对应 paper / 笔记 | ☐ |
 
 ---
 
@@ -336,7 +366,10 @@ cargo test -p agentero-cli
 | 10.6 | 设置 → Agent | 确认 **入库后自动精读** 默认关 | 默认关闭 | ☐ |
 | 10.7 | 设置 → Agent | 权限模式切 restricted / ask / auto | 选项保存成功（行为见 §11） | ☐ |
 | 10.8 | 设置 → 翻译 | 切换 free / Agent 翻译 | 保存成功；PDF 划词翻译跟新设置 | ☐ |
-| 10.9 | 设置 → 通用 → 隐私 | 开关「本地使用记录」；再点清除 | 关闭后不再写入；清除后 CLI `usage timeline` 为空；与 PostHog 开关互不影响 | ☐ |
+| 10.8a | 设置（新装 / 删掉 `settings.json` 后重启） | 依次看翻译默认服务、Agent → Embedding 来源、版面解析 → 正文引擎 | 注入 key 的构建里三处默认都是「Agentero 内置」，且**看不到任何** Base URL / API Key / Model 输入框；未注入 key 的构建里三处回落 `tencenttransmart` / 自定义 / `local` | ☐ |
+| 10.8b | 设置 → 翻译 | 选「Agentero 内置」后在 PDF 划词翻译一段英文 | 出译文；失败时 Toast 是可读文案，**不裸露** `translate.no_builtin_key` 标记 | ☐ |
+| 10.8c | 设置 → Agent → Embedding | 已填过 Base URL / API Key / Model 的老配置升级后打开 | 来源被推断为「自定义接口」，三个输入框仍在且值未丢；**没有**被静默切到内置 | ☐ |
+| 10.9 | 设置 → 通用 → 隐私 | 开关「本地使用记录」；再点清除 | 关闭后不再写入；清除后本地使用记录为空；与 PostHog 开关互不影响 | ☐ |
 
 ---
 
@@ -349,7 +382,7 @@ cargo test -p agentero-cli
 | # | 界面 | 操作 | 预期 | 结果 |
 |---|---|---|---|---|
 | 11.0.1 | 右栏·Agent | 未配置 Agent 时打开面板 | 有安装/配置指引；**左栏库与 PDF 仍可用** | ☐ |
-| 11.0.2 | 设置 → Agent | 本机未装 Claude/Codex/OpenCode/Gemini 等预设 Agent 时，点「安装」/「安装 ACP」 | 静默执行官方 installer；安装成功后探测状态变绿 | ☐ |
+| 11.0.2 | 设置 → Agent | 本机未装 Claude/Codex/OpenCode 等预设 Agent 时，点「安装」/「安装 ACP」 | 静默执行官方 installer；安装成功后探测状态变绿 | ☐ |
 | 11.0.3 | 设置 → Agent | 已装 Agent 有可用更新时，点「升级」 | 升级成功；版本号或探测状态更新 | ☐ |
 
 ### 11.1 对话
@@ -365,6 +398,12 @@ cargo test -p agentero-cli
 | 11.1.7 | 右栏·Agent | 会话空闲时 hover 用户消息 → Edit → 改完重发 | 该消息之后内容丢弃，新 turn 发出 | ☐ |
 | 11.1.8 | 右栏·Agent | 切换历史会话 / 加载旧会话 | 能 list 并恢复（provider 支持时） | ☐ |
 | 11.1.9 | 右栏·Agent | 看回答中的 Sources（若 Agent 返回） | 展示读过的本地路径 | ☐ |
+| 11.1.10 | 右栏·Agent（支持 Client terminal 的 Agent） | 依次执行 `pwd`、`echo AGENTERO_SMOKE`，再启动长命令，发送 `wait_for_exit` 并在等待期间读取 output、kill、release | 前两条及时返回；wait 挂起时同连接仍能处理 output / kill / release，卡片最终 completed / failed | ☐ |
+| 11.1.11 | 右栏·Agent | 在工具卡 pending 时结束或取消回合，再依次接收迟到 progress、completion、progress | 回合结束后不保留永久 spinner；内容与终态按同一 toolCallId 修正原卡片，迟到 progress 不恢复 spinner，也不新增重复卡片 | ☐ |
+| 11.1.12 | Windows · 设置 → Agent | 原生 `.exe` 探针模拟 initialize 阻塞，等待 30 秒超时并重复探测；查看父子进程 | 探针没有新增外层 CMD；超时后目标 `.exe` 被回收。Pi / Custom / npm shim / Dsh 自带 launcher 的后代清理单独记录，见 [cwd 边界](../bug_fix/pi-acp-vault-cwd.md#5) | ☐ |
+| 11.1.13 | Windows · Dsh | 在含空格的用户路径与 Vault 下探测、发送一轮消息 | 仅使用 Dsh 自带 launcher，不新增双层 CMD；launcher 配置与认证可读取 | ☐ |
+| 11.1.14 | macOS · Finder 启动 | 打开本地 Vault，用 Codex 精读论文；无 Vault 时执行探针 | 会话进程 cwd 为 Vault，探针为 scratch；不因继承 `/` 触发 Music / Desktop / Downloads 等无关 TCC 弹窗 | ☐ |
+| 11.1.15 | Windows · Zcode | 打开含 `.agents/skills` 的 Vault，启动 Zcode 并查看技能列表 | 能索引到该目录下的 skill；设置页探针没有外层 CMD | ☐ |
 
 ### 11.2 权限
 
@@ -379,7 +418,7 @@ cargo test -p agentero-cli
 | # | 界面 | 操作 | 预期 | 结果 |
 |---|---|---|---|---|
 | 11.3.1 | 右栏·Agent（空态） | 点 Summarize / Ask library / Draft Related Work | 对**当前聚焦 paper** 发起对应 workflow | ☐ |
-| 11.3.2 | 左栏·树 | 找资源齐全且未读 paper，点 **Zap** | 任务条 paper-reader 进度；写/更新 `NOTES.md`；`is_read` 变已读；Zap 消失 | ☐ |
+| 11.3.2 | 左栏·树 | 找资源齐全且未读 paper，点 **精读图标** | 任务条 paper-reader 进度；写/更新 `NOTES.md`；`is_read` 变已读；图标消失 | ☐ |
 | 11.3.3 | 设置 → Agent | 打开 **入库后自动精读**；魔棒再入一篇未读 | 入库/下载完成后**自动**精读；任务条可见 | ☐ |
 | 11.3.4 | 魔棒 | 批量多 ID 入库（自动精读开着） | **不**对批量每篇连跑精读 | ☐ |
 | 11.3.5 | 右栏·Agent 历史 | 精读跑完后翻主对话列表 | 精读**不**出现在主 chat 历史 | ☐ |
@@ -417,7 +456,7 @@ agentero --vault /tmp/agentero-cli-vault paper list --json
 |---|---|---|---|---|
 | 13.1 | 终端 | `agentero --version` | 版本与发布一致 | ☐ |
 | 13.2 | 终端 | `vault create <空目录>` | 脚手架与 GUI Create 一致（含 catalog） | ☐ |
-| 13.3 | 终端 | `vault which --json` / `info` / `check` | JSON 可解析；退出码 0 | ☐ |
+| 13.3 | 终端 | `vault list --json` | JSON 可解析；退出码 0 | ☐ |
 | 13.4 | 终端 | `tree`；`paper list --json` | 与 catalog 一致 | ☐ |
 | 13.5 | 终端 | `paper tag add …`；`list --tag` | 标签生效 | ☐ |
 | 13.6 | 终端 | `import id 1706.03762`（需网） | 入库成功或稳定 `error.code` | ☐ |
@@ -453,6 +492,9 @@ agentero --vault /tmp/agentero-cli-vault paper list --json
 | Connector §6.4 | ☐ | ☐ | ☐ |
 | 远程 §12 | ☐ | ☐ | 12.9 拒绝 ☐ |
 | CLI §13 | ☐ | ☐ | ☐ |
+| 外壳右键集成 §0.3.5/0.3.6 | ☐ | N/A | ☐ |
+
+Windows ARM64 首次发版至少跑 §0.3 + §1：运行 `arm64-setup.exe`（x86 安装器由 Windows 11 ARM 模拟执行），确认任务管理器中 `agentero.exe` 为 ARM64，完成一次 PDF 解析；应用内“安装 CLI”应下载 `agentero-cli-<version>-aarch64-pc-windows-msvc.zip` 并成功执行 `agentero-cli --version`。
 
 ---
 
@@ -467,7 +509,7 @@ agentero --vault /tmp/agentero-cli-vault paper list --json
 | 打开杂乱文件夹自动整理 | Vault 采纳未交付 |
 | 与 Zotero 桌面同时占 23119 | 端口互斥 |
 | Windows 远程 Vault | 不支持 |
-| 应用内填模型 API Key | BYOA，不收集 |
+| 应用内填 **Agent** 的模型 API Key | BYOA，不收集；Agent 的 Key 由 Agent CLI 自己持有。（翻译 / 版面 / embedding 的 BYOK Key 与构建期内置 provider 凭证是另外两条路径，见 [release.md](release.md) §内置 Provider 构建期注入） |
 | 删除时确认框 / Undo toast | 产品设计为无确认进回收站 |
 
 ---

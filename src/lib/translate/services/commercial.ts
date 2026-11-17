@@ -1,5 +1,5 @@
+import { isSecretMask } from "@/lib/core/secret-mask";
 import { invokeTranslateText } from "@/lib/translate/api";
-import { isTranslateApiKeyMask } from "@/lib/translate/probe";
 import type {
 	CommercialTranslateProviderId,
 	TranslateService,
@@ -28,11 +28,18 @@ export function makeCommercialMtService(
 				sourceLang: task.sourceLang || "auto",
 				targetLang: task.targetLang,
 				provider: id,
+				dictionary:
+					task.context?.dictionary ??
+					task.context?.surface?.endsWith("-selection") ??
+					false,
+				dictionarySurrounding: task.context?.dictionarySurrounding,
+				dictionaryReference: task.context?.dictionaryReference,
 				// Never send the mask token as if it were a key.
-				apiKey: rawKey && !isTranslateApiKeyMask(rawKey) ? rawKey : undefined,
+				apiKey: rawKey && !isSecretMask(rawKey) ? rawKey : undefined,
 				baseUrl: cfg?.baseUrl,
 				region: cfg?.region,
 				model: cfg?.model,
+				extraRequestBody: cfg?.extraRequestBody,
 			});
 			task.result = result;
 		},

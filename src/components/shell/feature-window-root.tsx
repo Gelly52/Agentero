@@ -5,6 +5,8 @@
 
 import { lazy, Suspense, useEffect, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { TrafficLightSpacer } from "@/components/shell/traffic-light-spacer";
+import { WindowHeader } from "@/components/shell/window-header";
 import {
 	AnnotationsPanel,
 	type AskRow,
@@ -15,8 +17,9 @@ import {
 	useSettings,
 	useVaultStore,
 } from "@/hooks/use-app-stores";
+import { useExternalFileDrop } from "@/hooks/use-external-file-drop";
+import { useNativeSelectAllGuard } from "@/hooks/use-native-select-all-guard";
 import { applyAgentSessionHandoffOnce } from "@/lib/agent/agent-session-store";
-import { normalizeAgentSourcePath } from "@/lib/agent/sources";
 import { toVaultRelative } from "@/lib/core/path";
 import { isMacOS, isTauri } from "@/lib/core/tauri";
 import { toSafeDisposer } from "@/lib/core/tauri-events";
@@ -37,18 +40,15 @@ import {
 	wikiTargetForPaper,
 } from "@/lib/pdf/annotation-ref";
 import { listPdfAskThreads } from "@/lib/pdf/ask/io";
+import { closeCurrentWindow } from "@/lib/shell/close-window";
 import {
 	type FeatureViewType,
 	readFeatureWindowView,
 } from "@/lib/shell/feature-window";
 import { openSettingsWindow } from "@/lib/shell/settings-window";
+import { resolveShortcutId } from "@/lib/shell/shortcuts";
+import { setAgentPanelMounted } from "@/lib/shell/ui-store";
 import {
-	type AgentSessionOpenRequest,
-	setAgentPanelMounted,
-	uiStore,
-} from "@/lib/shell/ui-store";
-import {
-	listenAgentOpenSession,
 	listenAgentSessionHandoff,
 	listenWorkspaceActive,
 	type WorkspaceActiveChangedPayload,
@@ -57,25 +57,13 @@ import { joinVaultPath } from "@/lib/vault";
 import { openRecentVault } from "@/lib/vault/actions";
 import { refreshTree } from "@/lib/vault/store";
 import { rebuildWikiAndNotify } from "@/lib/wiki/store";
-import { openGraphPath } from "@/lib/workspace/actions";
+import { openCitation } from "@/lib/workspace/actions";
 
 const AgentPanel = lazy(() =>
 	import("@/components/agent/agent-panel").then((m) => ({
 		default: m.AgentPanel,
 	})),
 );
-
-function closeCurrentWindow() {
-	if (!isTauri()) return;
-	void (async () => {
-		try {
-			const { getCurrentWindow } = await import("@tauri-apps/api/window");
-			await getCurrentWindow().close();
-		} catch {
-			// ignore
-		}
-	})();
-}
 
 function readFeatureQuery(): {
 	vaultPath: string | null;
@@ -102,21 +90,13 @@ function viewTitleKey(
 			return "labels.agent";
 		case "annotations":
 			return "titlebar.annotationsPanel";
+		default:
+			return "labels.agent";
 	}
 }
 
 function handleAgentOpenSource(source: string): void {
-	const trimmed = normalizeAgentSourcePath(source);
-	if (!trimmed) return;
-	if (/^https?:\/\//i.test(trimmed)) {
-		void import("@tauri-apps/plugin-opener")
-			.then(({ openUrl }) => openUrl(trimmed))
-			.catch(() => {
-				window.open(trimmed, "_blank", "noopener,noreferrer");
-			});
-		return;
-	}
-	openGraphPath(trimmed);
+	openCitation(source);
 }
 
 function FeatureAnnotations({
@@ -247,11 +227,14 @@ function FeatureAnnotations({
 }
 
 export function FeatureWindowRoot() {
+	useExternalFileDrop();
+
 	const { t } = useTranslation(["app"]);
 	const view = useMemo(() => readFeatureWindowView() ?? "agent", []);
 	const bootQuery = useMemo(() => readFeatureQuery(), []);
 	const isMac = useMemo(() => isMacOS(), []);
 	const [ready, setReady] = useState(false);
+	useNativeSelectAllGuard();
 	const [followed, setFollowed] = useState<WorkspaceActiveChangedPayload>({
 		path: bootQuery.activePath,
 		vaultPath: bootQuery.vaultPath,
@@ -298,13 +281,6 @@ export function FeatureWindowRoot() {
 	useEffect(() => {
 		if (view !== "agent") return;
 		const offs = [
-			toSafeDisposer(
-				listenAgentOpenSession((payload) => {
-					const req = payload as AgentSessionOpenRequest;
-					if (!req || typeof req !== "object" || !("nonce" in req)) return;
-					uiStore.setState({ agentSessionOpenRequest: req });
-				}),
-			),
 			// First handoff only — later retries must not clobber in-window chat.
 			toSafeDisposer(
 				listenAgentSessionHandoff((payload) => {
@@ -323,11 +299,13 @@ export function FeatureWindowRoot() {
 
 	useEffect(() => {
 		const onKeyDown = (event: KeyboardEvent) => {
-			const isEsc = event.key === "Escape";
-			const isCloseWindow =
-				(event.key === "w" || event.code === "KeyW") &&
-				(event.metaKey || event.ctrlKey);
-			if (isEsc || (isCloseWindow && !event.altKey && !event.shiftKey)) {
+			if (
+				event.defaultPrevented ||
+				document.querySelector("[data-shortcut-recording]")
+			)
+				return;
+			const id = resolveShortcutId(event, { settingsOpen: true });
+			if (id === "closeSheet" || id === "closeTab") {
 				event.preventDefault();
 				closeCurrentWindow();
 			}
@@ -356,18 +334,15 @@ export function FeatureWindowRoot() {
 	return (
 		<div className="flex h-screen w-screen flex-col overflow-hidden bg-background">
 			{isMac ? (
-				<header className="flex h-8 shrink-0 items-center border-b bg-muted/40 select-none">
+				<WindowHeader>
+					<TrafficLightSpacer />
 					<div
-						className="w-[92px] shrink-0 self-stretch"
-						data-tauri-drag-region
-					/>
-					<div
-						className="min-w-0 flex-1 truncate px-2 text-xs font-medium text-muted-foreground"
+						className="min-w-0 flex-1 truncate px-2 text-sm font-medium text-muted-foreground"
 						data-tauri-drag-region
 					>
 						{title}
 					</div>
-				</header>
+				</WindowHeader>
 			) : null}
 
 			<div className="flex min-h-0 flex-1 flex-col overflow-hidden">

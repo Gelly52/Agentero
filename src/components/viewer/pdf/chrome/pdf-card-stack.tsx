@@ -1,3 +1,5 @@
+import { AnimatePresence } from "motion/react";
+import { memo, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 import { AskPopover } from "@/components/viewer/pdf/cards/ask-popover";
 import {
@@ -5,41 +7,40 @@ import {
 	PdfCitationPreview,
 } from "@/components/viewer/pdf/cards/citation-preview";
 import { PdfCrossrefPreview } from "@/components/viewer/pdf/cards/crossref-preview";
+import { PdfLinkUrlTip } from "@/components/viewer/pdf/cards/link-url-tip";
 import { SelectionMenu } from "@/components/viewer/pdf/cards/selection-menu";
 import { TranslateCard } from "@/components/viewer/pdf/cards/translate-card";
-import { VisualAnnotationEditor } from "@/components/viewer/pdf/cards/visual-annotation-editor";
 import { VisualTraceCard } from "@/components/viewer/pdf/cards/visual-trace-card";
+import type { LinkUrlTipState } from "@/components/viewer/pdf/hooks/use-pdf-link-url-tip";
 import type {
 	CardScreenPoint,
 	CitationPreviewState,
 	CrossrefPreviewState,
 	SelectionMenuState,
-	VisualDraftEditorState,
 } from "@/components/viewer/pdf/types";
 import type { PdfVisualSessionTrace } from "@/lib/pdf/agent-trace";
 import type { PdfAskThread } from "@/lib/pdf/ask";
 import type { HighlightColor } from "@/lib/pdf/highlight/palette";
+import type { PdfTextMarkupKind } from "@/lib/pdf/highlight/types";
 import type { PdfTranslateRecord } from "@/lib/pdf/translate/types";
+import type { MenuContext } from "@/lib/shell/commands/menu-contributions";
+import type { SelectionTranslateMode } from "@/lib/translate/types";
 
 type PdfCardStackProps = {
 	selectionMenu: {
 		state: SelectionMenuState | null;
-		onHighlight: (color: HighlightColor) => void;
-		onCopy: () => void;
-		onNote: () => void;
+		onHighlight: (color: HighlightColor, shape: PdfTextMarkupKind) => void;
 		onAsk: () => void;
 		onAddToChat: () => void;
 		onTranslate: () => void;
-		onClose: () => void;
-	};
-	visualDraft: {
-		state: VisualDraftEditorState | null;
-		onSave: (comment: string) => void;
-		onAddToChat: (comment: string) => void;
-		onSendNow: (comment: string) => void;
-		/** Discard the pending crop. */
-		onDelete: () => void;
-		onClose: () => void;
+		onCopy?: () => Promise<boolean>;
+		onBookmark?: () => void;
+		onNote?: (shape: PdfTextMarkupKind) => void;
+		/** Hide highlight / translate (no marks/ to persist into); keep Ask. */
+		showHighlight?: boolean;
+		showTranslate?: boolean;
+		/** Passed through to the PDF toolbar. Omitted by other SelectionMenu callers. */
+		contributionContext?: MenuContext;
 	};
 	citationPreview: {
 		state: CitationPreviewState | null;
@@ -52,9 +53,14 @@ type PdfCardStackProps = {
 		onHoverEnter: () => void;
 		onHoverLeave: () => void;
 	};
-	/** Shared anchor of the pin-attached cards (ask / visual trace / translate). */
+	linkUrlTip: {
+		state: LinkUrlTipState | null;
+		onHoverEnter: () => void;
+		onHoverLeave: () => void;
+	};
+	/** Shared anchor of the pin-attached cards (ask / translate). */
 	cardScreen: CardScreenPoint | null;
-	/** Shared hover-hide contract of the pin-attached cards and the editor. */
+	/** Shared hover-hide contract of the pin-attached cards. */
 	onCardHoverEnter: () => void;
 	onCardHoverLeave: () => void;
 	ask: {
@@ -71,69 +77,91 @@ type PdfCardStackProps = {
 		onDelete: () => void;
 		onStop: () => void;
 	};
-	visualTrace: {
-		trace: PdfVisualSessionTrace | null;
-		error: string | null;
-		initialExpanded: boolean;
-		onOpenSession: () => void;
-		onAddToChat: () => void;
-		onSaveComment: (comment: string) => void;
-		onSend: (question: string) => void;
-		onDelete: () => void;
-		onHide: () => void;
-		onStop: () => void;
-	};
 	translate: {
 		record: PdfTranslateRecord | null;
+		onModeChange?: (mode: SelectionTranslateMode) => void;
 		streaming: boolean;
 		error: string | null;
 		onOpenSettings: () => void;
+		onTogglePin?: () => void;
+		onHide: () => void;
+	};
+	visual: {
+		trace: PdfVisualSessionTrace | null;
 		onHide: () => void;
 		onDelete: () => void;
 	};
 };
 
+/** Stable across scroll re-place; changes when the selection itself changes. */
+function selectionMenuInstanceKey(state: SelectionMenuState): string {
+	const rect = state.anchor.rects[0];
+	if (!rect) return String(state.anchor.page);
+	return `${state.anchor.page}:${rect.x}:${rect.y}:${rect.w}:${rect.h}`;
+}
+
+/**
+ * Clip page-anchored cards to the reading area. The wrapper is window-sized
+ * (`inset-0`) so the card keeps its client coordinates, and `clip-path` makes
+ * it the containing block for the fixed card — without it the card would keep
+ * painting over the tab strip once its text scrolls above the viewport.
+ */
+function PageClip({
+	inset,
+	children,
+}: {
+	inset: CardScreenPoint["clipInset"];
+	children: ReactNode;
+}) {
+	if (!inset) return <>{children}</>;
+	return (
+		<div
+			className="pointer-events-none fixed inset-0 z-50 [&>*]:pointer-events-auto"
+			style={{
+				clipPath: `inset(${inset.top}px ${inset.right}px ${inset.bottom}px ${inset.left}px)`,
+			}}
+		>
+			{children}
+		</div>
+	);
+}
+
 /**
  * Floating cards of the viewer, portaled to `document.body` so page transforms
- * and the scroller's overflow never clip or scale them.
+ * and the scroller's overflow never clip them. Cards keep a fixed UI size and
+ * type scale at any PDF zoom; their screen anchors still follow the page.
  */
-export function PdfCardStack({
+export const PdfCardStack = memo(function PdfCardStack({
 	selectionMenu,
-	visualDraft,
 	citationPreview,
 	crossrefPreview,
+	linkUrlTip,
 	cardScreen,
 	onCardHoverEnter,
 	onCardHoverLeave,
 	ask,
-	visualTrace,
 	translate,
+	visual,
 }: PdfCardStackProps) {
 	if (typeof document === "undefined") return null;
 
 	return createPortal(
-		<>
+		<div>
 			{selectionMenu.state ? (
 				<SelectionMenu
+					key={selectionMenuInstanceKey(selectionMenu.state)}
 					screen={selectionMenu.state.screen}
 					onHighlight={selectionMenu.onHighlight}
-					onCopy={selectionMenu.onCopy}
-					onNote={selectionMenu.onNote}
 					onAsk={selectionMenu.onAsk}
 					onAddToChat={selectionMenu.onAddToChat}
 					onTranslate={selectionMenu.onTranslate}
-					onClose={selectionMenu.onClose}
-				/>
-			) : null}
-
-			{visualDraft.state ? (
-				<VisualAnnotationEditor
-					screen={visualDraft.state.screen}
-					onSave={visualDraft.onSave}
-					onAddToChat={visualDraft.onAddToChat}
-					onSendNow={visualDraft.onSendNow}
-					onDelete={visualDraft.onDelete}
-					onClose={visualDraft.onClose}
+					onCopy={selectionMenu.onCopy}
+					onBookmark={selectionMenu.onBookmark}
+					onNote={selectionMenu.onNote}
+					showHighlight={selectionMenu.showHighlight}
+					showTranslate={selectionMenu.showTranslate}
+					selectionText={selectionMenu.state.anchor.quote}
+					contributionContext={selectionMenu.contributionContext}
 				/>
 			) : null}
 
@@ -153,64 +181,80 @@ export function PdfCardStack({
 					kind={crossrefPreview.state.kind}
 					page={crossrefPreview.state.page}
 					image={crossrefPreview.state.image}
+					targetSize={crossrefPreview.state.targetSize}
 					onPointerEnter={crossrefPreview.onHoverEnter}
 					onPointerLeave={crossrefPreview.onHoverLeave}
 				/>
 			) : null}
 
-			{ask.thread && cardScreen ? (
-				<AskPopover
-					thread={ask.thread}
-					paperTitle={ask.paperTitle}
-					paperLink={ask.paperLink}
-					screen={cardScreen}
-					preferRight={cardScreen.preferRight ?? true}
-					streaming={ask.streaming}
-					error={ask.error}
-					onSend={ask.onSend}
-					onResend={ask.onResend}
-					onHide={ask.onHide}
-					onDelete={ask.onDelete}
-					onPointerEnter={onCardHoverEnter}
-					onPointerLeave={onCardHoverLeave}
-					onStop={ask.onStop}
+			{linkUrlTip.state ? (
+				<PdfLinkUrlTip
+					url={linkUrlTip.state.url}
+					screen={linkUrlTip.state.screen}
+					onPointerEnter={linkUrlTip.onHoverEnter}
+					onPointerLeave={linkUrlTip.onHoverLeave}
 				/>
 			) : null}
 
-			{visualTrace.trace && cardScreen ? (
-				<VisualTraceCard
-					trace={visualTrace.trace}
-					screen={cardScreen}
-					preferRight={cardScreen.preferRight ?? true}
-					error={visualTrace.error}
-					initialExpanded={visualTrace.initialExpanded}
-					onOpenSession={visualTrace.onOpenSession}
-					onAddToChat={visualTrace.onAddToChat}
-					onSaveComment={visualTrace.onSaveComment}
-					onSend={visualTrace.onSend}
-					onDelete={visualTrace.onDelete}
-					onHide={visualTrace.onHide}
-					onPointerEnter={onCardHoverEnter}
-					onPointerLeave={onCardHoverLeave}
-					onStop={visualTrace.onStop}
-				/>
-			) : null}
+			<AnimatePresence>
+				{ask.thread && cardScreen ? (
+					<AskPopover
+						key={`ask-${ask.thread.id}`}
+						thread={ask.thread}
+						paperTitle={ask.paperTitle}
+						paperLink={ask.paperLink}
+						screen={cardScreen}
+						preferRight={cardScreen.preferRight ?? true}
+						streaming={ask.streaming}
+						error={ask.error}
+						onSend={ask.onSend}
+						onResend={ask.onResend}
+						onHide={ask.onHide}
+						onDelete={ask.onDelete}
+						onPointerEnter={onCardHoverEnter}
+						onPointerLeave={onCardHoverLeave}
+						onStop={ask.onStop}
+					/>
+				) : null}
+			</AnimatePresence>
 
 			{translate.record && cardScreen ? (
-				<TranslateCard
-					screen={cardScreen}
-					preferRight={cardScreen.preferRight ?? true}
-					result={translate.record.result ?? ""}
-					streaming={translate.streaming}
-					error={translate.error ?? translate.record.error ?? null}
-					onOpenSettings={translate.onOpenSettings}
-					onHide={translate.onHide}
-					onDelete={translate.onDelete}
-					onPointerEnter={onCardHoverEnter}
-					onPointerLeave={onCardHoverLeave}
-				/>
+				<PageClip inset={cardScreen.clipInset}>
+					<TranslateCard
+						key={`translate-${translate.record.id}`}
+						screen={cardScreen}
+						preferRight={cardScreen.preferRight ?? false}
+						result={translate.record.result ?? ""}
+						streaming={translate.streaming}
+						error={translate.error ?? translate.record.error ?? null}
+						pinned={translate.record.pinned}
+						onTogglePin={translate.onTogglePin}
+						onOpenSettings={translate.onOpenSettings}
+						onHide={translate.onHide}
+						onPointerEnter={onCardHoverEnter}
+						onPointerLeave={onCardHoverLeave}
+						sourceText={translate.record.quote}
+						mode={translate.record.mode}
+						onModeChange={translate.onModeChange}
+					/>
+				</PageClip>
 			) : null}
-		</>,
+
+			<AnimatePresence>
+				{visual.trace && cardScreen ? (
+					<VisualTraceCard
+						key={`visual-${visual.trace.id}`}
+						trace={visual.trace}
+						screen={cardScreen}
+						preferRight={cardScreen.preferRight ?? true}
+						onHide={visual.onHide}
+						onDelete={visual.onDelete}
+						onPointerEnter={onCardHoverEnter}
+						onPointerLeave={onCardHoverLeave}
+					/>
+				) : null}
+			</AnimatePresence>
+		</div>,
 		document.body,
 	);
-}
+});

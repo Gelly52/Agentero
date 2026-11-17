@@ -9,9 +9,16 @@ permissions:
   contents: write
 
 jobs:
+  checks:
+    name: Validate release commit
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+
   # Shared draft so installers + CLI can upload in parallel without racing create.
   prepare:
     name: Create draft release
+    needs: checks
     runs-on: ubuntu-latest
     steps:
       - name: Verify updater signing configuration
@@ -41,6 +48,7 @@ jobs:
 
             ## Desktop
             Platform installers from Tauri (see assets below).
+            Windows ARM64 ships as the `arm64-setup.exe` NSIS installer (no MSI); the installed app is native ARM64.
 
             ## Android
             `Agentero_<version>_aarch64.apk` — arm64 devices, Android 7.0+.
@@ -56,7 +64,7 @@ jobs:
             ```bash
             agentero --version
             agentero open ~/research   # or: agentero ~/research
-            agentero vault which --json
+            agentero vault list --json
             ```
 
             Source install (slow; pulls desktop Rust deps):
@@ -73,7 +81,19 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        platform: [macos-latest, ubuntu-22.04, ubuntu-24.04-arm, windows-latest]
+        include:
+          - platform: macos-latest
+          - platform: macos-15-intel
+          - platform: ubuntu-22.04
+          - platform: ubuntu-24.04-arm
+          - platform: windows-latest
+            msvc_arch: x64
+          # Native ARM64 runner; NSIS is the only bundle target Tauri supports
+          # for aarch64 Windows (MSI requires WiX x86/x64). The installer itself
+          # stays x86 and runs under Windows 11 emulation; the app is ARM64.
+          - platform: windows-11-arm
+            msvc_arch: arm64
+            tauri_args: --target aarch64-pc-windows-msvc --bundles nsis
 
     steps:
       - name: Checkout repository
@@ -96,6 +116,11 @@ jobs:
       - name: Setup MSVC developer environment
         if: runner.os == 'Windows'
         uses: ilammy/msvc-dev-cmd@v1
+        with:
+          # Native ARM64 toolchain on windows-11-arm. Without this the action
+          # defaults to x64, which would build the C dependencies (SQLite,
+          # leptonica/tesseract) for the wrong architecture.
+          arch: ${{ matrix.msvc_arch }}
 
       - name: Install Linux dependencies
         if: startsWith(matrix.platform, 'ubuntu-')
@@ -111,7 +136,7 @@ jobs:
       - name: Install frontend dependencies
         run: pnpm install --frozen-lockfile
 
-      # macOS: Developer ID signing + notarytool (see docs/development/macos-signing.md).
+      # macOS: Developer ID signing + notarytool (see docs/test/macos-signing.md).
       # Without APPLE_CERTIFICATE the build still runs unsigned (existing behavior).
       # Do NOT pass empty APPLE_TEAM_ID/APPLE_ID via the build env — empty strings make
       # Tauri/notarytool fail with "Team ID must be at least 3 characters".
@@ -176,10 +201,25 @@ jobs:
       - name: Build Tauri installers
         uses: tauri-apps/tauri-action@v1
         env:
+          VITE_AGENTERO_ACCOUNT_SURFACE: "0"
+          # macos-latest runners have 7GB RAM, so Node's default ~2GB heap
+          # limit is not enough for `vite build` on this bundle.
+          NODE_OPTIONS: --max-old-space-size=6144
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           # PostHog project API key baked in at compile time (build.rs);
           # empty/absent secret compiles telemetry out. See docs/backend/telemetry.md.
           AGENTERO_POSTHOG_KEY: ${{ secrets.POSTHOG_KEY }}
+          # Optional. When all four are set, About feedback lands in that
+          # PostHog API survey. Absent secrets still build; feedback is sent
+          # as a `feedback submitted` activity event. See docs/backend/telemetry.md.
+          AGENTERO_POSTHOG_SURVEY_ID: ${{ secrets.POSTHOG_SURVEY_ID }}
+          AGENTERO_POSTHOG_SURVEY_KIND_ID: ${{ secrets.POSTHOG_SURVEY_KIND_ID }}
+          AGENTERO_POSTHOG_SURVEY_MESSAGE_ID: ${{ secrets.POSTHOG_SURVEY_MESSAGE_ID }}
+          AGENTERO_POSTHOG_SURVEY_CONTACT_ID: ${{ secrets.POSTHOG_SURVEY_CONTACT_ID }}
+          # Built-in provider gateway key, baked in at compile time (build.rs);
+          # empty/absent secret still builds, but ships without the built-in
+          # provider, so verify it after release. See docs/backend/builtin-provider.md.
+          AGENTERO_BUILTIN_API_KEY: ${{ secrets.AGENTERO_BUILTIN_API_KEY }}
           # Tauri updater signature, independent from Apple code signing.
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
@@ -195,6 +235,9 @@ jobs:
           # APPLE_API_KEY_PATH, APPLE_ID, APPLE_PASSWORD, APPLE_TEAM_ID come from
           # the prepare step via GITHUB_ENV only when non-empty.
         with:
+          # windows-11-arm passes an explicit target + NSIS-only bundle; other
+          # entries leave it empty and build for the runner's host.
+          args: ${{ matrix.tauri_args }}
           tagName: ${{ github.ref_name }}
           releaseName: Agentero ${{ github.ref_name }}
           # Body is set by the prepare job; keep draft + same tag.
@@ -205,6 +248,24 @@ jobs:
           uploadUpdaterJson: true
           uploadUpdaterSignatures: true
           updaterJsonPreferNsis: true
+
+  # tauri-action writes api.github.com asset URLs into latest.json; anonymous
+  # API requests share a 60/hour per-IP quota, so updater downloads 403 behind
+  # shared NATs. Rewrite them to CDN download URLs once all installers are up.
+  updater-json:
+    name: Rewrite updater manifest
+    needs: installers
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Point updater downloads at the release CDN
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPOSITORY: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: node scripts/rewrite-updater-json.mjs
 
   # Android ships its own signed APK into the same draft. Kept out of the
   # `installers` matrix because it needs the Android SDK/NDK and a keystore
@@ -354,7 +415,17 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        platform: [macos-latest, ubuntu-22.04, ubuntu-24.04-arm, windows-latest]
+        include:
+          - platform: macos-latest
+          - platform: ubuntu-22.04
+          - platform: ubuntu-24.04-arm
+          - platform: windows-latest
+            msvc_arch: x64
+          # The CLI archive name carries the rust host triple, so this emits
+          # agentero-cli-<version>-aarch64-pc-windows-msvc.zip for in-app installs
+          # on the ARM64 desktop build.
+          - platform: windows-11-arm
+            msvc_arch: arm64
 
     steps:
       - name: Checkout repository
@@ -366,6 +437,10 @@ jobs:
       - name: Setup MSVC developer environment
         if: runner.os == 'Windows'
         uses: ilammy/msvc-dev-cmd@v1
+        with:
+          # Native ARM64 toolchain on windows-11-arm; the CLI links the same C
+          # dependencies (SQLite, leptonica/tesseract) as the desktop app.
+          arch: ${{ matrix.msvc_arch }}
 
       # agentero-cli path-depends agentero_lib (Tauri), so Linux still needs WebKit link libs.
       - name: Install Linux dependencies
@@ -380,27 +455,21 @@ jobs:
 
       # tauri.macos.conf.json lists pdfium/libpdfium.dylib under
       # bundle.macOS.frameworks; tauri-build hard-fails when the file is
-      # missing even when only compiling the headless CLI. This job has no
-      # Node setup, so download the binary directly (tag must stay in sync
-      # with scripts/prepare-pdfium.mjs).
-      - name: Stage PDFium for Tauri build-script
-        if: runner.os == 'macOS'
-        shell: bash
-        run: |
-          set -euo pipefail
-          tag="chromium/7897"
-          case "$(uname -m)" in
-            arm64 | aarch64) asset="pdfium-mac-arm64" ;;
-            *) asset="pdfium-mac-x64" ;;
-          esac
-          tmp="$(mktemp -d)"
-          url="https://github.com/run-llama/pdfium-binaries/releases/download/${tag/\//%2F}/${asset}.tgz"
-          echo "Downloading $url"
-          curl -fsSL "$url" | tar -xz -C "$tmp"
-          test -f "$tmp/lib/libpdfium.dylib"
-          mkdir -p src-tauri/pdfium
-          cp "$tmp/lib/libpdfium.dylib" src-tauri/pdfium/libpdfium.dylib
-          rm -rf "$tmp"
+      # missing even when only compiling the headless CLI. Every platform
+      # stages the same library so the CLI archive can ship it beside the
+      # binary — liteparse dlopens PDFium, and the path baked at compile time
+      # is this runner's cache, which does not exist on a user machine.
+      # The staging script owns the release tag and the download fallbacks.
+      - name: Setup Node.js for PDFium staging
+        uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          package-manager-cache: false
+
+      - name: Stage PDFium
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: node scripts/prepare-pdfium.mjs
 
       - name: Build agentero CLI (release)
         run: cargo build -p agentero-cli --release
@@ -418,15 +487,29 @@ jobs:
           mkdir -p "$STAGE"
           # Cargo bin is `agentero-cli` (no collision with GUI `agentero`);
           # archive still exposes the user-facing name `agentero`.
+          # PDFium sits beside that binary. bundled_pdfium_dir looks there;
+          # a stock PDFium build is not a substitute.
+          if [[ "${{ runner.os }}" == "Windows" ]]; then
+            PDFIUM_NAME="pdfium.dll"
+          elif [[ "${{ runner.os }}" == "macOS" ]]; then
+            PDFIUM_NAME="libpdfium.dylib"
+          else
+            PDFIUM_NAME="libpdfium.so"
+          fi
+          if [[ ! -f "src-tauri/pdfium/${PDFIUM_NAME}" ]]; then
+            echo "refusing to package CLI without src-tauri/pdfium/${PDFIUM_NAME}" >&2
+            exit 1
+          fi
+          cp "src-tauri/pdfium/${PDFIUM_NAME}" "$STAGE/${PDFIUM_NAME}"
           if [[ "${{ runner.os }}" == "Windows" ]]; then
             cp "target/release/agentero-cli.exe" "$STAGE/agentero.exe"
             powershell.exe -NoProfile -Command \
-              "Compress-Archive -Path '${STAGE}/agentero.exe' -DestinationPath '${OUT_DIR}/${STAGE}.zip' -Force"
+              "Compress-Archive -Path '${STAGE}/agentero.exe','${STAGE}/${PDFIUM_NAME}' -DestinationPath '${OUT_DIR}/${STAGE}.zip' -Force"
             echo "CLI_ASSET=${OUT_DIR}/${STAGE}.zip" >> "$GITHUB_ENV"
           else
             cp "target/release/agentero-cli" "$STAGE/agentero"
             chmod +x "$STAGE/agentero"
-            tar -C "$STAGE" -czf "${OUT_DIR}/${STAGE}.tar.gz" agentero
+            tar -C "$STAGE" -czf "${OUT_DIR}/${STAGE}.tar.gz" agentero "${PDFIUM_NAME}"
             echo "CLI_ASSET=${OUT_DIR}/${STAGE}.tar.gz" >> "$GITHUB_ENV"
           fi
           ls -la "$OUT_DIR"

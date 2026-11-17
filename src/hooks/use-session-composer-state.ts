@@ -6,6 +6,7 @@ import {
 	useRef,
 	useState,
 } from "react";
+import { useAgentSessionScope } from "@/lib/agent/agent-session-store";
 import {
 	type AgentComposerState,
 	clearSubmittedComposerState,
@@ -14,6 +15,12 @@ import {
 	removeAgentComposerState,
 	saveAgentComposerState,
 } from "@/lib/agent/composer-state";
+import {
+	activateVisualDraftSession as activateRailVisualDraftSession,
+	clearVisualDraftSession as clearRailVisualDraftSession,
+	rebindVisualDraftSession as rebindRailVisualDraftSession,
+	visualDraftSessionKey,
+} from "@/lib/agent/visual-context-store";
 
 type SessionComposerStateOptions = {
 	vaultPath: string | null;
@@ -22,7 +29,7 @@ type SessionComposerStateOptions = {
 	defaultIncludeSelectedFile: boolean;
 };
 
-type ComposerIdentity = {
+export type ComposerIdentity = {
 	scopeKey: string | null;
 	sessionId: string;
 };
@@ -44,13 +51,46 @@ function browserStorage(): Storage | null {
 	}
 }
 
+/** Live composer state plus the session-scoped persistence API around it. */
+export type SessionComposerStateApi = AgentComposerState & {
+	activateSession: (sessionId: string) => void;
+	completeSubmission: (
+		sessionId: string,
+		submitted: AgentComposerState,
+	) => void;
+	migrateSession: (sessionId: string) => void;
+	resetSession: (sessionId: string) => void;
+	setIncludeSelectedFile: Dispatch<SetStateAction<boolean>>;
+	setMentionedPaths: Dispatch<SetStateAction<string[]>>;
+	setSelectedSkillIds: Dispatch<SetStateAction<string[]>>;
+	setText: Dispatch<SetStateAction<string>>;
+	snapshot: () => AgentComposerState;
+	/** Session the composer text belongs to. Updated before React state flushes. */
+	composerIdentity: () => ComposerIdentity;
+};
+
+function noopVisualDraftSession(..._keys: string[]): void {}
+
 export function useSessionComposerState({
 	vaultPath,
 	agentId,
 	sessionId,
 	defaultIncludeSelectedFile,
-}: SessionComposerStateOptions) {
-	const scopeKey = composerScopeKey(vaultPath, agentId);
+}: SessionComposerStateOptions): SessionComposerStateApi {
+	const { scopeId } = useAgentSessionScope();
+	// PDF visual drafts follow the rail composer only; other chat surfaces
+	// (Zen slots) must not move the app-wide active draft bucket.
+	const railScope = scopeId === null;
+	const activateVisualDraftSession = railScope
+		? activateRailVisualDraftSession
+		: noopVisualDraftSession;
+	const clearVisualDraftSession = railScope
+		? clearRailVisualDraftSession
+		: noopVisualDraftSession;
+	const rebindVisualDraftSession = railScope
+		? rebindRailVisualDraftSession
+		: noopVisualDraftSession;
+	const scopeKey = composerScopeKey(vaultPath, agentId, scopeId);
 	const defaultIncludeSelectedFileRef = useRef(defaultIncludeSelectedFile);
 	defaultIncludeSelectedFileRef.current = defaultIncludeSelectedFile;
 	const identityRef = useRef<ComposerIdentity>({ scopeKey, sessionId });
@@ -121,6 +161,11 @@ export function useSessionComposerState({
 		(value) => updateField("text", value),
 		[updateField],
 	);
+	const composerIdentity = useCallback(
+		(): ComposerIdentity => identityRef.current,
+		[],
+	);
+	const snapshot = useCallback(() => stateRef.current, []);
 	const setMentionedPaths: Dispatch<SetStateAction<string[]>> = useCallback(
 		(value) => updateField("mentionedPaths", value),
 		[updateField],
@@ -141,22 +186,32 @@ export function useSessionComposerState({
 				sessionId: nextSessionId,
 			};
 			identityRef.current = nextIdentity;
+			activateVisualDraftSession(
+				visualDraftSessionKey(nextIdentity.scopeKey, nextIdentity.sessionId),
+			);
 			const next = readState(nextIdentity);
 			stateRef.current = next;
 			setState(next);
 		},
-		[readState],
+		[activateVisualDraftSession, readState],
 	);
 
 	const resetSession = useCallback(
 		(nextSessionId: string) => {
-			identityRef.current = {
+			const nextIdentity = {
 				scopeKey: identityRef.current.scopeKey,
 				sessionId: nextSessionId,
 			};
+			identityRef.current = nextIdentity;
+			const sessionKey = visualDraftSessionKey(
+				nextIdentity.scopeKey,
+				nextIdentity.sessionId,
+			);
+			clearVisualDraftSession(sessionKey);
+			activateVisualDraftSession(sessionKey);
 			commitState(emptyComposerState(defaultIncludeSelectedFileRef.current));
 		},
-		[commitState],
+		[activateVisualDraftSession, clearVisualDraftSession, commitState],
 	);
 
 	const rebindSession = useCallback(
@@ -174,13 +229,20 @@ export function useSessionComposerState({
 					previousIdentity.sessionId,
 				);
 			}
+			rebindVisualDraftSession(
+				visualDraftSessionKey(
+					previousIdentity.scopeKey,
+					previousIdentity.sessionId,
+				),
+				visualDraftSessionKey(previousIdentity.scopeKey, nextSessionId),
+			);
 			identityRef.current = {
 				scopeKey: previousIdentity.scopeKey,
 				sessionId: nextSessionId,
 			};
 			commitState(next);
 		},
-		[commitState],
+		[commitState, rebindVisualDraftSession],
 	);
 
 	const migrateSession = useCallback(
@@ -198,8 +260,10 @@ export function useSessionComposerState({
 
 	useLayoutEffect(() => {
 		const current = identityRef.current;
-		if (current.scopeKey === scopeKey && current.sessionId === sessionId)
+		if (current.scopeKey === scopeKey && current.sessionId === sessionId) {
+			activateVisualDraftSession(visualDraftSessionKey(scopeKey, sessionId));
 			return;
+		}
 		const nextIdentity = { scopeKey, sessionId };
 		identityRef.current = nextIdentity;
 		if (
@@ -210,13 +274,25 @@ export function useSessionComposerState({
 				stateRef.current.mentionedPaths.length > 0 ||
 				stateRef.current.selectedSkillIds.length > 0)
 		) {
+			rebindVisualDraftSession(
+				visualDraftSessionKey(current.scopeKey, current.sessionId),
+				visualDraftSessionKey(scopeKey, sessionId),
+			);
 			commitState(stateRef.current);
 			return;
 		}
+		activateVisualDraftSession(visualDraftSessionKey(scopeKey, sessionId));
 		const next = readState(nextIdentity);
 		stateRef.current = next;
 		setState(next);
-	}, [commitState, readState, scopeKey, sessionId]);
+	}, [
+		activateVisualDraftSession,
+		commitState,
+		readState,
+		rebindVisualDraftSession,
+		scopeKey,
+		sessionId,
+	]);
 
 	return {
 		...state,
@@ -228,6 +304,7 @@ export function useSessionComposerState({
 		setMentionedPaths,
 		setSelectedSkillIds,
 		setText,
-		snapshot: () => stateRef.current,
+		snapshot,
+		composerIdentity,
 	};
 }

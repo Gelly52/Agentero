@@ -3,12 +3,16 @@
 ## GitHub Actions (recommended)
 
 `.github/workflows/ios-testflight.yml` builds a signed IPA and uploads it to
-App Store Connect. It runs on `v*` tag pushes (alongside the desktop Release
-workflow) and can be triggered manually from the Actions tab.
+App Store Connect. It is triggered on demand (`workflow_dispatch`) from the
+Actions tab or `gh workflow run`; desktop tag pushes do not build iOS.
 
-When the signing secrets are not configured, an automatic tag run exits
-successfully with a warning and skips the iOS build. A manually triggered run
-still fails during preflight so missing release configuration is explicit.
+> Status (2026-10-16): iOS publishing is frozen. No TestFlight builds are
+> produced automatically; run the workflow manually when an iOS build is
+> needed. To resume automatic publishing, add `push.tags: ["v*"]` back to the
+> workflow trigger.
+
+When the signing secrets are not configured, a manual run fails during
+preflight so missing release configuration is explicit.
 
 Required secrets (org or repo level):
 
@@ -147,7 +151,7 @@ Provide **App Review Notes** that explain:
    code visible.
 3. On iOS: Scan QR, or paste a pairing link (`agentero://pair#offer=...`).
 4. Confirm the code; then exercise Library → PDF / Notes → Agent over
-   `wss://relay.philfan.cn`.
+   `wss://relay.agentero.app`.
 
 Paste the full English **App Review notes** block under
 [App Store Connect Metadata](#app-store-connect-metadata). Keep the same
@@ -175,7 +179,7 @@ core flows cannot be verified without pairing.
 | **External TestFlight** | Yes (Beta App Review) | No | Same Sign-in = No + pairing Notes; beta contact info |
 | **App Store version** | Yes (full App Review) | No | Same fields + privacy, screenshots, export compliance, etc. |
 
-Ensure `relay.philfan.cn` (or the relay named in Notes) is up for the whole
+Ensure `relay.agentero.app` (or the relay named in Notes) is up for the whole
 review window.
 
 ## App Store Connect Metadata
@@ -220,7 +224,7 @@ NOTES.md editor and write back to the desktop.
 
 CHAT WITH YOUR OWN AGENT
 Use the Agent tab to talk to the ACP Agent you already have installed
-on your computer — Claude, Codex, OpenCode, Gemini, Qoder, Grok, or
+on your computer — Claude, Codex, OpenCode, Qoder, Grok, or
 any ACP-compatible CLI. Streaming replies, history, and permission
 prompts are forwarded from the desktop.
 
@@ -281,13 +285,13 @@ reviewer needs:
    Confirm the 6-digit code matches.
 4. Once paired, the Library, PDF, and Notes panels render the
    desktop's content over an end-to-end encrypted relay at
-   wss://relay.philfan.cn.
+   wss://relay.agentero.app.
 
 Without a desktop, the iOS app shows the Connect screen and cannot be
 tested further — this is by design. A sandbox TestFlight review build
 on the App Store reviewer's iPhone will work the same way.
 
-Network egress: the iOS app only contacts wss://relay.philfan.cn:443.
+Network egress: the iOS app only contacts wss://relay.agentero.app:443.
 The relay routes opaque X25519+XSalsa20-Poly1305 frames; it does not
 decrypt Vault or Agent content.
 
@@ -356,7 +360,7 @@ catalog 和 ACP Agent 都留在你的桌面上；手机只负责渲染和缓存�
 
 与自己的 Agent 对话
 用 Agent 标签页和你已经在电脑上安装的 ACP Agent 聊天——
-Claude、Codex、OpenCode、Gemini、Qoder、Grok 或任意兼容 ACP
+Claude、Codex、OpenCode、Qoder、Grok 或任意兼容 ACP
 的 CLI。流式回复、历史会话和权限确认都由桌面转发过来。
 
 为隐私而生
@@ -403,7 +407,7 @@ note unchanged across localizations.
 
 ```
 Internal pre-release of Agentero iOS. Pairs with the developer's
-desktop Agentero build over the relay at relay.philfan.cn. Used for
+desktop Agentero build over the relay at relay.agentero.app. Used for
 smoke testing the iOS remote-client shell (Connect → Library → PDF /
 Notes → Agent chat) before the public App Store submission.
 ```

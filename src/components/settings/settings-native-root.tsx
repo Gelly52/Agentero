@@ -1,6 +1,11 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import type { SettingsSection } from "@/components/settings/types";
+import { TrafficLightSpacer } from "@/components/shell/traffic-light-spacer";
+import { applyLocale } from "@/i18n";
+import { commands, events } from "@/lib/core/bindings";
+import { errorMessage, notifyError } from "@/lib/core/notify";
 import { isMacOS, isTauri } from "@/lib/core/tauri";
+import { listenEventSafe } from "@/lib/core/tauri-events";
 import {
 	applyDocumentChrome,
 	ensureSettingsLoaded,
@@ -8,6 +13,9 @@ import {
 	saveSettingsAsync,
 	subscribeSettings,
 } from "@/lib/settings";
+import { applyExternalSettings } from "@/lib/settings/store";
+import { closeCurrentWindow } from "@/lib/shell/close-window";
+import { resolveShortcutId } from "@/lib/shell/shortcuts";
 import { SettingsContent } from "./settings-content";
 
 function readSearchParams() {
@@ -15,18 +23,6 @@ function readSearchParams() {
 	const section = (params.get("section") ?? "general") as SettingsSection;
 	const vaultPath = params.get("vault_path");
 	return { section, vaultPath };
-}
-
-function closeCurrentWindow() {
-	void (async () => {
-		if (!isTauri()) return;
-		try {
-			const { getCurrentWindow } = await import("@tauri-apps/api/window");
-			await getCurrentWindow().close();
-		} catch (e) {
-			console.warn("[settings-native-root] close failed", e);
-		}
-	})();
 }
 
 /**
@@ -65,19 +61,29 @@ export function SettingsNativeRoot() {
 		});
 	}, [settings.uiScale, settings.interfaceFontFamily, settings.monoFontFamily]);
 
+	// Settings webview does not mount `useAppBootstrap`; apply locale here so
+	// Appearance → Language switches the settings UI immediately (Fix #437).
+	useEffect(() => {
+		const resolved = applyLocale(settings.locale);
+		if (!isTauri()) return;
+		void (async () => {
+			try {
+				await commands.setLocale(resolved);
+			} catch {
+				// Native menu keeps its previous locale; non-fatal.
+			}
+		})();
+	}, [settings.locale]);
+
 	useEffect(() => {
 		const onKeyDown = (event: KeyboardEvent) => {
-			const isComma = event.key === "," || event.code === "Comma";
-			const isEsc = event.key === "Escape";
-			const isCloseWindow =
-				(event.key === "w" || event.code === "KeyW") &&
-				(event.metaKey || event.ctrlKey);
-			const metaOrCtrl = event.metaKey || event.ctrlKey;
 			if (
-				isEsc ||
-				(isCloseWindow && !event.altKey && !event.shiftKey) ||
-				(isComma && metaOrCtrl && !event.altKey && !event.shiftKey)
-			) {
+				event.defaultPrevented ||
+				document.querySelector("[data-shortcut-recording]")
+			)
+				return;
+			const id = resolveShortcutId(event, { settingsOpen: true });
+			if (id === "closeSheet" || id === "closeTab" || id === "settings") {
 				event.preventDefault();
 				closeCurrentWindow();
 			}
@@ -93,12 +99,40 @@ export function SettingsNativeRoot() {
 		window.history.replaceState(null, "", url.toString());
 	}, []);
 
+	useEffect(
+		() =>
+			listenEventSafe(events.settingsSectionRequested, (next) => {
+				handleSectionChange(next as SettingsSection);
+			}),
+		[handleSectionChange],
+	);
+
+	// The Settings window is a singleton: opening it from another Vault must
+	// retarget the panes (sync binds per Vault) instead of keeping the first
+	// opener's `vault_path`.
+	const handleVaultChange = useCallback((next: string) => {
+		const path = next.trim();
+		if (!path) return;
+		setSearchParams((prev) => ({ ...prev, vaultPath: path }));
+		const url = new URL(window.location.href);
+		url.searchParams.set("vault_path", path);
+		window.history.replaceState(null, "", url.toString());
+	}, []);
+
+	useEffect(
+		() => listenEventSafe(events.settingsVaultRequested, handleVaultChange),
+		[handleVaultChange],
+	);
+
 	const handleChange = useCallback(async (next: typeof settings) => {
+		const previous = loadSettings();
 		setSettings(next);
 		try {
 			await saveSettingsAsync(next);
 		} catch (e) {
-			console.warn("[settings-native-root] save failed", e);
+			applyExternalSettings(previous);
+			setSettings(previous);
+			notifyError(errorMessage(e));
 		}
 	}, []);
 
@@ -110,17 +144,18 @@ export function SettingsNativeRoot() {
 			  so the OS title bar already provides the title and caption buttons.
 			*/}
 			{isMac ? (
-				<header className="flex h-8 shrink-0 items-center border-b bg-muted/40 select-none">
+				<header
+					data-settings-titlebar
+					className="flex h-8 shrink-0 items-center border-b border-sidebar-border/80 bg-sidebar/80 backdrop-blur-xl backdrop-saturate-150 select-none supports-backdrop-blur:bg-sidebar/65"
+				>
 					{/*
 					  Traffic lights: x=14, three ~14px buttons + gaps → ends ~68px.
-					  Keep the same 92px reserved strip as the main title bar so the
-					  drag region layout matches across windows, then let the rest of
+					  Keep the same reserved strip as the main title bar so the drag
+					  region layout matches across windows (collapses in native
+					  fullscreen, where the lights are hidden), then let the rest of
 					  the header be draggable too.
 					*/}
-					<div
-						className="w-[92px] shrink-0 self-stretch"
-						data-tauri-drag-region
-					/>
+					<TrafficLightSpacer />
 					<div className="min-w-0 flex-1 self-stretch" data-tauri-drag-region />
 				</header>
 			) : null}

@@ -1,6 +1,17 @@
-import { describe, expect, it } from "vitest";
+import { createElement } from "react";
+import { renderToStaticMarkup } from "react-dom/server";
+import { describe, expect, it, vi } from "vitest";
 
-import { layoutCommentCards } from "@/components/viewer/pdf/layers/comment-cards-layer";
+vi.mock("@/components/viewer/pdf/layers/comment-markdown-editor", () => ({
+	CommentMarkdownEditor: () => null,
+}));
+
+import {
+	COMMENT_CARD_GAP_PX,
+	CommentCardsLayer,
+	commentConnectorPath,
+	layoutCommentCards,
+} from "@/components/viewer/pdf/layers/comment-cards-layer";
 import type { PageAnnotationComment } from "@/components/viewer/pdf/types";
 
 function comment(
@@ -13,6 +24,7 @@ function comment(
 		id,
 		pageIndex: 0,
 		anchorY,
+		rects: [{ x: 0.1, y: anchorY, w: 0.4, h: 0.02 }],
 		quote: kind === "visual" ? "" : "quoted text",
 		comment: text,
 		color: "yellow",
@@ -20,6 +32,37 @@ function comment(
 		linkAlias: null,
 	};
 }
+
+describe("PDF comment rail keeps a fixed UI size", () => {
+	it("lays out the rail in screen pixels without scaling the layer", () => {
+		const html = renderToStaticMarkup(
+			createElement(CommentCardsLayer, {
+				items: [comment("c1", 0.5)],
+				pageWidthPx: 600,
+				pageHeightPx: 800,
+				editingId: null,
+				wikiTarget: null,
+				hoveredId: null,
+				onOpen: vi.fn(),
+				onSave: vi.fn(),
+				onCancel: vi.fn(),
+				onDelete: vi.fn(),
+				onCopyLink: vi.fn(),
+				onCopyEmbed: vi.fn(),
+				onAddToChat: vi.fn(),
+				onHover: vi.fn(),
+				onLeave: vi.fn(),
+			}),
+		);
+		// The rail box equals the rendered page box; zoom rescales nothing.
+		expect(html).toContain("width:600px");
+		expect(html).toContain("height:800px");
+		expect(html).not.toContain("zoom:");
+		expect(html).not.toContain("transform:scale(");
+		// Cards hug their content under a hard height cap.
+		expect(html).toContain("max-height:420px");
+	});
+});
 
 describe("layoutCommentCards", () => {
 	it("returns an empty layout for no comments", () => {
@@ -121,5 +164,127 @@ describe("layoutCommentCards", () => {
 		expect(laid[0].id).toBe("v");
 		expect(laid[0].topPx).toBeCloseTo(320);
 		expect(laid[0].heightPx).toBeGreaterThan(0);
+	});
+
+	it("grows visual notes that carry an inline conversation preview", () => {
+		const withoutMessages = layoutCommentCards(
+			[comment("v", 0.4, "note", "visual")],
+			800,
+		);
+		const withMessages = layoutCommentCards(
+			[
+				{
+					...comment("v", 0.4, "note", "visual"),
+					messages: [
+						{ id: "m1", role: "user" as const, content: "explain this" },
+					],
+				},
+			],
+			800,
+		);
+		expect(withMessages[0]?.heightPx).toBeGreaterThan(
+			withoutMessages[0]?.heightPx ?? 0,
+		);
+	});
+
+	it("prefers a measured height over the layout seed estimate", () => {
+		const estimate = layoutCommentCards([comment("a", 0.2)], 800);
+		const measured = layoutCommentCards(
+			[comment("a", 0.2)],
+			800,
+			null,
+			new Map([["a", 260]]),
+		);
+		expect(measured[0].heightPx).toBe(260);
+		expect(measured[0].heightPx).not.toBe(estimate[0].heightPx);
+	});
+
+	it("stacks against measured heights with the avoidance gap", () => {
+		const laid = layoutCommentCards(
+			[comment("a", 0.3), comment("b", 0.31)],
+			800,
+			null,
+			new Map([
+				["a", 200],
+				["b", 120],
+			]),
+		);
+		const [a, b] = laid;
+		expect(a.heightPx).toBe(200);
+		expect(b.topPx).toBeGreaterThanOrEqual(a.topPx + a.heightPx + 8);
+		expect(b.topPx + b.heightPx).toBeLessThanOrEqual(800);
+	});
+
+	it("keeps the estimate when no measurement exists yet", () => {
+		const seed = layoutCommentCards([comment("a", 0.2)], 800);
+		const fallback = layoutCommentCards(
+			[comment("a", 0.2)],
+			800,
+			null,
+			new Map(),
+		);
+		expect(fallback[0].heightPx).toBe(seed[0].heightPx);
+	});
+});
+
+describe("commentConnectorPath", () => {
+	const pageW = 600;
+	const pageH = 800;
+
+	it("returns null for empty rects", () => {
+		expect(
+			commentConnectorPath(
+				[],
+				{ id: "a", topPx: 100, heightPx: 40 },
+				pageW,
+				pageH,
+			),
+		).toBeNull();
+	});
+
+	it("folds at the page edge toward the card left midpoint", () => {
+		const rects = [{ x: 0.2, y: 0.1, w: 0.3, h: 0.04 }];
+		// Card below the segment → attach at the segment bottom (clamped).
+		const placement = { id: "a", topPx: 200, heightPx: 40 };
+		const d = commentConnectorPath(rects, placement, pageW, pageH);
+		expect(d).toBe(
+			`M 300 112 L 600 112 L 600 220 L ${pageW + COMMENT_CARD_GAP_PX} 220`,
+		);
+	});
+
+	it("anchors to the segment nearest the card, not the envelope mid", () => {
+		const rects = [
+			{ x: 0.1, y: 0.2, w: 0.2, h: 0.02 },
+			{ x: 0.15, y: 0.24, w: 0.4, h: 0.02 },
+		];
+		// Card sits above both lines → nearest is the first segment (y=0.2).
+		const placement = { id: "a", topPx: 100, heightPx: 50 };
+		const d = commentConnectorPath(rects, placement, pageW, pageH);
+		// attach at top of first rect (clamped): y=0.2 → 160; right=0.3 → 180
+		expect(d).toBe(
+			`M 180 160 L 600 160 L 600 125 L ${pageW + COMMENT_CARD_GAP_PX} 125`,
+		);
+	});
+
+	it("picks the lower segment when the card is nudged downward", () => {
+		const rects = [
+			{ x: 0.1, y: 0.2, w: 0.5, h: 0.02 },
+			{ x: 0.1, y: 0.35, w: 0.4, h: 0.02 },
+		];
+		// Card mid at 300px → yNorm 0.375, closest to second segment.
+		const placement = { id: "a", topPx: 280, heightPx: 40 };
+		const d = commentConnectorPath(rects, placement, pageW, pageH);
+		expect(d).toBe(
+			`M 300 296 L 600 296 L 600 300 L ${pageW + COMMENT_CARD_GAP_PX} 300`,
+		);
+	});
+
+	it("follows the laid-out card when avoidance nudges it", () => {
+		const item = comment("a", 0.25);
+		const laid = layoutCommentCards([item], pageH);
+		const d = commentConnectorPath(item.rects, laid[0], pageW, pageH);
+		expect(d).not.toBeNull();
+		const y2 = Math.round((laid[0].topPx + laid[0].heightPx / 2) * 100) / 100;
+		expect(d).toContain(`L ${pageW + COMMENT_CARD_GAP_PX} ${y2}`);
 	});
 });

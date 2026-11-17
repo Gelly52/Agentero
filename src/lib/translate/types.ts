@@ -3,13 +3,18 @@
  * Architecture mirrors zotero-pdf-translate's pluggable TranslateService table.
  */
 
-/** Free MT engines (no paid API keys). */
+/**
+ * Free MT engines (no user-supplied API keys). `agentero` is the built-in
+ * provider: the Host injects its compiled-in credential, so the frontend keeps
+ * no BYOK config for it and it reuses the keyless free-engine plumbing.
+ */
 export type FreeTranslateProviderId =
-	| "google"
-	| "googleapi"
-	| "deeplx"
+	| "agentero"
+	| "cnki"
 	| "huoshanweb"
-	| "tencenttransmart";
+	| "tencenttransmart"
+	| "indextranslate"
+	| "indextranslate2b";
 
 /** Commercial BYOK engines called directly by the Tauri Host. */
 export type CommercialTranslateProviderId =
@@ -28,7 +33,11 @@ export type TranslateTargetLang = "ui" | "en" | "zh-CN";
 
 export type TranslateSourceLang = "auto";
 
+export type DictionaryMode = "auto" | "offline-first" | "off";
+export type SelectionTranslateMode = "dictionary" | "translate";
+
 export type TranslateSettings = {
+	dictionary: { mode: DictionaryMode };
 	/** App-wide default provider. */
 	provider: TranslateProviderId;
 	targetLang: TranslateTargetLang;
@@ -42,6 +51,24 @@ export type TranslateSettings = {
 	/** PDF consumer: auto-run translate after selection (default off). */
 	autoTranslateSelection: boolean;
 	/**
+	 * Open a secondary window with the rendered full-document translation so the
+	 * original PDF stays on the left and the translation stays on the right.
+	 * @deprecated Use `displayMode` instead; kept for migration.
+	 */
+	dualPaneTranslate: boolean;
+	/**
+	 * How full-document translation is displayed.
+	 * - `overlay`: in-place translation layer over the source PDF.
+	 * - `dualPane`: side-by-side source + translation panes.
+	 */
+	displayMode: TranslationDisplayMode;
+	/**
+	 * Which source drives the left pane when `displayMode === "dualPane"`.
+	 * - `pdf`: the rendered PDF.
+	 * - `latex`: the arXiv LaTeX source.
+	 */
+	dualPaneSource: DualPaneSource;
+	/**
 	 * Agent seat for provider === "agent".
 	 * Empty = follow registry defaultId.
 	 */
@@ -51,6 +78,44 @@ export type TranslateSettings = {
 	 * Empty = follow loadModelPref(agentId) / agent current.
 	 */
 	modelId: string;
+	/**
+	 * Legacy single template. Kept so older settings.json still apply.
+	 * Empty when `customSystem` is set. A one-line colloquial value is an
+	 * extra preference; anything longer replaces the academic style block
+	 * only. Engine rules always stay. Max 8000 chars.
+	 */
+	customPrompt: string;
+	/**
+	 * Custom system style or preference. Wins over `customPrompt`.
+	 * Placeholders: targetLang, sourceLang, and text.
+	 */
+	customSystem: string;
+	/**
+	 * Custom user template. Used only when it contains the text placeholder;
+	 * otherwise the source is still quoted. Max 8000 chars.
+	 */
+	customUser: string;
+	/**
+	 * Persist extracted reflow character IR pages under the app cache directory
+	 * (default on). Off = extraction runs again on every open and nothing is
+	 * written; existing files stay until the cache is cleared.
+	 */
+	cacheReflowIr: boolean;
+	/**
+	 * Persist the finished translated PDF under the app cache directory
+	 * (default off: each final is ~25 MB).
+	 */
+	cacheReflowFinal: boolean;
+	/**
+	 * Translate a paper's full text in the background once it is imported and
+	 * its layout analysis succeeds (default off: it spends provider quota).
+	 */
+	autoTranslateImport: boolean;
+	/**
+	 * How many papers the import-triggered background translation runs at
+	 * once (1–5, default 1). Seeded into the JobCenter `layoutTranslate` cap.
+	 */
+	autoTranslateImportConcurrency: number;
 };
 
 export type TranslateProviderConfig = {
@@ -61,6 +126,8 @@ export type TranslateProviderConfig = {
 	region: string;
 	/** OpenAI-compatible model id. */
 	model: string;
+	/** JSON object replacing automatic request options; blank uses model defaults. */
+	extraRequestBody?: string;
 };
 
 export type TranslateServiceType = "sentence" | "word";
@@ -78,14 +145,30 @@ export type TranslateTask = {
 		quote?: string;
 		/** e.g. "pdf-selection" */
 		surface?: string;
+		dictionary?: boolean;
+		dictionarySurrounding?: string;
+		dictionaryReference?: string;
 	};
 };
 
 export type TranslateRunOptions = {
+	/** Resolved terminology constraint for this source text. */
+	glossary?: string;
 	/** Override settings.provider for this call. */
 	providerId?: TranslateProviderId;
 	/** Current BYOK provider config, resolved from settings. */
 	providerConfig?: TranslateProviderConfig;
+	/** Streaming increments, for providers that stream (Bilibili Translate). */
+	onDelta?: (chunk: string) => void;
+	/**
+	 * Agent path: custom prompt override; defaults to
+	 * settings.translate.customPrompt (set by `runTranslate`).
+	 */
+	customPrompt?: string;
+	/** Wins over `customPrompt`. Defaults to settings.translate.customSystem. */
+	customSystem?: string;
+	/** Defaults to settings.translate.customUser. */
+	customUser?: string;
 	/**
 	 * Agent path: inject runner so lib/ does not depend on ACP wiring.
 	 * Streaming is the caller's concern; this returns the final string when used.
@@ -109,11 +192,12 @@ export type TranslateService = {
 
 /** Ordered list for settings UI (free engines). */
 export const FREE_MT_PROVIDER_IDS: FreeTranslateProviderId[] = [
+	"agentero",
+	"indextranslate",
+	"indextranslate2b",
 	"tencenttransmart",
 	"huoshanweb",
-	"deeplx",
-	"googleapi",
-	"google",
+	"cnki",
 ];
 
 /** Ordered list for settings UI (commercial BYOK engines). */
@@ -151,3 +235,18 @@ export const COMMERCIAL_MT_DOCS_URLS: Record<
 		"https://console.cloud.google.com/apis/library/translate.googleapis.com",
 	openaiCompatible: "https://platform.openai.com/api-keys",
 };
+
+/** How full-document translation is rendered. */
+export type TranslationDisplayMode = "overlay" | "dualPane";
+
+/** Canonical display modes in UI order. */
+export const TRANSLATION_DISPLAY_MODES: TranslationDisplayMode[] = [
+	"overlay",
+	"dualPane",
+];
+
+/** Source pane type for dual-pane full-document translation. */
+export type DualPaneSource = "pdf" | "latex";
+
+/** Canonical dual-pane source values in UI order. */
+export const DUAL_PANE_SOURCES: DualPaneSource[] = ["pdf", "latex"];

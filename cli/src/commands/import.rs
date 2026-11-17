@@ -3,9 +3,11 @@
 use crate::error::CliError;
 use crate::output::to_value;
 use crate::resolve::{resolve_vault, GlobalOpts};
-use agentero_lib::features::import as paper_import;
-use agentero_lib::features::import::{LookupImportArgs, PaperImportArgs};
-use agentero_lib::features::zotero;
+use agentero_core::features::import as paper_import;
+use agentero_core::features::import::{
+    skipped_preparation_line, ImportLocalPdfArgs, LookupImportArgs, NoteShellMode, PaperImportArgs,
+};
+use agentero_core::features::zotero;
 use clap::{Subcommand, ValueHint};
 use serde_json::{json, Value};
 use std::fs;
@@ -30,12 +32,29 @@ pub enum ImportCmd {
         #[arg(long = "parent", default_value = "papers", value_hint = ValueHint::DirPath)]
         parent: String,
     },
+    /// Import local PDF file(s) into vault (metadata recognition + copy + catalog + NOTES.md shell).
+    Pdf {
+        /// Local PDF file path(s).
+        #[arg(required = true, num_args = 1.., value_hint = ValueHint::FilePath)]
+        files: Vec<PathBuf>,
+        /// Vault-relative parent (default `papers`).
+        #[arg(long = "parent", default_value = "papers", value_hint = ValueHint::DirPath)]
+        parent: String,
+        /// Skip metadata recognition and import with filename-based metadata.
+        #[arg(long = "no-recognize")]
+        no_recognize: bool,
+    },
 }
 
 pub async fn run(cmd: ImportCmd, globals: &GlobalOpts) -> Result<Value, CliError> {
     match cmd {
         ImportCmd::Id { text, parent } => import_id(globals, &text, &parent).await,
         ImportCmd::Bib { file, parent } => import_bib(globals, &file, &parent).await,
+        ImportCmd::Pdf {
+            files,
+            parent,
+            no_recognize,
+        } => import_pdf(globals, &files, &parent, no_recognize).await,
     }
 }
 
@@ -66,7 +85,11 @@ async fn import_id(globals: &GlobalOpts, text: &str, parent: &str) -> Result<Val
         c
     };
 
-    let body = json!({
+    let mut lines = vec![format!(
+        "imported {} → {} ({})",
+        result.id, result.path, result.title
+    )];
+    let mut body = json!({
         "path": result.path,
         "id": result.id,
         "title": result.title,
@@ -79,11 +102,15 @@ async fn import_id(globals: &GlobalOpts, text: &str, parent: &str) -> Result<Val
         "assetMessages": result.asset_messages,
         "created": created,
         "skipped": [],
-        "lines": [format!(
-            "imported {} → {} ({})",
-            result.id, result.path, result.title
-        )],
     });
+    if let Some(obj) = body.as_object_mut() {
+        if let Some(line) = skipped_preparation_line(&result.preparation) {
+            log::info!(target: "agentero::import", "{line}");
+            obj.insert("preparationSkipped".into(), json!([line]));
+            lines.push(line);
+        }
+        obj.insert("lines".into(), json!(lines));
+    }
     Ok(body)
 }
 
@@ -124,4 +151,68 @@ fn read_input(file: &PathBuf) -> Result<String, CliError> {
         return Ok(buf);
     }
     Ok(fs::read_to_string(file)?)
+}
+
+async fn import_pdf(
+    globals: &GlobalOpts,
+    files: &[PathBuf],
+    parent: &str,
+    no_recognize: bool,
+) -> Result<Value, CliError> {
+    let vault = resolve_vault(globals)?;
+    let mut file_paths = Vec::with_capacity(files.len());
+    for f in files {
+        let abs = if f.is_absolute() {
+            f.clone()
+        } else {
+            std::env::current_dir()?.join(f)
+        };
+        let canonical = agentero_core::fs::canonicalize_best_effort(&abs);
+        file_paths.push(canonical.to_string_lossy().to_string());
+    }
+
+    let result = paper_import::import_local_pdfs(
+        ImportLocalPdfArgs {
+            vault_path: vault.to_string_lossy().to_string(),
+            parent_dir: parent.to_string(),
+            file_paths,
+            entries: vec![],
+            task_id: None,
+            recognize_sync: !no_recognize,
+            translator_base_url: globals.translator_base_url(),
+        },
+        None,
+        None,
+        NoteShellMode::Standard,
+    )
+    .await
+    .map_err(|e| CliError::import_failed(e.to_string()))?;
+
+    let mut v = to_value(&result)?;
+    if let Some(obj) = v.as_object_mut() {
+        let mut lines = Vec::new();
+        let mut preparation_skipped = Vec::new();
+        for paper in &result.papers {
+            lines.push(format!(
+                "imported {} → {} ({})",
+                paper.id, paper.path, paper.title
+            ));
+            if let Some(line) = skipped_preparation_line(&paper.preparation) {
+                log::info!(target: "agentero::import", "{line}");
+                preparation_skipped.push(line.clone());
+                lines.push(line);
+            }
+        }
+        for err in &result.errors {
+            lines.push(format!("error: {err}"));
+        }
+        if lines.is_empty() {
+            lines.push("no files imported".to_string());
+        }
+        if !preparation_skipped.is_empty() {
+            obj.insert("preparationSkipped".into(), json!(preparation_skipped));
+        }
+        obj.insert("lines".into(), json!(lines));
+    }
+    Ok(v)
 }

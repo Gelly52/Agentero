@@ -17,6 +17,10 @@ export type CatalogEntry = {
 	installHint: string;
 	/** Shell command for guided install (e.g. Claude ACP adapter via npm). */
 	installCommand?: string | null;
+	/** Host CLI OAuth/login command opened by Agentero's terminal helper. */
+	loginCommand?: string | null;
+	/** Interactive host CLI for the "open in terminal" action, when shipped. */
+	cliCommand?: string | null;
 	/** Host CLI present but ACP entrypoint missing — offer ACP install. */
 	offerInstall?: boolean;
 	/** Local silent install via `runToolLifecycle` is supported. */
@@ -26,14 +30,24 @@ export type CatalogEntry = {
 	/** Agent host CLI on PATH (`detect_command`). */
 	binaryAvailable: boolean;
 	resolvedPath?: string | null;
-	/** ACP entrypoint on PATH (`command`). */
+	/** ACP entrypoint on PATH (`command`), or served by the bundled tier. */
 	acpCommandAvailable: boolean;
+	/** Bundled ACP adapter tier present in app resources (offline fallback). */
+	acpBundled?: boolean;
+	/** Version of the bundled adapter, when staged. */
+	acpBundledVersion?: string | null;
 	acpStatus: CatalogAcpStatus;
 	registeredId?: string | null;
 	isDefault: boolean;
 	acpAgentName?: string | null;
 	lastProbeError?: string | null;
 	lastProbedAt?: string | null;
+	/** Normalized local host CLI version, when known. */
+	installedVersion?: string | null;
+	/** Silent-update target (npm latest), when known. */
+	latestVersion?: string | null;
+	/** Settings shows Upgrade only when this is explicitly true. */
+	updateAvailable?: boolean | null;
 };
 
 export type AcpSessionCapabilities = {

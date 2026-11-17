@@ -5,7 +5,10 @@
  * Plain browser / tests: `console.*` fallback.
  */
 
+import { commands } from "@/lib/core/bindings";
 import { errorText } from "@/lib/core/error";
+import { callApi } from "@/lib/core/ipc";
+import { perfEmit } from "@/lib/core/perf";
 import { isTauri } from "@/lib/core/tauri";
 
 type Level = "trace" | "debug" | "info" | "warn" | "error";
@@ -76,6 +79,14 @@ export const logger = {
 	},
 };
 
+/** Delete / truncate Host log files under the app log directory. */
+export async function clearLogs(): Promise<number> {
+	if (!isTauri()) return 0;
+	return callApi(() => commands.logsClear(), {
+		fallback: "logs_clear failed",
+	});
+}
+
 /** Dev: mirror Host logs into the webview console. No-op outside Tauri. */
 export async function initLogger(): Promise<void> {
 	if (!isTauri()) return;
@@ -105,6 +116,7 @@ export async function logOp<T>(
 		const result = await fn();
 		const ms = Math.round(performance.now() - start);
 		logger.info(`op end ${name} ok=true duration_ms=${ms}${fieldStr}`);
+		perfEmit(name, ms * 1000, true, fieldStr.trim());
 		return result;
 	} catch (e) {
 		const ms = Math.round(performance.now() - start);
@@ -112,6 +124,7 @@ export async function logOp<T>(
 		logger.error(
 			`op end ${name} ok=false duration_ms=${ms}${fieldStr} error=${trunc(err, 300)}`,
 		);
+		perfEmit(name, ms * 1000, false, fieldStr.trim());
 		throw e;
 	}
 }

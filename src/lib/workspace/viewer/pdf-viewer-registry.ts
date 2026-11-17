@@ -16,6 +16,7 @@ import {
 } from "@/lib/pdf/annotation-ref";
 import type { PdfAskNormalizedRect } from "@/lib/pdf/ask";
 import type { PdfHighlight } from "@/lib/pdf/highlight/types";
+import type { PdfLayoutKind } from "@/lib/pdf/layout";
 import { getVaultPath, vaultStore } from "@/lib/vault/store";
 import { getActiveTab } from "@/lib/workspace/store";
 
@@ -33,6 +34,8 @@ export type PdfViewerHandle = {
 	deleteVisualTrace: (id: string) => void;
 	/** Toggle visual-region annotation mode (⌘.). */
 	toggleVisualAnnotation: () => void;
+	/** Toggle full-text (layout) translation (⌥A), dual-pane aware. */
+	toggleLayoutTranslate: () => void;
 	/** Run EmbedPDF layout analysis for figures / tables / formulas. */
 	analyzeLayout: () => void;
 	/** Jump to a layout region (0-based page) and focus its overlay. */
@@ -40,6 +43,8 @@ export type PdfViewerHandle = {
 		id: string;
 		pageIndex: number;
 		bbox: PdfAskNormalizedRect;
+		/** When set, paints the focus outline without a layout-store id lookup. */
+		kind?: PdfLayoutKind;
 	}) => void;
 	/** Crop a normalized page region (for figure sidebar thumbnails). */
 	renderRegion: (args: {
@@ -47,6 +52,8 @@ export type PdfViewerHandle = {
 		bbox: PdfAskNormalizedRect;
 		maxEdgePx?: number;
 	}) => Promise<PromptImage | null>;
+	/** Export the current PDF with embedded highlights/comments to a file. */
+	exportAnnotatedPdf: () => Promise<void>;
 };
 
 const handles = new Map<string, PdfViewerHandle>();

@@ -1,3 +1,5 @@
+import i18n from "@/i18n";
+import { isZenVirtualPath, ZEN_VIRTUAL_PATH } from "@/lib/agent/zen-path";
 import {
 	isLibraryVirtualPath,
 	isTrashVirtualPath,
@@ -5,17 +7,27 @@ import {
 	TRASH_VIRTUAL_PATH,
 } from "@/lib/paper/api";
 import { isPlazaVirtualPath, plazaTitleForPath } from "@/lib/plaza";
+import { isResearchTablePath, TABLE_SUFFIX } from "@/lib/research-table/model";
 import { basenameOf, normalizePathKey } from "@/lib/vault/path";
-import type { DocTab } from "@/lib/workspace/tabs/types";
+import type { DocTab, TabResources } from "@/lib/workspace/tabs/types";
 import type { CenterViewMode } from "@/lib/workspace/viewer";
 
 export { basenameOf, normalizePathKey as normalizeTabPath };
 
-const SPLIT_PANE_ID_MARKER = "::pane-";
+export const SPLIT_PANE_ID_MARKER = "::pane-";
+
+/** Tab label for a file path. Research tables hide the `.table.json` suffix. */
+export function tabTitleForPath(path: string): string {
+	const base = basenameOf(path);
+	if (!isResearchTablePath(base)) return base;
+	const stem = base.slice(0, -TABLE_SUFFIX.length);
+	return stem || base;
+}
 
 export function tabIdForPath(path: string): string {
 	if (isLibraryVirtualPath(path)) return LIBRARY_VIRTUAL_PATH;
 	if (isTrashVirtualPath(path)) return TRASH_VIRTUAL_PATH;
+	if (isZenVirtualPath(path)) return ZEN_VIRTUAL_PATH;
 	if (isPlazaVirtualPath(path)) return path;
 	return normalizePathKey(path);
 }
@@ -56,6 +68,7 @@ function remapTabIdForPath(
 /** Rewrite one absolute or Vault-relative path under a moved root. */
 export function remapPathUnder(path: string, from: string, to: string): string {
 	if (isLibraryVirtualPath(path) || isTrashVirtualPath(path)) return path;
+	if (isZenVirtualPath(path)) return path;
 	if (isPlazaVirtualPath(path)) return path;
 	const current = path.replace(/\\/g, "/").replace(/\/+$/, "");
 	const oldRoot = from.replace(/\\/g, "/").replace(/\/+$/, "");
@@ -82,13 +95,28 @@ export function remapTabsUnderPath(
 		const notesPath = tab.notesPath
 			? remapPathUnder(tab.notesPath, from, to)
 			: null;
-		const paperPath = tab.paperMeta?.path
-			? remapPathUnder(tab.paperMeta.path, fromRel, toRel)
-			: tab.paperMeta?.path;
+		const pdfUrl = tab.pdfUrl ? remapPathUnder(tab.pdfUrl, from, to) : null;
+		const imageUrl = tab.imageUrl
+			? remapPathUnder(tab.imageUrl, from, to)
+			: null;
+		const writingRoot = tab.writingRoot
+			? remapPathUnder(tab.writingRoot, from, to)
+			: undefined;
+		const paperMeta = tab.paperMeta;
+		let nextPaperMeta = paperMeta;
+		if (paperMeta) {
+			const remappedPaperPath = remapPathUnder(paperMeta.path, fromRel, toRel);
+			if (remappedPaperPath !== paperMeta.path) {
+				nextPaperMeta = { ...paperMeta, path: remappedPaperPath };
+			}
+		}
 		if (
 			path === tab.path &&
 			notesPath === tab.notesPath &&
-			paperPath === tab.paperMeta?.path
+			pdfUrl === tab.pdfUrl &&
+			imageUrl === tab.imageUrl &&
+			writingRoot === tab.writingRoot &&
+			nextPaperMeta === paperMeta
 		) {
 			return tab;
 		}
@@ -97,10 +125,10 @@ export function remapTabsUnderPath(
 			id: remapTabIdForPath(tab.id, tab.path, path),
 			path,
 			notesPath,
-			paperMeta:
-				tab.paperMeta && paperPath !== tab.paperMeta.path
-					? { ...tab.paperMeta, path: paperPath }
-					: tab.paperMeta,
+			pdfUrl,
+			imageUrl,
+			writingRoot,
+			paperMeta: nextPaperMeta,
 		};
 	});
 }
@@ -112,6 +140,7 @@ export function createPlaceholderTab(
 ): DocTab {
 	const isLibrary = isLibraryVirtualPath(path);
 	const isTrash = isTrashVirtualPath(path);
+	const isZen = isZenVirtualPath(path);
 	const isPlaza = isPlazaVirtualPath(path);
 	return {
 		id,
@@ -119,21 +148,27 @@ export function createPlaceholderTab(
 			? LIBRARY_VIRTUAL_PATH
 			: isTrash
 				? TRASH_VIRTUAL_PATH
-				: path,
+				: isZen
+					? ZEN_VIRTUAL_PATH
+					: path,
 		kind: isLibrary
 			? "library"
 			: isTrash
 				? "trash"
-				: isPlaza
-					? "plaza"
-					: "file",
+				: isZen
+					? "zen"
+					: isPlaza
+						? "plaza"
+						: "file",
 		title: isLibrary
 			? "Library"
 			: isTrash
 				? "Recycle Bin"
-				: isPlaza
-					? plazaTitleForPath(path)
-					: basenameOf(path),
+				: isZen
+					? i18n.t("sidebar:zen.title")
+					: isPlaza
+						? plazaTitleForPath(path)
+						: tabTitleForPath(path),
 		mode: preferMode,
 		paperMeta: null,
 		pdfUrl: null,
@@ -143,17 +178,24 @@ export function createPlaceholderTab(
 		notesPath: null,
 		notesSeed: "",
 		markdownSeed: "",
+		excalidrawSeed: "",
+		textSeed: "",
 		markdownDirty: false,
 		notesDirty: false,
+		excalidrawDirty: false,
+		textDirty: false,
 		seedKey: 0,
 		notesKey: 0,
+		excalidrawKey: 0,
+		textKey: 0,
+		htmlKey: 0,
 		loaded: false,
 	};
 }
 
 /**
  * Ensure the full-library tab exists; returns the next tabs + active id.
- * Used when the tab strip would otherwise be empty (default page).
+ * The Library tab is resident: every mutation path re-inserts it when missing.
  */
 export function ensureFullLibraryTab(prev: DocTab[]): {
 	tabs: DocTab[];
@@ -171,6 +213,39 @@ export function ensureFullLibraryTab(prev: DocTab[]): {
 		loaded: true,
 	};
 	return { tabs: [...prev, tab], activeId: tab.id, inserted: true };
+}
+
+/**
+ * Fields a freshly loaded `TabResources` fills in on top of a tab. When the
+ * tab already renders this paper as PDF (restored placeholder, ⇧⌘T reopen,
+ * doc popout), a single failed local-PDF probe must not downgrade it to an
+ * empty Markdown editor — keep `pdf` and let the viewer surface the state.
+ */
+export function patchFromTabResources(
+	res: TabResources,
+	current?: DocTab | null,
+): Partial<DocTab> {
+	const keepPdfMode =
+		current?.mode === "pdf" &&
+		res.mode === "markdown" &&
+		(current.kind === "paper" || res.kind === "paper");
+	return {
+		kind: res.kind,
+		title: res.title,
+		mode: keepPdfMode ? "pdf" : res.mode,
+		paperMeta: res.paperMeta,
+		pdfUrl: res.pdfUrl,
+		pdfBytes: res.pdfBytes ?? null,
+		htmlUrl: res.htmlUrl,
+		imageUrl: res.imageUrl,
+		notesPath: res.notesPath,
+		notesSeed: res.notesSeed,
+		markdownSeed: res.markdownSeed,
+		excalidrawSeed: res.excalidrawSeed ?? "",
+		textSeed: res.textSeed ?? "",
+		seedKey: 1,
+		loaded: true,
+	};
 }
 
 /** Insert a placeholder tab for `path` unless a tab for it already exists. */
@@ -194,7 +269,23 @@ export function patchTab(
 	id: string,
 	patch: Partial<DocTab>,
 ): DocTab[] {
-	return prev.map((t) => (t.id === id ? { ...t, ...patch } : t));
+	const idx = prev.findIndex((t) => t.id === id);
+	if (idx < 0) return prev;
+	const current = prev[idx];
+	// No-op patches (e.g. notesDirty: true → true) must keep the array and the
+	// tab identity: DocView's memo compares `tab` by reference, so minting a
+	// fresh object per patch re-rendered every pane's editor.
+	let changed = false;
+	for (const key of Object.keys(patch) as (keyof DocTab)[]) {
+		if (current[key] !== patch[key]) {
+			changed = true;
+			break;
+		}
+	}
+	if (!changed) return prev;
+	const next = prev.slice();
+	next[idx] = { ...current, ...patch };
+	return next;
 }
 
 /**
